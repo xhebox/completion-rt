@@ -1,0 +1,21 @@
+id: no-foreign-reexport
+language: Rust
+severity: error
+# A `pub use` names the items this module offers. It may reach its own
+# children (`pub use core::{…}`, `pub use self::…`), never sideways or up
+# (`crate::` / `super::`), which turns a module into a re-export facade for
+# something it does not own.
+rule:
+  all:
+    - kind: use_declaration
+    - has:
+        kind: visibility_modifier
+    - has:
+        any:
+          - kind: crate
+          - kind: super
+        stopBy: end
+message: >
+  Re-export your own children only. Name the defining module instead:
+  `crate::backend::X` stays reachable at `crate::backend::X`, or the crate
+  root re-exports it.

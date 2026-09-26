@@ -1,0 +1,57 @@
+version: '3'
+
+vars:
+  # The cargo profile every recipe builds under. Unset means cargo's own
+  # default (dev): `--profile` is not passed at all, so plain `cargo` and
+  # rust-analyzer use the same profile, and the same artifacts.
+  PROFILE: '{{.PROFILE | default "dev"}}'
+  PROFILE_ARG: '{{if ne .PROFILE "dev"}}--profile {{.PROFILE}}{{end}}'
+  # `--profile` on nextest names a nextest profile; the cargo profile a recipe
+  # wants goes through `--cargo-profile`.
+  CARGO_PROFILE_ARG: '{{if ne .PROFILE "dev"}}--cargo-profile {{.PROFILE}}{{end}}'
+  RUSTFLAGS: '-D warnings -C force-frame-pointers=yes -C symbol-mangling-version=v0'
+
+env:
+  RUSTFLAGS: '{{.RUSTFLAGS}}'
+
+tasks:
+  default:
+    deps: [build]
+
+  build:
+    desc: "Build the library for the host"
+    cmds:
+      - cargo build {{.PROFILE_ARG}} --locked {{.CLI_ARGS}}
+
+  check:
+    desc: "Format, lint and cross-check every target"
+    cmds:
+      - cargo fmt --all
+      - ast-grep scan --report-style short
+      - task: check-target
+        vars: { TARGET: aarch64-unknown-linux-musl }
+      - task: check-target
+        vars: { TARGET: x86_64-unknown-linux-musl }
+      - task: check-target
+        vars: { TARGET: aarch64-apple-darwin }
+      - task: check-target
+        vars: { TARGET: x86_64-pc-windows-gnu }
+
+  check-target:
+    internal: true
+    cmds:
+      # `--all-targets` covers the tests too, which are where the platform
+      # cfgs and the scratch helpers live.
+      - cargo check {{.PROFILE_ARG}} --all-targets --locked --target {{.TARGET}}
+
+  test:
+    desc: "Run every test on the host"
+    cmds:
+      - cargo nextest run {{.CARGO_PROFILE_ARG}} --locked {{.CLI_ARGS}}
+
+  # Every other recipe passes `--locked`; this is the one that rewrites the
+  # lock file, after a manifest change (a dependency added or removed).
+  lock:
+    desc: "Sync Cargo.lock with the manifest"
+    cmds:
+      - cargo metadata --format-version 1 > /dev/null

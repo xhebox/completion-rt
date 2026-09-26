@@ -1,0 +1,20 @@
+id: no-wildcard-use
+language: Rust
+severity: error
+ignores:
+  # An integration test file is test code from top to bottom.
+  - "**/tests/**"
+rule:
+  any:
+    # No `use path::*;`: name what this module uses. `use super::*;` in a test
+    # module is the one exception.
+    - all:
+        - kind: use_wildcard
+        - not: {has: {kind: super, stopBy: neighbor}}
+    # No bare `use {…};`: name the crate or the module in front of the list.
+    - all:
+        - kind: use_list
+        - inside: {kind: use_declaration, field: argument, stopBy: neighbor}
+message: >
+  No wildcard imports and no bare `use {…};` outside test code. Name what you
+  use; `use super::*;` is the test-module idiom.

@@ -1,0 +1,28 @@
+id: no-platform-cfg-on-items
+language: Rust
+severity: error
+rule:
+  all:
+    - any:
+        - kind: function_item
+        - kind: struct_item
+        - kind: enum_item
+        - kind: trait_item
+        - kind: type_item
+        - kind: const_item
+        - kind: static_item
+        - kind: impl_item
+    - follows:
+        kind: attribute_item
+        has:
+          kind: attribute
+          regex: 'cfg\([^)]*(target_os|target_family|target_env|unix|windows)'
+ignores:
+  # A test that exercises one platform's shape is the exception: the cfg names
+  # the test, not an implementation detail leaking out of a backend module.
+  - tests/core.rs
+  - tests/net.rs
+message: >
+  Platform cfg on an item declaration leaks platform code into a shared file.
+  Keep cfg on `mod`/`use`/fields/variants and put the item in the platform
+  module instead.

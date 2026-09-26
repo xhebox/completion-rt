@@ -1,0 +1,10 @@
+id: no-pub-crate
+language: Rust
+severity: error
+rule:
+  kind: visibility_modifier
+  has:
+    kind: crate
+    stopBy: end
+message: >
+  pub(crate) is discouraged, use pub(super) for parent-child visibility limit, otherwise just use pub.

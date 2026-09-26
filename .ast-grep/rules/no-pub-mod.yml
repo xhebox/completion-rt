@@ -1,0 +1,7 @@
+id: no-pub-mod
+language: Rust
+severity: error
+rule:
+  pattern: pub mod $MOD
+message: >
+  Re-export the specific items instead: `mod $MOD;` plus `pub use`.

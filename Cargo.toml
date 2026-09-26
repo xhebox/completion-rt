@@ -1,0 +1,42 @@
+[package]
+name = "completion-rt"
+version = "0.1.0"
+edition = "2024"
+# The newest std API the crate reaches for is `std::io::pipe` (1.87.0);
+# `Option::is_none_or` (1.82.0) and 2024's edition floor (1.85.0) sit below it.
+rust-version = "1.87"
+description = "Completion-model async I/O: one reactor per platform backend, Send submitters, cooperative cancellation."
+license = "MIT"
+repository = "https://github.com/xhebox/completion-rt"
+
+[dependencies]
+async-executor = "1"
+enum_dispatch = "0.3.13"
+log = { version = "0.4.34", features = ["std", "kv"] }
+smallvec = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+rustix = { version = "1.1", features = ["event", "fs", "net"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+# The portable backend: readiness from `polling` (epoll, kqueue, event ports,
+# poll) and file I/O on `blocking`'s thread pool. Linux and Windows keep the
+# kernel's own file I/O instead.
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+blocking = "1.7"
+libc = "0.2"
+polling = "3.11"
+rustix = { version = "1.1", features = ["event", "fs", "net", "pipe"] }
+
+[dev-dependencies]
+env_logger = "0.11"
+tempfile = "3"
+
+[features]
+# `iowait` withholds `IORING_ENTER_NO_IOWAIT` from the ring's blocking waits,
+# so their sleep counts as iowait the way the kernel's own default would.
+iowait = []

@@ -1,0 +1,50 @@
+id: no-direct-construct
+language: Rust
+severity: error
+# Whitelist: in this crate a `struct` literal is allowed only for the types
+# named below, so a normalising constructor cannot be bypassed.
+#
+# What is checked: a bare name, or a `crate::`/`super::`/`self::` path. What is
+# not: a path whose first segment is lowercase (a foreign crate, `rustix::…`)
+# or a path whose first segment is a type (an enum variant, `Submission::Fsync`)
+# — neither is ours to police. The whitelist matches the last segment, so
+# `super::Inner` is covered by `Inner`.
+#
+# The regex is `(?x)` so the names can wrap; each line after the first starts
+# with `|` because `(?x)` drops the newline. `has` deliberately omits
+# `stopBy: end`: a scoped name (`Submission::Read`) has a nested `name` field
+# (the last segment), and a deep search would match that instead of the whole
+# path.
+files:
+  - src/**
+rule:
+  kind: struct_expression
+  all:
+    - any:
+        - has:
+            field: name
+            regex: ^[A-Za-z0-9_]+$
+        - has:
+            field: name
+            regex: '^(?:crate|super|self)::'
+    - not:
+        has:
+          field: name
+          regex: |-
+            (?x)
+            ^(?:(?:[A-Za-z0-9_]+)::)*(?:
+            Accept|Active|Completion
+            |Config|Control|Entry|Event|Events|Executor|Extent|File|Fsync
+            |Immediate|Inner|Iocp
+            |Job|Op|OpenOptions|Overlapped|Portable|Poll|Pool
+            |Reactor|Readable|ReadAt|Readv|Recv
+            |Self|Send
+            |Shared|SlotGuard|Socket|Spawner|Submitter
+            |SyncAt|Tasks|TasksInner|Timeout|Timespec|Timer|Until|Uring
+            |Wait|Writable|Writev
+            |OVERLAPPED|OVERLAPPED_0|OVERLAPPED_0_0
+            )$
+message: >
+  This struct is built by literal in a tree that opts into the construction
+  whitelist. Either add the type to the whitelist in this rule (if a literal
+  is sound) or build it through its named constructor.

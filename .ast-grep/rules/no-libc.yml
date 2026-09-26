@@ -1,0 +1,23 @@
+id: no-libc
+language: Rust
+severity: error
+files:
+  - "**/*.rs"
+# Whitelist: only these (platform/FFI boundary) layers may use libc.
+# Everything else must go through rustix (or std).
+ignores:
+  # io_uring entries name a raw `libc::msghdr`, and SCM_RIGHTS is its cmsg
+  # macros — neither has a rustix wrapper that io_uring can use. The portable
+  # backend's `recvmsg`/`sendmsg` are the same, and its transfers pass caller
+  # memory to the kernel by pointer rather than as a slice.
+  - src/backend/uring.rs
+  - src/backend/portable.rs
+rule:
+  all:
+    - kind: identifier
+    - regex: '^libc$'
+message: >
+  Don't use libc outside the whitelisted platform/FFI layers. Use rustix
+  (or std) instead; if you really need libc here, add the path to the
+  whitelist in .ast-grep/rules/no-libc.yml.
+note: "libc is an FFI boundary, not a general-purpose syscall API."

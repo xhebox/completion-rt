@@ -1,0 +1,11 @@
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy", "rust-analyzer"]
+# `task check` cross-checks every backend: uring and the portable one on the
+# unix targets, iocp on windows.
+targets = [
+  "aarch64-unknown-linux-musl",
+  "x86_64-unknown-linux-musl",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-gnu",
+]

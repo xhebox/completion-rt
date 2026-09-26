@@ -1,0 +1,22 @@
+id: no-system-temp-dir
+language: Rust
+severity: error
+rule:
+  any:
+    - pattern: std::env::temp_dir()
+    - pattern: tempfile::tempdir()
+    - pattern: tempfile::tempfile()
+    - pattern: tempfile::TempDir::new()
+    - pattern: tempfile::NamedTempFile::new()
+    - pattern: tempfile::Builder::new()
+ignores:
+  # Justified: the integration tests' scratch-directory helper is the only
+  # place allowed to reach for tempfile.
+  - tests/common/mod.rs
+message: >
+  Do not create temporary files or directories in /tmp or TMPDIR: that
+  filesystem is shared with the rest of the system and outlives the working
+  tree. Tests must use the scratch-directory helper (scratch lives under
+  target/test-tmp, cleaned on drop) and create scratch files inside the
+  directory it returns. Any `tempfile::Builder` chain is banned too — use
+  `tempfile::Builder::tempdir_in` with an explicit in-tree base.

@@ -575,7 +575,9 @@ struct Shared {
 	/// What wakes a blocked [`Reactor::poll`], and what every [`Event`] this
 	/// reactor hands out raises.
 	event: Event,
-	/// Set by [`Submitter::stop`]; no new submission is taken afterwards.
+	/// Set by [`Submitter::stop`], and by [`Reactor`]'s drop under
+	/// [`Shared::events`] so a racing submission is refused or cleaned up, not
+	/// left in a table nobody drives; no new submission is taken afterwards.
 	stopped: AtomicBool,
 	/// Set while the reactor is inside its backend wait: a submission that
 	/// lands now is one the reactor cannot see without being woken, and one
@@ -805,14 +807,21 @@ impl Reactor {
 	}
 }
 
-/// Cancels every operation still out and drives them to their ends, so nothing
-/// is left touching memory after the reactor goes. A completion dropped after
-/// this finds its entry gone and returns at once.
+/// Stops the reactor and cancels every operation still out, driving them to
+/// their ends so nothing is left touching memory after the reactor goes. A
+/// completion dropped after this finds its entry gone and returns at once, and
+/// a submission after it is refused the same as one after [`Submitter::stop`].
 impl Drop for Reactor {
 	fn drop(&mut self) {
 		let shared = &self.shared;
 		{
 			let mut events = shared.events.lock().unwrap();
+			// Set under the table's lock, so a submission racing this drop meets
+			// one or the other: it sees `stopped` and is refused, or its entry is
+			// here in time for the cleanup below. A check outside the lock would
+			// let one insert after the table was cleared, into a reactor nobody
+			// drives.
+			shared.stopped.store(true, Ordering::Release);
 			// A pending request never reached a backend; it goes with the map.
 			// A timer is such a one, and its deadline goes with it.
 			events
@@ -1297,29 +1306,31 @@ impl Submitter {
 	/// the request a backend would need.
 	#[track_caller]
 	fn arm(&self, deadline: Instant) -> io::Result<Completion> {
-		if self.shared.stopped.load(Ordering::Acquire) {
-			return Err(io::Error::new(
-				io::ErrorKind::BrokenPipe,
-				"the reactor has been stopped",
-			));
-		}
-		let id = self.shared.next.fetch_add(1, Ordering::Relaxed) + 1;
-		self.shared.events.lock().unwrap().insert(
-			id,
-			Entry {
-				request: None,
-				response: None,
-				waker: None,
-				stat: Stat::Pending,
-				cancel: false,
-				names_memory: false,
-				kind: "timeout",
-				origin: Location::caller(),
-				waiter: false,
-				deadline: Some(deadline),
-				_descriptor: None,
-			},
-		);
+		let id = {
+			// The check and the insert are one lock hold; see [`Reactor`]'s drop.
+			let mut events = self.shared.events.lock().unwrap();
+			if self.shared.stopped.load(Ordering::Acquire) {
+				return Err(stopped());
+			}
+			let id = self.shared.next.fetch_add(1, Ordering::Relaxed) + 1;
+			events.insert(
+				id,
+				Entry {
+					request: None,
+					response: None,
+					waker: None,
+					stat: Stat::Pending,
+					cancel: false,
+					names_memory: false,
+					kind: "timeout",
+					origin: Location::caller(),
+					waiter: false,
+					deadline: Some(deadline),
+					_descriptor: None,
+				},
+			);
+			id
+		};
 		self.wake();
 		Ok(Completion {
 			guard: SlotGuard {
@@ -1330,7 +1341,10 @@ impl Submitter {
 		})
 	}
 
-	/// Wake and stop the reactor.
+	/// Wake and stop the reactor: no further submission is taken — each is
+	/// refused with [`BrokenPipe`](io::ErrorKind::BrokenPipe) — while the
+	/// operations already in flight are left to land. Dropping the reactor
+	/// stops it the same way.
 	pub fn stop(&self) {
 		self.shared.stopped.store(true, Ordering::Release);
 		let _ = self.shared.event.notify();
@@ -1340,31 +1354,33 @@ impl Submitter {
 	/// awaits it, with `descriptor` held for as long as the operation lives.
 	#[track_caller]
 	fn enqueue(&self, request: Request, descriptor: Option<Descriptor>) -> io::Result<Completion> {
-		if self.shared.stopped.load(Ordering::Acquire) {
-			return Err(io::Error::new(
-				io::ErrorKind::BrokenPipe,
-				"the reactor has been stopped",
-			));
-		}
 		let names_memory = request.names_memory();
 		let kind = request.kind();
-		let id = self.shared.next.fetch_add(1, Ordering::Relaxed) + 1;
-		self.shared.events.lock().unwrap().insert(
-			id,
-			Entry {
-				request: Some(request),
-				response: None,
-				waker: None,
-				stat: Stat::Pending,
-				cancel: false,
-				names_memory,
-				kind,
-				origin: Location::caller(),
-				waiter: false,
-				deadline: None,
-				_descriptor: descriptor,
-			},
-		);
+		let id = {
+			// The check and the insert are one lock hold; see [`Reactor`]'s drop.
+			let mut events = self.shared.events.lock().unwrap();
+			if self.shared.stopped.load(Ordering::Acquire) {
+				return Err(stopped());
+			}
+			let id = self.shared.next.fetch_add(1, Ordering::Relaxed) + 1;
+			events.insert(
+				id,
+				Entry {
+					request: Some(request),
+					response: None,
+					waker: None,
+					stat: Stat::Pending,
+					cancel: false,
+					names_memory,
+					kind,
+					origin: Location::caller(),
+					waiter: false,
+					deadline: None,
+					_descriptor: descriptor,
+				},
+			);
+			id
+		};
 		self.wake();
 		Ok(Completion {
 			guard: SlotGuard {
@@ -1739,6 +1755,12 @@ impl std::error::Error for NotSubmitted {}
 
 fn not_submitted() -> io::Error {
 	io::Error::other(NotSubmitted)
+}
+
+/// The error a submission gets once the reactor is stopped — by
+/// [`Submitter::stop`], or by the reactor being dropped.
+fn stopped() -> io::Error {
+	io::Error::new(io::ErrorKind::BrokenPipe, "the reactor has been stopped")
 }
 
 fn is_not_submitted(error: &io::Error) -> bool {

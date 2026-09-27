@@ -826,3 +826,186 @@ fn a_take_without_waiting_reports_a_receive_in_flight() {
 		"the settled receive let the socket go"
 	);
 }
+
+/// A `shutdown(Write)` half-closes the connection: the peer reads end of file,
+/// and what it sends afterwards still arrives — the receive side was not
+/// touched.
+#[test]
+fn a_shutdown_write_half_closes_the_connection() {
+	use std::io::Write;
+	use std::net::Shutdown;
+
+	let (client, mut server) = pair();
+	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let socket: Facade<TcpStream> = Facade::new(client, &submitter);
+
+	let mut reactor = reactor;
+	let driven = std::thread::spawn(move || {
+		while !reactor.is_stopped() {
+			reactor.poll(None).unwrap();
+		}
+	});
+
+	socket.shutdown(Shutdown::Write).unwrap();
+
+	// The peer's read reaches the FIN: zero bytes, not a read left waiting.
+	server
+		.set_read_timeout(Some(Duration::from_secs(5)))
+		.unwrap();
+	let mut byte = [0u8; 1];
+	assert_eq!(
+		server.read(&mut byte).unwrap(),
+		0,
+		"the peer did not read the FIN"
+	);
+
+	// The receive side is open still: the peer's bytes arrive.
+	server.write_all(b"world").unwrap();
+	let buffer: Arc<Vec<u8>> = Arc::new(vec![0u8; 5]);
+	assert_eq!(
+		block_on(socket.recv(buffer.clone())).into_result().unwrap(),
+		5
+	);
+	assert_eq!(&buffer[..], b"world");
+
+	submitter.stop();
+	driven.join().unwrap();
+}
+
+/// A receive already in front of the kernel ends when the read side is shut
+/// down: it comes back, with the zero bytes the kernel reports, instead of
+/// waiting for a peer that never sends.
+#[test]
+fn a_shutdown_read_ends_a_receive_in_flight() {
+	use std::future::Future;
+	use std::net::Shutdown;
+	use std::task::{Context, Poll, Waker};
+
+	use completion_rt::Memory;
+
+	let (client, _server) = pair();
+	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let socket: Facade<TcpStream> = Facade::new(client, &submitter);
+
+	let buffer: Arc<Vec<u8>> = Arc::new(vec![0u8; 16]);
+	let payload: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
+	let mut receive = std::pin::pin!(socket.recv(payload));
+	let mut cx = Context::from_waker(Waker::noop());
+	// The peer sends nothing, so the receive sits with the kernel and only a
+	// shutdown can end it.
+	assert!(receive.as_mut().poll(&mut cx).is_pending());
+	reactor.poll(Some(Duration::ZERO)).unwrap();
+
+	socket.shutdown(Shutdown::Read).unwrap();
+
+	let mut landed = None;
+	for _ in 0..500 {
+		if let Poll::Ready(outcome) = receive.as_mut().poll(&mut cx) {
+			landed = Some(outcome);
+			break;
+		}
+		reactor.poll(Some(Duration::from_millis(1))).unwrap();
+	}
+	let outcome = landed.expect("the shut-down receive never came back");
+	assert!(
+		outcome.result.is_ok(),
+		"the receive ended with an error: {:?}",
+		outcome.result
+	);
+	assert_eq!(outcome.value, 0, "the receive counted bytes nobody sent");
+}
+
+/// `take_error` hands over the socket's pending error and clears it: a refused
+/// datagram shows up once, and the second call reports a clean socket.
+#[test]
+fn take_error_takes_a_pending_error_off_the_socket() {
+	use std::net::UdpSocket;
+	use std::time::Instant;
+
+	// A port nothing holds: the kernel picks one for a bind, and the socket
+	// that held it goes.
+	let held = UdpSocket::bind("127.0.0.1:0").unwrap();
+	let unreachable = held.local_addr().unwrap();
+	drop(held);
+
+	let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+	sender.connect(unreachable).unwrap();
+	// The datagram reaches a port with no receiver, and the port-unreachable
+	// comes back to the connected socket that sent it.
+	sender.send(b"x").unwrap();
+
+	let (_reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let socket: Facade<UdpSocket> = Facade::new(sender, &submitter);
+
+	let deadline = Instant::now() + Duration::from_secs(5);
+	let pending = loop {
+		if let Some(error) = socket.take_error().unwrap() {
+			break error;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"the refused datagram never reached the socket"
+		);
+		std::thread::sleep(Duration::from_millis(1));
+	};
+	assert_eq!(
+		pending.kind(),
+		std::io::ErrorKind::ConnectionRefused,
+		"the pending error was not the refusal: {pending:?}"
+	);
+	assert!(
+		socket.take_error().unwrap().is_none(),
+		"the error was read without being taken away"
+	);
+}
+
+/// A send already in front of the kernel ends when the write side is shut
+/// down: the peer never reads, the send waits on the socket's buffers, and the
+/// shutdown is what turns it into the error a closed send side gives — not a
+/// write left waiting.
+#[test]
+fn a_shutdown_write_ends_a_send_in_flight() {
+	use std::future::Future;
+	use std::net::Shutdown;
+	use std::task::{Context, Poll, Waker};
+
+	let (client, _server) = pair();
+	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let socket: Facade<TcpStream> = Facade::new(client, &submitter);
+
+	let len = 8 << 20;
+	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
+	let mut send = std::pin::pin!(socket.send_all(payload.clone()));
+	let mut cx = Context::from_waker(Waker::noop());
+	assert!(send.as_mut().poll(&mut cx).is_pending());
+
+	// Eight mebibytes never fit the socket's buffers with the peer not reading:
+	// the send is still pending however many times the reactor is driven.
+	for _ in 0..50 {
+		assert!(
+			send.as_mut().poll(&mut cx).is_pending(),
+			"the payload went out with the peer never reading it"
+		);
+		reactor.poll(Some(Duration::from_millis(1))).unwrap();
+	}
+
+	socket.shutdown(Shutdown::Write).unwrap();
+
+	let mut landed = None;
+	for _ in 0..500 {
+		if let Poll::Ready(outcome) = send.as_mut().poll(&mut cx) {
+			landed = Some(outcome);
+			break;
+		}
+		reactor.poll(Some(Duration::from_millis(1))).unwrap();
+	}
+	let outcome = landed.expect("the shut-down send never came back");
+	assert!(
+		outcome.value > 0,
+		"the shut-down send threw away the bytes it had put out"
+	);
+	assert!(
+		outcome.result.is_err(),
+		"a send whose write side was shut down reports an error, not a write left waiting"
+	);
+}

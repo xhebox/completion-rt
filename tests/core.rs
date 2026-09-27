@@ -660,6 +660,22 @@ fn stopping_the_reactor_drains_what_is_in_flight() {
 	assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
 }
 
+/// Dropping the reactor stops it: a submitter left over — every clone a caller
+/// kept is one — is refused from then on, the same as after `Submitter::stop`,
+/// so the caller has an error to act on instead of a completion nothing drives.
+#[test]
+fn a_submission_after_the_reactor_drops_is_refused() {
+	let file = seeded_file(b"hello");
+	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	drop(reactor);
+	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
+	let error = submitter
+		.read(&file, 0, memory(&buf), whole(&buf))
+		.err()
+		.expect("a dropped reactor refuses submissions");
+	assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+}
+
 /// The reactor's own wake-up is a descriptor a caller can wait on
 /// (`Submitter::wait`): a raise from another thread must complete that wait,
 /// not only make `poll` return — otherwise the task waiting on it never runs

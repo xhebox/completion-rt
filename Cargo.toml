@@ -21,7 +21,7 @@ libc = "0.2"
 rustix = { version = "1.1", features = ["event", "fs", "net"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 # The portable backend: readiness from `polling` (epoll, kqueue, event ports,
 # poll) and file I/O on `blocking`'s thread pool. Linux and Windows keep the

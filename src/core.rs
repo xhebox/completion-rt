@@ -1074,9 +1074,10 @@ impl<S> Drop for Take<S> {
 /// hold on the handle until it settles, so the descriptor stays open however the
 /// caller treats its own — a number the caller closed and the kernel handed to
 /// another file can never be what an operation reads or writes. A caller that
-/// holds a plain number has to own a descriptor first: [`dup`](crate::dup)
-/// takes one, and a resource comes to a facade through
-/// [`Facade::new`](crate::Facade::new).
+/// holds a plain number has to own a descriptor first:
+/// [`BorrowedDescriptor`](crate::BorrowedDescriptor)'s `try_clone_to_owned`
+/// duplicates one into an [`OwnedDescriptor`](crate::OwnedDescriptor), and a
+/// resource comes to a facade through [`Facade::new`](crate::Facade::new).
 ///
 /// A transfer is one kernel call: it completes with what that call moved,
 /// possibly less than the extents name, and `0` at the end of a file. The

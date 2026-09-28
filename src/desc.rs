@@ -2,7 +2,6 @@
 
 #[cfg(unix)]
 mod imp {
-	use std::io;
 	use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 	/// A descriptor as the backend names it: the value it keys an operation
@@ -13,6 +12,11 @@ mod imp {
 	/// A descriptor this value owns and will close.
 	pub type OwnedDescriptor = OwnedFd;
 	/// A descriptor borrowed for a stated lifetime.
+	///
+	/// One type on this platform: this is `BorrowedFd`, so std's own
+	/// [`BorrowedFd::try_clone_to_owned`] — handing back the [`OwnedFd`] behind
+	/// [`OwnedDescriptor`] — is the whole of duplicating one, with no wrapper of
+	/// our own to name.
 	pub type BorrowedDescriptor<'a> = BorrowedFd<'a>;
 	/// A socket that owns its descriptor.
 	pub type OwnedSocket = OwnedFd;
@@ -63,12 +67,6 @@ mod imp {
 	pub unsafe fn from_raw_socket(raw: RawHandle) -> OwnedSocket {
 		unsafe { OwnedSocket::from_raw_fd(raw.as_raw_fd()) }
 	}
-
-	/// A second, independent descriptor on the same resource: it stays open on
-	/// its own, and closing one descriptor does not close the other.
-	pub fn dup(handle: BorrowedDescriptor<'_>) -> io::Result<OwnedSocket> {
-		handle.try_clone_to_owned()
-	}
 }
 
 #[cfg(windows)]
@@ -92,10 +90,43 @@ mod imp {
 	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 	pub struct RawHandle(usize);
 
-	/// A descriptor this value owns and will close.
-	pub type OwnedDescriptor = OwnedHandle;
+	/// A descriptor this value owns and will close: the owned counterpart of
+	/// [`BorrowedDescriptor`], one arm per family.
+	#[derive(Debug)]
+	pub enum OwnedDescriptor {
+		Handle(OwnedHandle),
+		Socket(OwnedSocket),
+	}
 	/// A socket that owns its descriptor.
 	pub type OwnedSocket = std::os::windows::io::OwnedSocket;
+
+	impl BorrowedDescriptor<'_> {
+		/// A second, independent descriptor on the same resource: it stays open
+		/// on its own, and closing one descriptor does not close the other.
+		/// std's method of the same name, per family.
+		pub fn try_clone_to_owned(&self) -> io::Result<OwnedDescriptor> {
+			match self {
+				BorrowedDescriptor::Handle(handle) => {
+					handle.try_clone_to_owned().map(OwnedDescriptor::Handle)
+				}
+				BorrowedDescriptor::Socket(socket) => {
+					socket.try_clone_to_owned().map(OwnedDescriptor::Socket)
+				}
+			}
+		}
+	}
+
+	impl From<OwnedHandle> for OwnedDescriptor {
+		fn from(handle: OwnedHandle) -> Self {
+			OwnedDescriptor::Handle(handle)
+		}
+	}
+
+	impl From<OwnedSocket> for OwnedDescriptor {
+		fn from(socket: OwnedSocket) -> Self {
+			OwnedDescriptor::Socket(socket)
+		}
+	}
 
 	impl RawHandle {
 		pub fn as_platform(self) -> PlatformHandle {
@@ -170,25 +201,25 @@ mod imp {
 		std::os::windows::io::BorrowedSocket<'_>,
 	);
 
+	impl AsDescriptor for OwnedDescriptor {
+		fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
+			match self {
+				OwnedDescriptor::Handle(handle) => BorrowedDescriptor::Handle(handle.as_handle()),
+				OwnedDescriptor::Socket(socket) => BorrowedDescriptor::Socket(socket.as_socket()),
+			}
+		}
+	}
+
 	impl<S: AsDescriptor> AsDescriptor for crate::core::Handle<S> {
 		fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
 			(**self).as_descriptor()
 		}
 	}
-
-	/// A second descriptor on the same socket. Nothing here needs one: the VMM's
-	/// devices only run on unix.
-	pub fn dup(_handle: BorrowedDescriptor<'_>) -> std::io::Result<OwnedSocket> {
-		Err(io::Error::new(
-			io::ErrorKind::Unsupported,
-			"duplicating a socket is not implemented here",
-		))
-	}
 }
 
 #[cfg(windows)]
-pub use imp::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawHandle, dup};
+pub use imp::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawHandle};
 #[cfg(unix)]
 pub use imp::{
-	AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawHandle, dup, from_raw_socket,
+	AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawHandle, from_raw_socket,
 };

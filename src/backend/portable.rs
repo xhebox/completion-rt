@@ -54,6 +54,7 @@ enum Kind {
 	Read,
 	Write,
 	Fsync,
+	Flush,
 }
 
 /// What a readiness-driven operation did.
@@ -384,7 +385,7 @@ impl Portable {
 		memory: Option<Arc<dyn Memory>>,
 		extents: Extents,
 	) -> io::Result<()> {
-		if kind != Kind::Fsync && extents.is_empty() {
+		if !matches!(kind, Kind::Fsync | Kind::Flush) && extents.is_empty() {
 			self.done.push_back((token, Ok(Response::Count(0))));
 			return Ok(());
 		}
@@ -515,6 +516,18 @@ impl Backend for Portable {
 		let result = rustix::fs::fsync(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
 			.map(|()| Response::Done)
 			.map_err(io::Error::from);
+		self.done.push_back((id, result));
+		Ok(())
+	}
+
+	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
+		if takes_pool(fd) {
+			return self.submit_pool(id, fd, 0, Kind::Flush, None, Extents::new());
+		}
+		// Nothing to wait for on a descriptor the kernel does not sync: the
+		// dup-and-close answers now.
+		let result = flush_handle(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
+			.map(|()| Response::Done);
 		self.done.push_back((id, result));
 		Ok(())
 	}
@@ -738,6 +751,7 @@ fn run_file(
 	let fd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
 	match kind {
 		Kind::Fsync => rustix::fs::fsync(fd).map(|()| 0).map_err(io::Error::from),
+		Kind::Flush => flush_handle(fd).map(|()| 0),
 		Kind::Read | Kind::Write => {
 			let memory = memory.expect("a transfer carries its memory");
 			let spans = crate::memory::spans(&memory, &extents)?;
@@ -757,11 +771,30 @@ fn run_file(
 					Kind::Write => {
 						libc::pwrite(fd.as_raw_fd(), span.as_ptr().cast(), span.len(), offset)
 					}
-					Kind::Fsync => unreachable!("handled above"),
+					Kind::Fsync | Kind::Flush => unreachable!("handled above"),
 				}
 			})
 		}
 	}
+}
+
+/// Reports a file's deferred write-back errors: `close(dup(fd))`, so the
+/// descriptor the caller named stays open.
+///
+/// The close is the whole point — it is what reports a write-back error the
+/// filesystem had deferred — so it goes through `libc::close` and the result is
+/// checked: `rustix::io::close` and a dropped `OwnedFd` both discard it. EINTR
+/// is not retried: POSIX leaves the descriptor's state unspecified, and here
+/// Linux has already closed it, so a retry could close a reused number.
+fn flush_handle(fd: BorrowedFd<'_>) -> io::Result<()> {
+	let dup = unsafe { libc::dup(fd.as_raw_fd()) };
+	if dup < 0 {
+		return Err(io::Error::last_os_error());
+	}
+	if unsafe { libc::close(dup) } < 0 {
+		return Err(io::Error::last_os_error());
+	}
+	Ok(())
 }
 
 /// The bytes a raw syscall moved, `errno` being the error it left.

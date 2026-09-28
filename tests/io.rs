@@ -307,3 +307,98 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	submitter.stop();
 	driven.join().unwrap();
 }
+
+/// `flush` reports the file's deferred write-back errors by closing a
+/// duplicate, so the facade keeps its own descriptor and goes on working.
+#[test]
+fn flush_leaves_the_facade_usable() {
+	let directory = common::tempdir("completion-flush").unwrap();
+	let path = directory.path().join("data");
+	std::fs::write(&path, []).unwrap();
+	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let file = File::new(
+		OpenOptions::new()
+			.read(true)
+			.write(true)
+			.open(&path)
+			.unwrap(),
+		&submitter,
+	);
+
+	let mut reactor = reactor;
+	let driven = std::thread::spawn(move || {
+		while !reactor.is_stopped() {
+			reactor.poll(None).unwrap();
+		}
+	});
+
+	let first: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
+	block_on(file.write_all_at(first, 0)).into_result().unwrap();
+	block_on(file.flush()).unwrap();
+
+	// The duplicate the flush closed was not the facade's descriptor: the same
+	// facade still writes and reads.
+	let second: Arc<Vec<u8>> = Arc::new(b"world".to_vec());
+	block_on(file.write_all_at(second, 5))
+		.into_result()
+		.unwrap();
+
+	let read: Arc<Vec<u8>> = Arc::new(vec![0; 10]);
+	block_on(file.read_exact_at(read.clone(), 0))
+		.into_result()
+		.unwrap();
+	assert_eq!(&read[..], b"helloworld");
+
+	drop(file);
+	submitter.stop();
+	driven.join().unwrap();
+}
+
+/// A descriptor nothing owns anymore: `flush` must report the error rather than
+/// pretend success. Unix only — the close-time error is a unix idea.
+#[cfg(unix)]
+#[test]
+fn flush_reports_a_descriptor_that_is_not_open() {
+	use std::os::fd::{AsRawFd, FromRawFd};
+
+	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+
+	// Opened then closed, so the number is free and nothing owns it. Made after
+	// the reactor so no descriptor it built can have taken the number back.
+	let dead = {
+		let (reader, writer) = std::io::pipe().unwrap();
+		drop(writer);
+		let raw = reader.as_raw_fd();
+		drop(reader);
+		raw
+	};
+
+	let mut reactor = reactor;
+	let driven = std::thread::spawn(move || {
+		while !reactor.is_stopped() {
+			reactor.poll(None).unwrap();
+		}
+	});
+
+	let file = File::new(unsafe { std::fs::File::from_raw_fd(dead) }, &submitter);
+	match block_on(file.flush()) {
+		Err(Error::Io(error)) => assert_eq!(
+			error.raw_os_error(),
+			Some(rustix::io::Errno::BADF.raw_os_error()),
+			"a closed descriptor reports EBADF, not {error}"
+		),
+		other => panic!("flush on a closed descriptor must fail, got {other:?}"),
+	}
+
+	// The file owns a descriptor that is not open: dropping it would close the
+	// number again, which aborts under a debug assertion. Take it back and leak
+	// it instead.
+	let plain = match file.try_take() {
+		Ok(plain) => plain,
+		Err(_) => panic!("an operation still names the file"),
+	};
+	std::mem::forget(plain);
+
+	submitter.stop();
+	driven.join().unwrap();
+}

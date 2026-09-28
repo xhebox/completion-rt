@@ -98,6 +98,11 @@ enum Step {
 	Fsync {
 		fd: RawHandle,
 	},
+	Flush {
+		/// The duplicate `flush` made; the CLOSE entry closes this one, so the
+		/// caller's descriptor stays open.
+		fd: RawHandle,
+	},
 	Accept {
 		fd: RawHandle,
 	},
@@ -116,7 +121,10 @@ impl Step {
 			// An accept reports the descriptor the kernel created where a
 			// transfer reports its count.
 			Step::Accept { .. } => Kind::Accepted,
-			Step::Fsync { .. } | Step::Readable { .. } | Step::Writable { .. } => Kind::Done,
+			Step::Fsync { .. }
+			| Step::Flush { .. }
+			| Step::Readable { .. }
+			| Step::Writable { .. } => Kind::Done,
 			_ => Kind::Count,
 		}
 	}
@@ -571,6 +579,22 @@ impl Uring {
 					Spans::new(),
 				)
 			}
+			Step::Flush { fd } => {
+				// Like a fsync, a close has no form an IOPOLL ring can poll
+				// for.
+				if self.iopoll {
+					return Err(io::Error::new(
+						io::ErrorKind::Unsupported,
+						"flush cannot be submitted on an IOPOLL ring; give it a ring of its own",
+					));
+				}
+				(
+					opcode::Close::new(types::Fd(fd.as_raw_fd()))
+						.build()
+						.user_data(id),
+					Spans::new(),
+				)
+			}
 			Step::Accept { fd } => {
 				// An accept cannot be polled for, and only a ring that can be
 				// polled for has anything to wait on.
@@ -757,6 +781,27 @@ impl Backend for Uring {
 
 	fn fsync(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
 		self.submit(id, Step::Fsync { fd })
+	}
+
+	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
+		// The close has to name a descriptor this operation owns, so the one
+		// the caller named stays open. The duplicate is made here, at submit,
+		// because a failure to make it is the operation's outcome — the same
+		// way a submit-time fsync failure is.
+		let dup = unsafe { libc::dup(fd.as_raw_fd()) };
+		if dup < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		let dup = RawHandle::from_raw(dup as usize);
+		let result = self.submit(id, Step::Flush { fd: dup });
+		if result.is_err() {
+			// The ring never took the entry, so the duplicate has to go here
+			// or it leaks. EINTR is not retried: Linux has already closed the
+			// descriptor, and a retry could close a number something else has
+			// reused.
+			unsafe { libc::close(dup.as_raw_fd()) };
+		}
+		result
 	}
 
 	fn recv(

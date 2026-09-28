@@ -81,6 +81,9 @@ enum Request {
 	Fsync {
 		fd: RawHandle,
 	},
+	Flush {
+		fd: RawHandle,
+	},
 	Recv {
 		fd: RawHandle,
 		memory: Arc<dyn Memory>,
@@ -140,6 +143,7 @@ impl Request {
 			// the caller's: the payload is what names memory.
 			Request::SendWithFds { extents, .. } => extents.len_bytes() != 0,
 			Request::Fsync { .. }
+			| Request::Flush { .. }
 			| Request::Accept { .. }
 			| Request::Readable { .. }
 			| Request::Writable { .. } => false,
@@ -152,6 +156,7 @@ impl Request {
 			Request::Read { .. } => "read",
 			Request::Write { .. } => "write",
 			Request::Fsync { .. } => "fsync",
+			Request::Flush { .. } => "flush",
 			Request::Recv { .. } => "recv",
 			Request::RecvWithFds { .. } => "recv_with_fds",
 			Request::Send { .. } => "send",
@@ -421,6 +426,7 @@ impl Core {
 					extents,
 				} => self.backend.write(id, fd, fdoff, memory, extents),
 				Request::Fsync { fd } => self.backend.fsync(id, fd),
+				Request::Flush { fd } => self.backend.flush(id, fd),
 				Request::Recv {
 					fd,
 					memory,
@@ -1160,6 +1166,17 @@ impl Submitter {
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
 		self.enqueue(Request::Fsync { fd: raw }, Some(Descriptor::new(fd)))
+	}
+
+	/// Reports the deferred write-back errors of `fd` without forcing it to
+	/// disk.
+	#[track_caller]
+	pub fn flush<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		fd: &Handle<S>,
+	) -> io::Result<Completion> {
+		let raw = fd.raw();
+		self.enqueue(Request::Flush { fd: raw }, Some(Descriptor::new(fd)))
 	}
 
 	/// Receives into the ranges of `memory` named by `extents`.

@@ -255,6 +255,17 @@ impl Facade<fs::File> {
 	pub fn sync(&self) -> Op<fs::File> {
 		Op::new(self, Submitter::fsync)
 	}
+
+	/// Reports the file's pending deferred write-back errors — `ENOSPC`, `EIO`
+	/// and the like — without forcing anything to disk.
+	///
+	/// This is not [`Write::flush`](std::io::Write::flush): it names no buffer
+	/// of the caller's, and it does not make the data durable — [`sync`](Self::sync)
+	/// is what does that. What it reports is the error the filesystem had
+	/// deferred and would otherwise surface at the file's next close.
+	pub fn flush(&self) -> Op<fs::File> {
+		Op::new(self, Submitter::flush)
+	}
 }
 
 impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {

@@ -95,6 +95,10 @@ pub(super) trait Backend: Send {
 	/// Makes everything written to `fd` durable.
 	fn fsync(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
 
+	/// Reports the deferred write-back errors of `fd` without making it
+	/// durable.
+	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
+
 	/// Receives into the ranges of `memory` named by `extents`.
 	fn recv(
 		&mut self,

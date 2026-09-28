@@ -250,6 +250,29 @@ impl Backend for Iocp {
 		Ok(())
 	}
 
+	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
+		// Windows reports no deferred write-back error when a handle is closed:
+		// there is no close-time error to surface. `FlushFileBuffers`
+		// approximates a fsync, not a flush, and is too costly to run on every
+		// close — so the operation succeeds without touching the disk. Should a
+		// mechanism appear, only this backend changes.
+		let handle: HANDLE = fd.as_platform();
+		self.active.insert(
+			id,
+			Active {
+				ov: Box::new(Overlapped {
+					inner: zeroed(),
+					token: id,
+					submit_error: 0,
+					handle,
+				}),
+				_memory: None,
+			},
+		);
+		self.post(id);
+		Ok(())
+	}
+
 	fn recv(
 		&mut self,
 		_id: u64,

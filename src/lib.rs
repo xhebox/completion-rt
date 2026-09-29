@@ -52,8 +52,11 @@ mod tasks;
 
 pub use backend::{Config, PollMode};
 pub use channel::{Closed, Receiver, Sender};
-pub use core::{Cancel, Cancelled, Completion, Handle, Reactor, Response, Submitter, Until};
-pub use desc::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket};
+pub use core::{
+	Cancel, Cancelled, Completion, Handle, InFlight, InFlightState, Reactor, Response, Submitter,
+	Until,
+};
+pub use desc::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor};
 pub use event::Event;
 pub use executor::{Executor, Spawner};
 pub use flow::{Accept, Op, Receive, Transfer};

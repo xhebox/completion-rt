@@ -9,6 +9,11 @@ mod imp {
 	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 	pub struct RawHandle(RawFd);
 
+	/// A descriptor as a plain value: the [`RawFd`] on this platform, handed
+	/// out without giving up the descriptor it belongs to. See
+	/// [`Submitter::in_flight`](crate::Submitter::in_flight).
+	pub type RawDescriptor = RawFd;
+
 	/// A descriptor this value owns and will close.
 	pub type OwnedDescriptor = OwnedFd;
 	/// A descriptor borrowed for a stated lifetime.
@@ -34,6 +39,12 @@ mod imp {
 		}
 
 		pub const fn as_raw_fd(self) -> RawFd {
+			self.0
+		}
+
+		/// The number as the cross-platform [`RawDescriptor`], for
+		/// [`Submitter::in_flight`](crate::Submitter::in_flight).
+		pub const fn into_raw(self) -> RawDescriptor {
 			self.0
 		}
 	}
@@ -90,6 +101,11 @@ mod imp {
 	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 	pub struct RawHandle(usize);
 
+	/// A descriptor as a plain value: the handle or socket number on this
+	/// platform, handed out without giving up the descriptor it belongs to.
+	/// See [`Submitter::in_flight`](crate::Submitter::in_flight).
+	pub type RawDescriptor = usize;
+
 	/// A descriptor this value owns and will close: the owned counterpart of
 	/// [`BorrowedDescriptor`], one arm per family.
 	#[derive(Debug)]
@@ -135,6 +151,12 @@ mod imp {
 
 		pub fn from_raw_handle(handle: PlatformHandle) -> Self {
 			Self(handle as usize)
+		}
+
+		/// The number as the cross-platform [`RawDescriptor`], for
+		/// [`Submitter::in_flight`](crate::Submitter::in_flight).
+		pub const fn into_raw(self) -> RawDescriptor {
+			self.0
 		}
 
 		/// The number behind a borrow, for the backend.
@@ -218,8 +240,11 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawHandle};
+pub use imp::{
+	AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor, RawHandle,
+};
 #[cfg(unix)]
 pub use imp::{
-	AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawHandle, from_raw_socket,
+	AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor, RawHandle,
+	from_raw_socket,
 };

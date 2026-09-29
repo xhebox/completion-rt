@@ -12,7 +12,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
-use crate::desc::{BorrowedDescriptor, RawHandle};
+use crate::desc::{BorrowedDescriptor, RawDescriptor, RawHandle};
 use crate::{AsDescriptor, Extent, Extents, Memory, OwnedDescriptor, OwnedSocket};
 
 use crate::backend::{self, Backend, BackendEnum, Config, create};
@@ -199,6 +199,8 @@ struct Entry {
 	/// report of a dropped in-flight operation.
 	kind: &'static str,
 	origin: &'static Location<'static>,
+	/// When the entry was made, for the age [`InFlight`] reports.
+	submitted: Instant,
 	/// A thread waits on [`Shared::settled`] for this entry: [`Core::settle`]
 	/// has to raise it once the entry lands.
 	waiter: bool,
@@ -207,13 +209,16 @@ struct Entry {
 	deadline: Option<Instant>,
 	/// The descriptor the operation names, held until the entry goes: the
 	/// backend works on the number, which must stay live until then.
-	_descriptor: Option<Descriptor>,
+	descriptor: Option<Descriptor>,
 }
 
 /// What an in-flight operation holds so the resource it names stays open: the
 /// clone's share of the caller's [`Handle`], with the value erased by unsizing
 /// so an entry stays concrete whatever the handle names.
 struct Descriptor {
+	/// The number the backend works on, for the snapshot [`InFlight`] is; the
+	/// hold below is what keeps it live.
+	raw: RawDescriptor,
 	/// The hold on the resource, kept for what dropping it does.
 	_value: Arc<dyn Send + Sync>,
 	/// Dropped after `_value`, so the resource is let go before the wake; see
@@ -222,11 +227,12 @@ struct Descriptor {
 }
 
 impl Descriptor {
-	fn new<S: Send + Sync + 'static>(handle: &Handle<S>) -> Descriptor {
+	fn new<S: AsDescriptor + Send + Sync + 'static>(handle: &Handle<S>) -> Descriptor {
 		// Bound first: an `Arc::clone` under the erased type would have to infer
 		// its own parameter as the trait object.
 		let value = Arc::clone(&handle.value);
 		Self {
+			raw: handle.raw().into_raw(),
 			_value: value,
 			_release: handle.release.clone(),
 		}
@@ -1068,6 +1074,77 @@ impl<S> Drop for Take<S> {
 	}
 }
 
+/// One operation the reactor still holds, as [`Submitter::in_flight`] reports
+/// it.
+///
+/// A copy taken under the reactor's lock: the descriptor is a number, not a
+/// hold, and a later snapshot may no longer show the entry at all.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct InFlight {
+	/// The id the reactor minted for the operation.
+	pub id: u64,
+	/// The operation's name: `"read"`, `"send"`, `"timeout"`, and the rest.
+	pub op: &'static str,
+	/// The submitting call site, from `#[track_caller]`.
+	pub origin: &'static Location<'static>,
+	/// Where the operation is in its life.
+	pub state: InFlightState,
+	/// The descriptor the operation names, as a plain number; `None` for a
+	/// timer, which names none. The snapshot keeps nothing open.
+	pub descriptor: Option<RawDescriptor>,
+	/// How long since the operation was submitted.
+	pub age: Duration,
+	/// Whether a backend has been asked to stop the operation.
+	pub cancel_requested: bool,
+	/// Whether the kernel reads or writes the caller's memory through it; the
+	/// fact the drop fallback reports an operation left in flight for.
+	pub names_memory: bool,
+	/// A timer's deadline; `None` for an operation a backend carries.
+	pub deadline: Option<Instant>,
+}
+
+impl InFlight {
+	fn of(id: u64, entry: &Entry, now: Instant) -> InFlight {
+		Self {
+			id,
+			op: entry.kind,
+			origin: entry.origin,
+			state: InFlightState::of(entry.stat),
+			descriptor: entry.descriptor.as_ref().map(|held| held.raw),
+			age: now.saturating_duration_since(entry.submitted),
+			cancel_requested: entry.cancel,
+			names_memory: entry.names_memory,
+			deadline: entry.deadline,
+		}
+	}
+}
+
+/// Where an operation is in its life, as [`InFlight::state`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InFlightState {
+	/// Submitted, waiting for the reactor to hand it to a backend.
+	Pending,
+	/// A backend has it.
+	InFlight,
+	/// The result has landed and waits for its future.
+	Done,
+	/// The future went without the result.
+	Abandoned,
+}
+
+impl InFlightState {
+	fn of(stat: Stat) -> InFlightState {
+		match stat {
+			Stat::Pending => InFlightState::Pending,
+			Stat::InFlight => InFlightState::InFlight,
+			Stat::Done => InFlightState::Done,
+			Stat::Abandoned => InFlightState::Abandoned,
+		}
+	}
+}
+
 /// The submit side of a [`Reactor`].
 ///
 /// An operation names its resource as a [`Handle`]: the operation keeps its own
@@ -1099,6 +1176,29 @@ impl Submitter {
 	/// This reactor's fallback drops; see [`Reactor::fallback_drops`].
 	pub fn fallback_drops(&self) -> u64 {
 		self.shared.fallback_drops.load(Ordering::Relaxed)
+	}
+
+	/// A snapshot of every operation the reactor still holds — the requests
+	/// and the timers — in every state, [`InFlightState::Pending`] through
+	/// [`InFlightState::Abandoned`]. Oldest first, by submission id. Callers
+	/// filter to the states they care about; nothing is left out here.
+	///
+	/// Diagnostic, and read-only: it walks the operation table once under its
+	/// lock and touches no waker, response, stat or backend. A caller at human
+	/// rates pays only that walk; one in a hot loop shares the lock with the
+	/// reactor's own passes and should not call it per operation.
+	pub fn in_flight(&self) -> Vec<InFlight> {
+		let now = Instant::now();
+		let mut held: Vec<InFlight> = {
+			let events = self.shared.events.lock().unwrap();
+			events
+				.entries
+				.iter()
+				.map(|(&id, entry)| InFlight::of(id, entry, now))
+				.collect()
+		};
+		held.sort_by_key(|entry| entry.id);
+		held
 	}
 
 	/// Wakes a reactor that is waiting, and nothing else.
@@ -1342,9 +1442,10 @@ impl Submitter {
 					names_memory: false,
 					kind: "timeout",
 					origin: Location::caller(),
+					submitted: Instant::now(),
 					waiter: false,
 					deadline: Some(deadline),
-					_descriptor: None,
+					descriptor: None,
 				},
 			);
 			id
@@ -1392,9 +1493,10 @@ impl Submitter {
 					names_memory,
 					kind,
 					origin: Location::caller(),
+					submitted: Instant::now(),
 					waiter: false,
 					deadline: None,
-					_descriptor: descriptor,
+					descriptor,
 				},
 			);
 			id

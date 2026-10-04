@@ -6,8 +6,10 @@
 //! yielding what that operation produces. Dropping a `Completion` without
 //! awaiting cancels the operation and returns only once the backend has let go
 //! of the memory it was given. An operation still in flight that named the
-//! caller's memory is a bug: the drop has to wait on it, panicking in a debug
-//! build and logging in a release one.
+//! caller's memory and was never given up is a bug: the drop has to wait on it,
+//! panicking in a debug build and logging in a release one. One whose give-up a
+//! cancel already asked for is not — a stop that cancels a session and lets the
+//! futures go is that path, and the drop reports it without panicking.
 //!
 //! A [`Facade`] is the same operations over one resource: it holds the resource
 //! in a [`Handle`], so an operation that is still in flight keeps it open, and

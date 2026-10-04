@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io;
+use std::panic::Location;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -173,12 +174,14 @@ impl Facade<fs::File> {
 	/// Reads the whole of `mem` at `fdoff`, in one call: a short count is what
 	/// the call moved, not an error. [`read_exact_at`](Self::read_exact_at)
 	/// loops.
+	#[track_caller]
 	pub fn read_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<fs::File> {
 		let extents = whole(&*mem);
-		Transfer::new(self, Kind::Read { fdoff }, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::Read { fdoff }, mem, extents)
 	}
 
 	/// Reads the named ranges of `mem` at `fdoff`, in one call.
+	#[track_caller]
 	pub fn read_vectored_at(
 		&self,
 		mem: Arc<dyn Memory>,
@@ -186,7 +189,7 @@ impl Facade<fs::File> {
 		fdoff: u64,
 	) -> Transfer<fs::File> {
 		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Kind::Read { fdoff }, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::Read { fdoff }, mem, extents)
 	}
 
 	/// Reads the whole of `mem` at `fdoff`, over as many calls as it takes to
@@ -194,13 +197,21 @@ impl Facade<fs::File> {
 	///
 	/// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) when the file ends
 	/// first.
+	#[track_caller]
 	pub fn read_exact_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<fs::File> {
 		let extents = whole(&*mem);
-		Transfer::new(self, Kind::ReadAll { fdoff }, mem, extents)
+		Transfer::new(
+			self,
+			Location::caller(),
+			Kind::ReadAll { fdoff },
+			mem,
+			extents,
+		)
 	}
 
 	/// Reads the named ranges of `mem` at `fdoff`, over as many calls as it
 	/// takes to fill them.
+	#[track_caller]
 	pub fn read_exact_vectored_at(
 		&self,
 		mem: Arc<dyn Memory>,
@@ -208,18 +219,32 @@ impl Facade<fs::File> {
 		fdoff: u64,
 	) -> Transfer<fs::File> {
 		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Kind::ReadAll { fdoff }, mem, extents)
+		Transfer::new(
+			self,
+			Location::caller(),
+			Kind::ReadAll { fdoff },
+			mem,
+			extents,
+		)
 	}
 
 	/// Writes the whole of `mem` at `fdoff`, in one call: a short count is what
 	/// the call moved, not an error. [`write_all_at`](Self::write_all_at)
 	/// loops.
+	#[track_caller]
 	pub fn write_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<fs::File> {
 		let extents = whole(&*mem);
-		Transfer::new(self, Kind::Write { fdoff }, mem, extents)
+		Transfer::new(
+			self,
+			Location::caller(),
+			Kind::Write { fdoff },
+			mem,
+			extents,
+		)
 	}
 
 	/// Writes the named ranges of `mem` at `fdoff`, in one call.
+	#[track_caller]
 	pub fn write_vectored_at(
 		&self,
 		mem: Arc<dyn Memory>,
@@ -227,20 +252,34 @@ impl Facade<fs::File> {
 		fdoff: u64,
 	) -> Transfer<fs::File> {
 		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Kind::Write { fdoff }, mem, extents)
+		Transfer::new(
+			self,
+			Location::caller(),
+			Kind::Write { fdoff },
+			mem,
+			extents,
+		)
 	}
 
 	/// Writes the whole of `mem` at `fdoff`, over as many calls as it takes to
 	/// write it all.
 	///
 	/// [`WriteZero`](io::ErrorKind::WriteZero) when a call writes nothing.
+	#[track_caller]
 	pub fn write_all_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<fs::File> {
 		let extents = whole(&*mem);
-		Transfer::new(self, Kind::WriteAll { fdoff }, mem, extents)
+		Transfer::new(
+			self,
+			Location::caller(),
+			Kind::WriteAll { fdoff },
+			mem,
+			extents,
+		)
 	}
 
 	/// Writes the named ranges of `mem` at `fdoff`, over as many calls as it
 	/// takes to write them all.
+	#[track_caller]
 	pub fn write_all_vectored_at(
 		&self,
 		mem: Arc<dyn Memory>,
@@ -248,12 +287,19 @@ impl Facade<fs::File> {
 		fdoff: u64,
 	) -> Transfer<fs::File> {
 		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Kind::WriteAll { fdoff }, mem, extents)
+		Transfer::new(
+			self,
+			Location::caller(),
+			Kind::WriteAll { fdoff },
+			mem,
+			extents,
+		)
 	}
 
 	/// Makes everything written to the file durable.
+	#[track_caller]
 	pub fn sync(&self) -> Op<fs::File> {
-		Op::new(self, Submitter::fsync)
+		Op::new(self, Location::caller(), Submitter::fsync_at)
 	}
 
 	/// Reports the file's pending deferred write-back errors — `ENOSPC`, `EIO`
@@ -263,17 +309,20 @@ impl Facade<fs::File> {
 	/// of the caller's, and it does not make the data durable — [`sync`](Self::sync)
 	/// is what does that. What it reports is the error the filesystem had
 	/// deferred and would otherwise surface at the file's next close.
+	#[track_caller]
 	pub fn flush(&self) -> Op<fs::File> {
-		Op::new(self, Submitter::flush)
+		Op::new(self, Location::caller(), Submitter::flush_at)
 	}
 }
 
 impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
+	#[track_caller]
 	pub fn wait_readable(&self) -> Op<S> {
-		Op::new(self, Submitter::wait_readable)
+		Op::new(self, Location::caller(), Submitter::wait_readable_at)
 	}
 
+	#[track_caller]
 	pub fn wait_writable(&self) -> Op<S> {
-		Op::new(self, Submitter::wait_writable)
+		Op::new(self, Location::caller(), Submitter::wait_writable_at)
 	}
 }

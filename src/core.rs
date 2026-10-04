@@ -181,6 +181,45 @@ enum Stat {
 	Abandoned,
 }
 
+/// Whether an operation has been asked to stop, and how far the ask has got.
+///
+/// Monotonic: it never goes back to [`GiveUp::None`]. A flag that a reactor
+/// pass cleared could not answer "was this give-up asked for?" once the pass
+/// had carried the ask to a backend, and the drop of a completion whose
+/// give-up a caller had asked for was reported as a lost operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GiveUp {
+	/// Nobody has asked.
+	None,
+	/// Asked, and no reactor pass has carried it out yet.
+	Asked,
+	/// Carried out: a pass handed the ask to a backend, or settled an entry
+	/// that never reached one.
+	Handled,
+}
+
+impl GiveUp {
+	/// Whether anyone asked the operation to stop.
+	fn asked(self) -> bool {
+		self != GiveUp::None
+	}
+
+	/// Records an ask; a second one changes nothing.
+	fn ask(&mut self) {
+		if *self == GiveUp::None {
+			*self = GiveUp::Asked;
+		}
+	}
+
+	/// Records that a pass carried the ask out. An ask nobody made stays
+	/// unmade, which is what keeps "nobody asked" readable at the drop.
+	fn handled(&mut self) {
+		if *self == GiveUp::Asked {
+			*self = GiveUp::Handled;
+		}
+	}
+}
+
 /// One operation, from submission to response.
 struct Entry {
 	request: Option<Request>,
@@ -188,10 +227,11 @@ struct Entry {
 	/// The task waiting for `response`.
 	waker: Option<Waker>,
 	stat: Stat,
-	/// Ask a backend to stop the operation: set by [`Completion::until`] when
+	/// The stop asked of this operation: raised by [`Completion::until`] when
 	/// its cancel fires, and by a dropped completion that has to wait for the
-	/// kernel to let go.
-	cancel: bool,
+	/// kernel to let go. Monotonic, so the drop can tell the give-up it is
+	/// carrying out from an operation nobody gave up.
+	give_up: GiveUp,
 	/// The kernel reads or writes the caller's memory through this operation,
 	/// so going without awaiting it is not just a lost result.
 	names_memory: bool,
@@ -375,8 +415,9 @@ impl Core {
 			let mut pending = Vec::new();
 			let mut cancels = Vec::new();
 			for (id, entry) in entries.iter_mut() {
-				if entry.cancel {
-					entry.cancel = false;
+				// An ask a pass has already carried out is not carried again.
+				if entry.give_up == GiveUp::Asked {
+					entry.give_up.handled();
 					match entry.stat {
 						// Never submitted: there is nothing to stop. A timer is
 						// such a one, and its deadline goes with the cancel.
@@ -468,8 +509,8 @@ impl Core {
 				let mut events = shared.events.lock().unwrap();
 				match events.get_mut(id) {
 					Some(entry) => {
-						let asked = entry.cancel;
-						entry.cancel = false;
+						let asked = entry.give_up.asked();
+						entry.give_up.handled();
 						asked || entry.stat == Stat::Abandoned
 					}
 					None => true,
@@ -617,9 +658,12 @@ struct Shared {
 	/// creation: a second ask would take the core lock.
 	poll_fd: io::Result<Event>,
 	/// How many completions were dropped while their operation still used the
-	/// caller's memory, and so had to be waited out: one per missed cooperative
-	/// cancel. A teardown that has already taken the entry does not count — the
-	/// drop finds nothing to wait for.
+	/// caller's memory, and so had to be waited out. It witnesses a missed
+	/// cooperative cancel: a cancel that is awaited takes its entry out of the
+	/// table, and counts nothing, while a drop that has to wait the operation out
+	/// counts once — a caller's deliberate give-up among them. A teardown that
+	/// has already taken the entry does not count: the drop finds nothing to
+	/// wait for.
 	fallback_drops: AtomicU64,
 }
 
@@ -806,8 +850,9 @@ impl Reactor {
 	}
 
 	/// How many completions this reactor's threads dropped while their
-	/// operation still named the caller's memory: a test witness for a missed
-	/// cooperative cancel, and a diagnostic.
+	/// operation still named the caller's memory, and so had to be waited out:
+	/// a test witness for a cooperative cancel that was not awaited, and a
+	/// diagnostic.
 	pub fn fallback_drops(&self) -> u64 {
 		self.shared.fallback_drops.load(Ordering::Relaxed)
 	}
@@ -841,7 +886,7 @@ impl Drop for Reactor {
 				.retain(|_, entry| entry.stat != Stat::Pending);
 			events.deadlines.clear();
 			for entry in events.entries.values_mut() {
-				entry.cancel = true;
+				entry.give_up.ask();
 			}
 		}
 		let _ = shared.event.notify();
@@ -1086,7 +1131,9 @@ pub struct InFlight {
 	pub id: u64,
 	/// The operation's name: `"read"`, `"send"`, `"timeout"`, and the rest.
 	pub op: &'static str,
-	/// The submitting call site, from `#[track_caller]`.
+	/// The submitting call site. A facade takes it where the operation was
+	/// asked for, through `#[track_caller]`; a [`Submitter`] method called
+	/// directly takes its own caller's, the same way.
 	pub origin: &'static Location<'static>,
 	/// Where the operation is in its life.
 	pub state: InFlightState,
@@ -1095,7 +1142,9 @@ pub struct InFlight {
 	pub descriptor: Option<RawDescriptor>,
 	/// How long since the operation was submitted.
 	pub age: Duration,
-	/// Whether a backend has been asked to stop the operation.
+	/// Whether a stop was asked of the operation — by a cancel racing it, or by
+	/// a drop waiting it out — whether or not a pass has carried the ask to a
+	/// backend yet.
 	pub cancel_requested: bool,
 	/// Whether the kernel reads or writes the caller's memory through it; the
 	/// fact the drop fallback reports an operation left in flight for.
@@ -1113,7 +1162,7 @@ impl InFlight {
 			state: InFlightState::of(entry.stat),
 			descriptor: entry.descriptor.as_ref().map(|held| held.raw),
 			age: now.saturating_duration_since(entry.submitted),
-			cancel_requested: entry.cancel,
+			cancel_requested: entry.give_up.asked(),
 			names_memory: entry.names_memory,
 			deadline: entry.deadline,
 		}
@@ -1155,6 +1204,18 @@ impl InFlightState {
 /// [`BorrowedDescriptor`](crate::BorrowedDescriptor)'s `try_clone_to_owned`
 /// duplicates one into an [`OwnedDescriptor`](crate::OwnedDescriptor), and a
 /// resource comes to a facade through [`Facade::new`](crate::Facade::new).
+///
+/// The submission methods come in pairs, for the two ways a caller reaches
+/// them. The `#[track_caller]` one records the caller's own location; the `_at`
+/// twin takes it as a parameter.
+///
+/// Both exist because an operation is submitted lazily, at its first poll: by
+/// then the frame that asked for it has returned, and the attribute cannot
+/// reach back across a `Future::poll` to it. A facade therefore captures
+/// `Location::caller()` as the operation is built and hands it to the twin —
+/// through the flow loop, whose own calls name the loop, not the caller. A
+/// caller that reaches a submitter directly keeps the attribute and pays
+/// nothing.
 ///
 /// A transfer is one kernel call: it completes with what that call moved,
 /// possibly less than the extents name, and `0` at the end of a file. The
@@ -1225,8 +1286,22 @@ impl Submitter {
 		memory: Arc<dyn Memory>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
+		self.read_at(Location::caller(), fd, fdoff, memory, extents)
+	}
+
+	/// [`read`](Self::read) with the location in hand; see [`Submitter`] for why
+	/// the two exist.
+	pub(super) fn read_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+		fdoff: u64,
+		memory: Arc<dyn Memory>,
+		extents: impl IntoIterator<Item = Extent>,
+	) -> io::Result<Completion> {
 		let raw = fd.raw();
 		self.enqueue(
+			origin,
 			Request::Read {
 				fd: raw,
 				fdoff,
@@ -1247,8 +1322,22 @@ impl Submitter {
 		memory: Arc<dyn Memory>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
+		self.write_at(Location::caller(), fd, fdoff, memory, extents)
+	}
+
+	/// [`write`](Self::write) with the location in hand; see [`Submitter`] for
+	/// why the two exist.
+	pub(super) fn write_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+		fdoff: u64,
+		memory: Arc<dyn Memory>,
+		extents: impl IntoIterator<Item = Extent>,
+	) -> io::Result<Completion> {
 		let raw = fd.raw();
 		self.enqueue(
+			origin,
 			Request::Write {
 				fd: raw,
 				fdoff,
@@ -1265,8 +1354,22 @@ impl Submitter {
 		&self,
 		fd: &Handle<S>,
 	) -> io::Result<Completion> {
+		self.fsync_at(Location::caller(), fd)
+	}
+
+	/// [`fsync`](Self::fsync) with the location in hand; see [`Submitter`] for
+	/// why the two exist.
+	pub(super) fn fsync_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+	) -> io::Result<Completion> {
 		let raw = fd.raw();
-		self.enqueue(Request::Fsync { fd: raw }, Some(Descriptor::new(fd)))
+		self.enqueue(
+			origin,
+			Request::Fsync { fd: raw },
+			Some(Descriptor::new(fd)),
+		)
 	}
 
 	/// Reports the deferred write-back errors of `fd` without forcing it to
@@ -1276,20 +1379,47 @@ impl Submitter {
 		&self,
 		fd: &Handle<S>,
 	) -> io::Result<Completion> {
+		self.flush_at(Location::caller(), fd)
+	}
+
+	/// [`flush`](Self::flush) with the location in hand; see [`Submitter`] for
+	/// why the two exist.
+	pub(super) fn flush_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+	) -> io::Result<Completion> {
 		let raw = fd.raw();
-		self.enqueue(Request::Flush { fd: raw }, Some(Descriptor::new(fd)))
+		self.enqueue(
+			origin,
+			Request::Flush { fd: raw },
+			Some(Descriptor::new(fd)),
+		)
 	}
 
 	/// Receives into the ranges of `memory` named by `extents`.
 	#[track_caller]
-	pub(super) fn recv<S: AsDescriptor + Send + Sync + 'static>(
+	pub fn recv<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
+		fd: &Handle<S>,
+		memory: Arc<dyn Memory>,
+		extents: impl IntoIterator<Item = Extent>,
+	) -> io::Result<Completion> {
+		self.recv_at(Location::caller(), fd, memory, extents)
+	}
+
+	/// [`recv`](Self::recv) with the location in hand; see [`Submitter`] for why
+	/// the two exist.
+	pub(super) fn recv_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
 		fd: &Handle<S>,
 		memory: Arc<dyn Memory>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
 		self.enqueue(
+			origin,
 			Request::Recv {
 				fd: raw,
 				memory,
@@ -1302,14 +1432,27 @@ impl Submitter {
 	/// Receives into the ranges of `memory` named by `extents`, taking the
 	/// descriptors a control message carries with them.
 	#[track_caller]
-	pub(super) fn recv_with_fds<S: AsDescriptor + Send + Sync + 'static>(
+	pub fn recv_with_fds<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
+		fd: &Handle<S>,
+		memory: Arc<dyn Memory>,
+		extents: impl IntoIterator<Item = Extent>,
+	) -> io::Result<Completion> {
+		self.recv_with_fds_at(Location::caller(), fd, memory, extents)
+	}
+
+	/// [`recv_with_fds`](Self::recv_with_fds) with the location in hand; see
+	/// [`Submitter`] for why the two exist.
+	pub(super) fn recv_with_fds_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
 		fd: &Handle<S>,
 		memory: Arc<dyn Memory>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
 		self.enqueue(
+			origin,
 			Request::RecvWithFds {
 				fd: raw,
 				memory,
@@ -1321,14 +1464,27 @@ impl Submitter {
 
 	/// Sends the ranges of `memory` named by `extents`.
 	#[track_caller]
-	pub(super) fn send<S: AsDescriptor + Send + Sync + 'static>(
+	pub fn send<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
+		fd: &Handle<S>,
+		memory: Arc<dyn Memory>,
+		extents: impl IntoIterator<Item = Extent>,
+	) -> io::Result<Completion> {
+		self.send_at(Location::caller(), fd, memory, extents)
+	}
+
+	/// [`send`](Self::send) with the location in hand; see [`Submitter`] for why
+	/// the two exist.
+	pub(super) fn send_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
 		fd: &Handle<S>,
 		memory: Arc<dyn Memory>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
 		self.enqueue(
+			origin,
 			Request::Send {
 				fd: raw,
 				memory,
@@ -1342,8 +1498,21 @@ impl Submitter {
 	/// bytes. The descriptors travel with the bytes that leave first, which is
 	/// the whole call: nothing resumes it.
 	#[track_caller]
-	pub(super) fn send_with_fds<S: AsDescriptor + Send + Sync + 'static>(
+	pub fn send_with_fds<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
+		fd: &Handle<S>,
+		memory: Arc<dyn Memory>,
+		extents: impl IntoIterator<Item = Extent>,
+		fds: Vec<OwnedDescriptor>,
+	) -> io::Result<Completion> {
+		self.send_with_fds_at(Location::caller(), fd, memory, extents, fds)
+	}
+
+	/// [`send_with_fds`](Self::send_with_fds) with the location in hand; see
+	/// [`Submitter`] for why the two exist.
+	pub(super) fn send_with_fds_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
 		fd: &Handle<S>,
 		memory: Arc<dyn Memory>,
 		extents: impl IntoIterator<Item = Extent>,
@@ -1351,6 +1520,7 @@ impl Submitter {
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
 		self.enqueue(
+			origin,
 			Request::SendWithFds {
 				fd: raw,
 				memory,
@@ -1365,36 +1535,82 @@ impl Submitter {
 	/// socket the kernel reports, and closing it is what dropping the response
 	/// does.
 	#[track_caller]
-	pub(super) fn accept<S: AsDescriptor + Send + Sync + 'static>(
+	pub fn accept<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		fd: &Handle<S>,
 	) -> io::Result<Completion> {
+		self.accept_at(Location::caller(), fd)
+	}
+
+	/// [`accept`](Self::accept) with the location in hand; see [`Submitter`] for
+	/// why the two exist.
+	pub(super) fn accept_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+	) -> io::Result<Completion> {
 		let raw = fd.raw();
-		self.enqueue(Request::Accept { fd: raw }, Some(Descriptor::new(fd)))
+		self.enqueue(
+			origin,
+			Request::Accept { fd: raw },
+			Some(Descriptor::new(fd)),
+		)
 	}
 
 	/// Waits for `fd` to become readable.
 	#[track_caller]
-	pub(super) fn wait_readable<S: AsDescriptor + Send + Sync + 'static>(
+	pub fn wait_readable<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		fd: &Handle<S>,
 	) -> io::Result<Completion> {
+		self.wait_readable_at(Location::caller(), fd)
+	}
+
+	/// [`wait_readable`](Self::wait_readable) with the location in hand; see
+	/// [`Submitter`] for why the two exist.
+	pub(super) fn wait_readable_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+	) -> io::Result<Completion> {
 		let raw = fd.raw();
-		self.enqueue(Request::Readable { fd: raw }, Some(Descriptor::new(fd)))
+		self.enqueue(
+			origin,
+			Request::Readable { fd: raw },
+			Some(Descriptor::new(fd)),
+		)
 	}
 
 	/// Waits for `fd` to become writable.
 	#[track_caller]
-	pub(super) fn wait_writable<S: AsDescriptor + Send + Sync + 'static>(
+	pub fn wait_writable<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		fd: &Handle<S>,
 	) -> io::Result<Completion> {
+		self.wait_writable_at(Location::caller(), fd)
+	}
+
+	/// [`wait_writable`](Self::wait_writable) with the location in hand; see
+	/// [`Submitter`] for why the two exist.
+	pub(super) fn wait_writable_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+	) -> io::Result<Completion> {
 		let raw = fd.raw();
-		self.enqueue(Request::Writable { fd: raw }, Some(Descriptor::new(fd)))
+		self.enqueue(
+			origin,
+			Request::Writable { fd: raw },
+			Some(Descriptor::new(fd)),
+		)
 	}
 
 	/// Waits for this reactor's own wake-up (`Submitter::event`), which a
 	/// channel send or a `notify` raises.
+	///
+	/// No facade stands in front of this one, so the attribute reaches the frame
+	/// that asked: a `wake` waited on from the reactor's own thread would
+	/// otherwise name this body.
 	#[track_caller]
 	pub fn wait(&self) -> io::Result<Completion> {
 		if !cfg!(unix) {
@@ -1404,6 +1620,7 @@ impl Submitter {
 			));
 		}
 		self.enqueue(
+			Location::caller(),
 			Request::Readable {
 				fd: self.shared.event.handle(),
 			},
@@ -1417,13 +1634,12 @@ impl Submitter {
 	/// whose deadline a wait is capped at, and the reactor settles it there.
 	#[track_caller]
 	pub fn timeout(&self, duration: Duration) -> io::Result<Completion> {
-		self.arm(Instant::now() + duration)
+		self.arm(Location::caller(), Instant::now() + duration)
 	}
 
 	/// Registers a timer due at `deadline`; the entry `enqueue` makes, without
 	/// the request a backend would need.
-	#[track_caller]
-	fn arm(&self, deadline: Instant) -> io::Result<Completion> {
+	fn arm(&self, origin: &'static Location<'static>, deadline: Instant) -> io::Result<Completion> {
 		let id = {
 			// The check and the insert are one lock hold; see [`Reactor`]'s drop.
 			let mut events = self.shared.events.lock().unwrap();
@@ -1438,10 +1654,10 @@ impl Submitter {
 					response: None,
 					waker: None,
 					stat: Stat::Pending,
-					cancel: false,
+					give_up: GiveUp::None,
 					names_memory: false,
 					kind: "timeout",
-					origin: Location::caller(),
+					origin,
 					submitted: Instant::now(),
 					waiter: false,
 					deadline: Some(deadline),
@@ -1471,8 +1687,17 @@ impl Submitter {
 
 	/// Registers `request` under a fresh id and returns the completion that
 	/// awaits it, with `descriptor` held for as long as the operation lives.
-	#[track_caller]
-	fn enqueue(&self, request: Request, descriptor: Option<Descriptor>) -> io::Result<Completion> {
+	///
+	/// `origin` is the caller's own location, taken by whoever knows it: a facade
+	/// captures it when it builds the operation, because the frame that reaches
+	/// this one through `Flow::submit` is not the frame that asked, and
+	/// `#[track_caller]` cannot cross a `Future::poll` to find it.
+	fn enqueue(
+		&self,
+		origin: &'static Location<'static>,
+		request: Request,
+		descriptor: Option<Descriptor>,
+	) -> io::Result<Completion> {
 		let names_memory = request.names_memory();
 		let kind = request.kind();
 		let id = {
@@ -1489,10 +1714,10 @@ impl Submitter {
 					response: None,
 					waker: None,
 					stat: Stat::Pending,
-					cancel: false,
+					give_up: GiveUp::None,
 					names_memory,
 					kind,
-					origin: Location::caller(),
+					origin,
 					submitted: Instant::now(),
 					waiter: false,
 					deadline: None,
@@ -1728,11 +1953,17 @@ impl Drop for Wait {
 /// completion is not `Drop`: dropping one still releases the entry, while the
 /// userdata can be moved out by [`Completion::tag`].
 ///
-/// An operation still in flight that names the caller's memory is a bug: the
-/// kernel would go on reading or writing memory the caller may free. The drop
-/// stays until the backend has let go — the semantics the caller needs — and
-/// reports the bug. A build with debug assertions panics on it too, once the
-/// backend is off the memory; a release build only reports.
+/// An operation still in flight that names the caller's memory is a bug the
+/// drop has to pay for: the kernel would go on reading or writing memory the
+/// caller may free, so the drop stays until the backend has let go — the
+/// semantics the caller needs — and reports it. A build with debug assertions
+/// panics on it too, once the backend is off the memory; a release build only
+/// reports.
+///
+/// A give-up the caller asked for is not that bug: a cancel that already fired,
+/// or a reactor carrying out a stop, leaves the future to be dropped with the
+/// operation still in flight, and the wait above is the give-up's own path. The
+/// drop reports that at `debug`, and does not panic.
 struct SlotGuard {
 	id: u64,
 	shared: Arc<Shared>,
@@ -1752,8 +1983,13 @@ impl Drop for SlotGuard {
 				// Settled and taken, or the reactor's teardown removed it.
 				return;
 			};
-			let (stat, names_memory, kind, origin) =
-				(entry.stat, entry.names_memory, entry.kind, entry.origin);
+			let (stat, names_memory, kind, origin, give_up) = (
+				entry.stat,
+				entry.names_memory,
+				entry.kind,
+				entry.origin,
+				entry.give_up,
+			);
 			match stat {
 				// Nobody has it yet, and nobody will: it never reaches a
 				// backend. A landed response goes too — dropping it closes any
@@ -1770,7 +2006,7 @@ impl Drop for SlotGuard {
 				Stat::InFlight if !names_memory => {
 					if let Some(entry) = events.get_mut(id) {
 						entry.stat = Stat::Abandoned;
-						entry.cancel = true;
+						entry.give_up.ask();
 					}
 					drop(events);
 					// Nothing else is coming to wake the reactor: the
@@ -1781,25 +2017,41 @@ impl Drop for SlotGuard {
 					return;
 				}
 				// The backend has it and it touches the caller's memory: the
-				// drop has to wait for it to let go. The flags are set here,
-				// under the same lock, so the reactor sees the ask whichever
-				// thread it drains from.
+				// drop has to wait for it to let go. The ask is recorded here,
+				// under the same lock, so the reactor sees it whichever thread
+				// it drains from — and so the wait below can tell the give-up
+				// it is carrying out from an operation nobody gave up.
 				Stat::InFlight => {
 					if let Some(entry) = events.get_mut(id) {
-						entry.cancel = true;
+						entry.give_up.ask();
 						entry.waiter = true;
 					}
 				}
 				Stat::Abandoned => return,
 			}
-			(kind, origin)
+			(kind, origin, give_up)
 		};
-		let (kind, origin) = abandoned;
+		let (kind, origin, give_up) = abandoned;
 		shared.fallback_drops.fetch_add(1, Ordering::Relaxed);
 		let started = Instant::now();
 		wait_released(shared, id);
 		shared.events.lock().unwrap().remove(id);
 		let elapsed = started.elapsed();
+		// A give-up a caller had already asked for is the drop carrying it out,
+		// not a bug: the future went with the memory still named, and the wait
+		// above is what keeps the caller's memory untouched until the backend has
+		// let go. One nobody asked for is the caller losing an operation that
+		// could still be read or written — the case the report is for.
+		if give_up.asked() {
+			log::debug!(
+				id,
+				op = kind,
+				origin:? = origin,
+				elapsed:? = elapsed;
+				"a completion naming caller memory was dropped: the op waited out its end"
+			);
+			return;
+		}
 		log::error!(
 			id,
 			op = kind,
@@ -1822,7 +2074,8 @@ impl Drop for SlotGuard {
 }
 
 /// Waits for the backend to let go of `id`, so the caller may free the memory
-/// the operation named. The entry is already marked cancelled and waiting.
+/// the operation named. The entry's give-up is already recorded and its waiter
+/// flag set, so the reactor's next pass carries the ask and wakes this wait.
 fn wait_released(shared: &Shared, id: u64) {
 	let _ = shared.event.notify();
 	if shared.on_reactor_thread() {
@@ -1928,7 +2181,7 @@ impl<U> Completion<U> {
 		{
 			let mut events = shared.events.lock().unwrap();
 			if let Some(entry) = events.get_mut(self.guard.id) {
-				entry.cancel = true;
+				entry.give_up.ask();
 			}
 		}
 		if shared.parked.load(Ordering::Acquire) {

@@ -9,6 +9,7 @@
 
 use std::future::Future;
 use std::io;
+use std::panic::Location;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -143,6 +144,15 @@ pub(super) fn whole(memory: &dyn Memory) -> Extents {
 	}])
 }
 
+/// One round submitted by a [`Gate`]: the same call for every round, because a
+/// gate lands a whole response and has nothing left to continue.
+///
+/// It takes the caller's location as a parameter: the frame that reaches the
+/// submitter through here is this loop's, not the caller's, and the attribute
+/// that names a caller cannot cross a `Future::poll` to find it.
+pub(super) type Submit<S> =
+	fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>;
+
 /// A transfer's loop: rounds over what is left of the memory.
 pub(super) struct Flow<S> {
 	handle: Handle<S>,
@@ -151,6 +161,9 @@ pub(super) struct Flow<S> {
 	kind: Kind,
 	memory: Arc<dyn Memory>,
 	extents: Extents,
+	/// The caller's location, captured when the operation was built; see
+	/// [`Submitter::read`](crate::Submitter::read).
+	origin: &'static Location<'static>,
 	/// Bytes moved so far; a single round's count is the whole of it.
 	done: usize,
 	control: Control,
@@ -160,6 +173,7 @@ pub(super) struct Flow<S> {
 impl<S> Flow<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
+		origin: &'static Location<'static>,
 		kind: Kind,
 		memory: Arc<dyn Memory>,
 		extents: Extents,
@@ -172,6 +186,7 @@ impl<S> Flow<S> {
 			kind,
 			memory,
 			extents,
+			origin,
 			done: 0,
 			control,
 			call: Call::idle(),
@@ -233,24 +248,25 @@ impl<S: AsDescriptor + Send + Sync + 'static> Flow<S> {
 		let memory = Arc::clone(&self.memory);
 		let submitter = &self.submitter;
 		let handle = &self.handle;
+		let origin = self.origin;
 		match self.kind {
 			Kind::Read { fdoff } | Kind::ReadAll { fdoff } => {
-				submitter.read(handle, fdoff + shift, memory, extents)
+				submitter.read_at(origin, handle, fdoff + shift, memory, extents)
 			}
 			Kind::Write { fdoff } | Kind::WriteAll { fdoff } => {
-				submitter.write(handle, fdoff + shift, memory, extents)
+				submitter.write_at(origin, handle, fdoff + shift, memory, extents)
 			}
 			Kind::Recv | Kind::RecvAll => match &mut self.control {
-				Control::In(_) => submitter.recv_with_fds(handle, memory, extents),
-				_ => submitter.recv(handle, memory, extents),
+				Control::In(_) => submitter.recv_with_fds_at(origin, handle, memory, extents),
+				_ => submitter.recv_at(origin, handle, memory, extents),
 			},
 			Kind::Send | Kind::SendAll => match (&mut self.control, self.done) {
 				// The descriptors travel with the first round's bytes, the only
 				// round that carries them.
 				(Control::Out(fds), 0) => {
-					submitter.send_with_fds(handle, memory, extents, std::mem::take(fds))
+					submitter.send_with_fds_at(origin, handle, memory, extents, std::mem::take(fds))
 				}
-				_ => submitter.send(handle, memory, extents),
+				_ => submitter.send_at(origin, handle, memory, extents),
 			},
 		}
 	}
@@ -287,7 +303,9 @@ pub(super) struct Gate<S> {
 	submitter: Submitter,
 	cancel: Option<Cancel>,
 	/// What the one round submits, taken from [`Submitter`] by name.
-	submit: fn(&Submitter, &Handle<S>) -> io::Result<Completion>,
+	submit: Submit<S>,
+	/// The caller's location, captured when the operation was built.
+	origin: &'static Location<'static>,
 	response: Option<Response>,
 	call: Call,
 }
@@ -295,13 +313,15 @@ pub(super) struct Gate<S> {
 impl<S> Gate<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
-		submit: fn(&Submitter, &Handle<S>) -> io::Result<Completion>,
+		origin: &'static Location<'static>,
+		submit: Submit<S>,
 	) -> Gate<S> {
 		Self {
 			handle: facade.handle().clone(),
 			submitter: facade.submitter().clone(),
 			cancel: None,
 			submit,
+			origin,
 			response: None,
 			call: Call::idle(),
 		}
@@ -327,7 +347,7 @@ impl<S: AsDescriptor + Send + Sync + 'static> Gate<S> {
 				if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
 					return Poll::Ready(Err(Error::Cancelled));
 				}
-				match (self.submit)(&self.submitter, &self.handle) {
+				match (self.submit)(&self.submitter, self.origin, &self.handle) {
 					Ok(completion) => self.call.arm(completion, self.cancel.as_ref()),
 					Err(error) => return Poll::Ready(Err(Error::Io(error))),
 				}
@@ -357,12 +377,13 @@ pub struct Transfer<S> {
 impl<S> Transfer<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
+		origin: &'static Location<'static>,
 		kind: Kind,
 		memory: Arc<dyn Memory>,
 		extents: Extents,
 	) -> Transfer<S> {
 		Self {
-			flow: Flow::new(facade, kind, memory, extents, Control::None),
+			flow: Flow::new(facade, origin, kind, memory, extents, Control::None),
 			finished: false,
 		}
 	}
@@ -370,13 +391,14 @@ impl<S> Transfer<S> {
 	/// A send whose control buffer carries `fds` with the first round's bytes.
 	pub(super) fn with_fds(
 		facade: &Facade<S>,
+		origin: &'static Location<'static>,
 		kind: Kind,
 		memory: Arc<dyn Memory>,
 		extents: Extents,
 		fds: Vec<OwnedDescriptor>,
 	) -> Transfer<S> {
 		Self {
-			flow: Flow::new(facade, kind, memory, extents, Control::Out(fds)),
+			flow: Flow::new(facade, origin, kind, memory, extents, Control::Out(fds)),
 			finished: false,
 		}
 	}
@@ -417,12 +439,20 @@ pub struct Receive<S> {
 impl<S> Receive<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
+		origin: &'static Location<'static>,
 		kind: Kind,
 		memory: Arc<dyn Memory>,
 		extents: Extents,
 	) -> Receive<S> {
 		Self {
-			flow: Flow::new(facade, kind, memory, extents, Control::In(Vec::new())),
+			flow: Flow::new(
+				facade,
+				origin,
+				kind,
+				memory,
+				extents,
+				Control::In(Vec::new()),
+			),
 			finished: false,
 		}
 	}
@@ -464,10 +494,11 @@ pub struct Op<S> {
 impl<S> Op<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
-		submit: fn(&Submitter, &Handle<S>) -> io::Result<Completion>,
+		origin: &'static Location<'static>,
+		submit: Submit<S>,
 	) -> Op<S> {
 		Self {
-			gate: Gate::new(facade, submit),
+			gate: Gate::new(facade, origin, submit),
 			finished: false,
 		}
 	}
@@ -510,10 +541,11 @@ pub struct Accept<S> {
 impl<S> Accept<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
-		submit: fn(&Submitter, &Handle<S>) -> io::Result<Completion>,
+		origin: &'static Location<'static>,
+		submit: Submit<S>,
 	) -> Accept<S> {
 		Self {
-			gate: Gate::new(facade, submit),
+			gate: Gate::new(facade, origin, submit),
 			finished: false,
 		}
 	}

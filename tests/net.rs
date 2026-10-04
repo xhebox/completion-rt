@@ -252,6 +252,54 @@ fn a_given_up_receive_reports_the_cancel() {
 	);
 }
 
+/// The origin a reactor reports names the call that asked for the operation.
+///
+/// A facade takes the location where the operation was asked for, because the
+/// frame that reaches the submitter through the loop is the loop's own; a
+/// report that points at `flow.rs` names code that cannot stop asking.
+#[test]
+fn an_operation_reports_the_line_that_asked_for_it() {
+	let (client, server) = pair();
+	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let socket: Facade<TcpStream> = Facade::new(client, &submitter);
+	let buffer = Arc::new(vec![0u8; 16]);
+	let payload: Arc<dyn completion_rt::Memory> =
+		Arc::clone(&buffer) as Arc<dyn completion_rt::Memory>;
+
+	let before = line!();
+	let mut receive = std::pin::pin!(socket.recv_with_fds(payload));
+	let after = line!();
+	let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+	assert!(
+		std::future::Future::poll(receive.as_mut(), &mut cx).is_pending(),
+		"the peer sends nothing, so the receive waits"
+	);
+	reactor.poll(Some(Duration::ZERO)).unwrap();
+
+	let entry = submitter
+		.in_flight()
+		.into_iter()
+		.find(|entry| entry.op == "recv_with_fds")
+		.expect("the receive is in the reactor");
+	assert_eq!(
+		entry.origin.file(),
+		file!(),
+		"the origin names another file than the caller's"
+	);
+	assert!(
+		(before..=after).contains(&entry.origin.line()),
+		"the origin names line {}, outside the call at {before}..={after}",
+		entry.origin.line()
+	);
+
+	// The peer going ends the receive, so the future is dropped with nothing in
+	// flight: the fallback is not what this test is about.
+	drop(server);
+	while !reactor.is_idle() {
+		reactor.poll(Some(Duration::from_millis(1))).unwrap();
+	}
+}
+
 /// `send_all` moves a payload larger than one call: eight mebibytes do not fit
 /// the socket's buffers, the peer drains while the send goes, and only a loop
 /// puts all of it on the wire.

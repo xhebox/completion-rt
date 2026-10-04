@@ -259,6 +259,51 @@ fn a_reactor_counts_only_its_own_fallback_drops() {
 	}
 }
 
+/// Dropping a completion whose cancel already fired is the given-up path, not a
+/// lost operation: the reactor was asked to stop it, and the drop is what waits
+/// for the kernel to let go.
+///
+/// The drop reports it, and a build with debug assertions does not panic on it —
+/// the panic is for the operation nobody gave up, whose memory could still be
+/// read or written. The cancel is polled through the future first, so the ask is
+/// recorded before the drop, which is the state a device reaches when a stop
+/// cancels the session and then lets the future go.
+#[test]
+fn a_drop_after_the_cancel_fired_is_not_an_unsignalled_one() {
+	use std::panic::{AssertUnwindSafe, catch_unwind};
+
+	let (_left, right) = socket_pair();
+	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let buf = Arc::new(vec![0u8; 8]);
+	let cancel = Cancel::new();
+	let completion = stalled_recv(&submitter, &right, &buf);
+	let mut receive = Box::pin(completion.until(&cancel));
+	let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+	assert!(
+		receive.as_mut().poll(&mut cx).is_pending(),
+		"the peer never sends, so the receive waits"
+	);
+	reactor.poll(Some(Duration::ZERO)).unwrap();
+	assert!(!reactor.is_idle(), "the receive has to be in flight");
+
+	// The cancel fires, and the future is polled once more: that poll asks the
+	// backend to stop the receive, and leaves the ask recorded on the entry.
+	cancel.cancel();
+	assert!(
+		receive.as_mut().poll(&mut cx).is_pending(),
+		"the kernel still holds the receive"
+	);
+
+	let caught = catch_unwind(AssertUnwindSafe(move || drop(receive)));
+	assert!(
+		caught.is_ok(),
+		"a given-up drop panicked; it is the path a clean stop takes"
+	);
+	while !reactor.is_idle() {
+		reactor.poll(Some(Duration::from_millis(1))).unwrap();
+	}
+}
+
 /// A debug build panics on the drop, and the panic comes once the kernel has
 /// let go: the buffer is the caller's again, and the bytes the peer sends
 /// afterwards reach no operation.

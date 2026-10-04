@@ -1,6 +1,7 @@
 //! Socket operations: the receive and the send.
 
 use std::io;
+use std::panic::Location;
 use std::sync::Arc;
 
 use crate::flow::{Accept, Kind, Receive, Transfer, whole};
@@ -43,52 +44,58 @@ pub trait ListenerHandle: AsDescriptor + Send + Sync + 'static {
 impl<S: SocketHandle> Facade<S> {
 	/// Receives into the whole of `mem`, in one call: a short count is what
 	/// arrived, not an error. [`recv_exact`](Facade::recv_exact) loops.
+	#[track_caller]
 	pub fn recv(&self, mem: Arc<dyn Memory>) -> Transfer<S> {
 		let extents = whole(&*mem);
-		Transfer::new(self, Kind::Recv, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::Recv, mem, extents)
 	}
 
 	/// Receives into the named ranges of `mem`, in one call.
+	#[track_caller]
 	pub fn recv_vectored(
 		&self,
 		mem: Arc<dyn Memory>,
 		ranges: impl IntoIterator<Item = Extent>,
 	) -> Transfer<S> {
 		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Kind::Recv, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::Recv, mem, extents)
 	}
 
 	/// Receives into the whole of `mem`, taking the descriptors the control
 	/// messages carry with the bytes.
+	#[track_caller]
 	pub fn recv_with_fds(&self, mem: Arc<dyn Memory>) -> Receive<S> {
 		let extents = whole(&*mem);
-		Receive::new(self, Kind::Recv, mem, extents)
+		Receive::new(self, Location::caller(), Kind::Recv, mem, extents)
 	}
 
 	/// Sends the whole of `mem`, in one call: a short count is what the call
 	/// took, not an error. [`send_all`](Facade::send_all) loops.
+	#[track_caller]
 	pub fn send(&self, mem: Arc<dyn Memory>) -> Transfer<S> {
 		let extents = whole(&*mem);
-		Transfer::new(self, Kind::Send, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::Send, mem, extents)
 	}
 
 	/// Sends the named ranges of `mem`, in one call.
+	#[track_caller]
 	pub fn send_vectored(
 		&self,
 		mem: Arc<dyn Memory>,
 		ranges: impl IntoIterator<Item = Extent>,
 	) -> Transfer<S> {
 		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Kind::Send, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::Send, mem, extents)
 	}
 
 	/// Sends the whole of `mem`, carrying `fds` with the bytes.
 	///
 	/// One call carries the descriptors; see
 	/// [`send_all_with_fds`](Facade::send_all_with_fds) for a send that loops.
+	#[track_caller]
 	pub fn send_with_fds(&self, mem: Arc<dyn Memory>, fds: Vec<OwnedDescriptor>) -> Transfer<S> {
 		let extents = whole(&*mem);
-		Transfer::with_fds(self, Kind::Send, mem, extents, fds)
+		Transfer::with_fds(self, Location::caller(), Kind::Send, mem, extents, fds)
 	}
 
 	/// The error the socket has pending, taking it away: reading `SO_ERROR`
@@ -109,57 +116,63 @@ impl<S: StreamHandle> Facade<S> {
 	///
 	/// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) when the peer closes
 	/// first.
+	#[track_caller]
 	pub fn recv_exact(&self, mem: Arc<dyn Memory>) -> Transfer<S> {
 		let extents = whole(&*mem);
-		Transfer::new(self, Kind::RecvAll, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::RecvAll, mem, extents)
 	}
 
 	/// Receives into the named ranges of `mem`, over as many calls as it takes
 	/// to fill them.
+	#[track_caller]
 	pub fn recv_exact_vectored(
 		&self,
 		mem: Arc<dyn Memory>,
 		ranges: impl IntoIterator<Item = Extent>,
 	) -> Transfer<S> {
 		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Kind::RecvAll, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::RecvAll, mem, extents)
 	}
 
 	/// [`recv_with_fds`](Facade::recv_with_fds) over as many calls as it takes
 	/// to fill `mem`, gathering the descriptors every call brings.
+	#[track_caller]
 	pub fn recv_exact_with_fds(&self, mem: Arc<dyn Memory>) -> Receive<S> {
 		let extents = whole(&*mem);
-		Receive::new(self, Kind::RecvAll, mem, extents)
+		Receive::new(self, Location::caller(), Kind::RecvAll, mem, extents)
 	}
 
 	/// Sends the whole of `mem`, over as many calls as it takes.
 	///
 	/// [`WriteZero`](std::io::ErrorKind::WriteZero) when a call takes nothing.
+	#[track_caller]
 	pub fn send_all(&self, mem: Arc<dyn Memory>) -> Transfer<S> {
 		let extents = whole(&*mem);
-		Transfer::new(self, Kind::SendAll, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::SendAll, mem, extents)
 	}
 
 	/// Sends the named ranges of `mem`, over as many calls as it takes.
+	#[track_caller]
 	pub fn send_all_vectored(
 		&self,
 		mem: Arc<dyn Memory>,
 		ranges: impl IntoIterator<Item = Extent>,
 	) -> Transfer<S> {
 		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Kind::SendAll, mem, extents)
+		Transfer::new(self, Location::caller(), Kind::SendAll, mem, extents)
 	}
 
 	/// Sends the whole of `mem` over as many calls as it takes, carrying `fds`
 	/// with the first call's bytes: descriptors travel with bytes, so the one
 	/// call the kernel took them in is the one they are announced in.
+	#[track_caller]
 	pub fn send_all_with_fds(
 		&self,
 		mem: Arc<dyn Memory>,
 		fds: Vec<OwnedDescriptor>,
 	) -> Transfer<S> {
 		let extents = whole(&*mem);
-		Transfer::with_fds(self, Kind::SendAll, mem, extents, fds)
+		Transfer::with_fds(self, Location::caller(), Kind::SendAll, mem, extents, fds)
 	}
 
 	/// Shuts the stream down, one direction or both. `Write` is the half-close:
@@ -183,8 +196,9 @@ impl<S: StreamHandle> Facade<S> {
 
 impl<S: ListenerHandle> Facade<S> {
 	/// Takes the next connection in: the stream it made, in a facade of its own.
+	#[track_caller]
 	pub fn accept(&self) -> Accept<S> {
-		Accept::new(self, Submitter::accept)
+		Accept::new(self, Location::caller(), Submitter::accept_at)
 	}
 }
 

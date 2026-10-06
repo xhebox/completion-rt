@@ -231,7 +231,6 @@ fn a_given_up_receive_reports_the_cancel() {
 	// can end it.
 	assert!(receive.as_mut().poll(&mut cx).is_pending());
 	reactor.poll(Some(Duration::ZERO)).unwrap();
-	let drops = reactor.fallback_drops();
 	cancel.cancel();
 
 	let outcome = drive(&mut reactor, &mut receive);
@@ -241,11 +240,6 @@ fn a_given_up_receive_reports_the_cancel() {
 		outcome.result
 	);
 	assert_eq!(outcome.value, 0, "nothing arrived for the receive to count");
-	assert_eq!(
-		reactor.fallback_drops(),
-		drops,
-		"the drop fallback answered the cancel, not the until race"
-	);
 	assert!(
 		buffer.iter().all(|byte| *byte == 0),
 		"the receive wrote the buffer it was supposed to leave alone"

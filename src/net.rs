@@ -1,42 +1,539 @@
-//! Socket operations: the receive and the send.
+//! Socket operations and the futures that drive them.
 
+use std::future::Future;
 use std::io;
 use std::panic::Location;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use crate::flow::{Accept, Kind, Receive, Transfer, whole};
-use crate::io::Facade;
-use crate::{AsDescriptor, Extent, Extents, Memory, OwnedDescriptor, OwnedSocket, Submitter};
+use crate::memory::Extents;
+use crate::outcome::{Error, Outcome};
+use crate::{
+	AsDescriptor, Cancel, Completion, Extent, Facade, Handle, Memory, OwnedDescriptor, OwnedSocket,
+	Response, Submitter, Until,
+};
 
-/// A resource a socket facade names: a socket, not a file.
-///
-/// Receiving and sending are only meaningful on a socket, which is what this
-/// marks. It is not sealed: a type of the caller's own is a socket once the
-/// caller implements this and [`AsDescriptor`] for it, and that type owns the
-/// socket — an operation holds the handle, not the number, so an impl over a
-/// bare descriptor would leave it open to be closed and handed out again
-/// underneath the operation. `fs::File`, which is also a resource, is
-/// deliberately not one.
-///
-/// A socket that is a byte stream is also a [`StreamHandle`]; a datagram socket
-/// is this alone.
+#[derive(Clone, Copy)]
+pub(super) enum Kind {
+	Read { fdoff: u64 },
+	Write { fdoff: u64 },
+	ReadAll { fdoff: u64 },
+	WriteAll { fdoff: u64 },
+	Recv,
+	RecvAll,
+	Send,
+	SendAll,
+}
+
+impl Kind {
+	fn mode(self) -> Mode {
+		match self {
+			Kind::Read { .. } | Kind::Write { .. } | Kind::Recv | Kind::Send => Mode::Once,
+			Kind::ReadAll { .. } | Kind::RecvAll => Mode::Fill,
+			Kind::WriteAll { .. } | Kind::SendAll => Mode::Drain,
+		}
+	}
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+	Once,
+	Fill,
+	Drain,
+}
+
+pub(super) enum Control {
+	None,
+	Out(Vec<OwnedDescriptor>),
+	In(Vec<OwnedDescriptor>),
+}
+
+enum Call {
+	Idle,
+	Plain(Completion),
+	Armed(Until<()>),
+}
+
+impl Call {
+	fn idle() -> Call {
+		Call::Idle
+	}
+
+	fn arm(&mut self, completion: Completion, cancel: Option<&Cancel>) {
+		*self = match cancel {
+			Some(cancel) => Call::Armed(completion.until(cancel)),
+			None => Call::Plain(completion),
+		};
+	}
+
+	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Response>>> {
+		match std::mem::replace(self, Call::Idle) {
+			Call::Idle => unreachable!("a round is polled only with one in flight"),
+			Call::Plain(mut completion) => match Pin::new(&mut completion).poll(cx) {
+				Poll::Pending => {
+					*self = Call::Plain(completion);
+					Poll::Pending
+				}
+				Poll::Ready(((), result)) => Poll::Ready(Some(result)),
+			},
+			Call::Armed(mut until) => match Pin::new(&mut until).poll(cx) {
+				Poll::Pending => {
+					*self = Call::Armed(until);
+					Poll::Pending
+				}
+				Poll::Ready(Ok(((), result))) => Poll::Ready(Some(result)),
+				Poll::Ready(Err(_)) => Poll::Ready(None),
+			},
+		}
+	}
+}
+
+fn short(mode: Mode) -> io::Error {
+	match mode {
+		Mode::Fill => io::Error::new(
+			io::ErrorKind::UnexpectedEof,
+			"the source ended before the memory was full",
+		),
+		_ => io::Error::new(io::ErrorKind::WriteZero, "a call moved nothing"),
+	}
+}
+
+pub(super) fn whole(memory: &dyn Memory) -> Extents {
+	Extents::from_slice(&[Extent {
+		offset: 0,
+		len: memory.len(),
+	}])
+}
+
+pub(super) type Submit<S> =
+	fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>;
+
+pub(super) struct Flow<S> {
+	handle: Handle<S>,
+	submitter: Submitter,
+	cancel: Option<Cancel>,
+	kind: Kind,
+	memory: Arc<dyn Memory>,
+	extents: Extents,
+	origin: &'static Location<'static>,
+	done: usize,
+	control: Control,
+	call: Call,
+}
+
+impl<S> Flow<S> {
+	pub(super) fn new(
+		facade: &Facade<S>,
+		origin: &'static Location<'static>,
+		kind: Kind,
+		memory: Arc<dyn Memory>,
+		extents: Extents,
+		control: Control,
+	) -> Flow<S> {
+		Self {
+			handle: facade.handle().clone(),
+			submitter: facade.submitter().clone(),
+			cancel: None,
+			kind,
+			memory,
+			extents,
+			origin,
+			done: 0,
+			control,
+			call: Call::idle(),
+		}
+	}
+
+	pub(super) fn until(mut self, cancel: &Cancel) -> Flow<S> {
+		self.cancel = Some(cancel.clone());
+		self
+	}
+
+	pub(super) fn done(&self) -> usize {
+		self.done
+	}
+
+	pub(super) fn take_fds(&mut self) -> Vec<OwnedDescriptor> {
+		match &mut self.control {
+			Control::In(fds) => std::mem::take(fds),
+			_ => Vec::new(),
+		}
+	}
+}
+
+impl<S: AsDescriptor + Send + Sync + 'static> Flow<S> {
+	pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+		loop {
+			if matches!(self.call, Call::Idle) {
+				if self.kind.mode() != Mode::Once && self.done >= self.extents.len_bytes() {
+					return Poll::Ready(Ok(()));
+				}
+				if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+					return Poll::Ready(Err(Error::Cancelled));
+				}
+				match self.submit() {
+					Ok(completion) => self.call.arm(completion, self.cancel.as_ref()),
+					Err(error) => return Poll::Ready(Err(Error::Io(error))),
+				}
+			}
+			match self.call.poll(cx) {
+				Poll::Pending => return Poll::Pending,
+				Poll::Ready(None) => return Poll::Ready(Err(Error::Cancelled)),
+				Poll::Ready(Some(result)) => match self.landed(result) {
+					Ok(false) => return Poll::Ready(Ok(())),
+					Ok(true) => continue,
+					Err(error) => return Poll::Ready(Err(error)),
+				},
+			}
+		}
+	}
+
+	fn submit(&mut self) -> io::Result<Completion> {
+		let extents = self.extents.skip(self.done);
+		let shift = self.done as u64;
+		let memory = Arc::clone(&self.memory);
+		let submitter = &self.submitter;
+		let handle = &self.handle;
+		let origin = self.origin;
+		match self.kind {
+			Kind::Read { fdoff } | Kind::ReadAll { fdoff } => {
+				submitter.read_at(origin, handle, fdoff + shift, memory, extents)
+			}
+			Kind::Write { fdoff } | Kind::WriteAll { fdoff } => {
+				submitter.write_at(origin, handle, fdoff + shift, memory, extents)
+			}
+			Kind::Recv | Kind::RecvAll => match &mut self.control {
+				Control::In(_) => submitter.recv_with_fds_at(origin, handle, memory, extents),
+				_ => submitter.recv_at(origin, handle, memory, extents),
+			},
+			Kind::Send | Kind::SendAll => match (&mut self.control, self.done) {
+				(Control::Out(fds), 0) => {
+					submitter.send_with_fds_at(origin, handle, memory, extents, std::mem::take(fds))
+				}
+				_ => submitter.send_at(origin, handle, memory, extents),
+			},
+		}
+	}
+
+	fn landed(&mut self, result: io::Result<Response>) -> Result<bool, Error> {
+		let response = result.map_err(Error::Io)?;
+		let (count, fds) = match response {
+			Response::CountWithFds(count, fds) => (count, fds),
+			other => (other.count().map_err(Error::Io)?, Vec::new()),
+		};
+		if let Control::In(gathered) = &mut self.control {
+			gathered.extend(fds);
+		}
+		if self.kind.mode() == Mode::Once {
+			self.done = count;
+			return Ok(false);
+		}
+		if count == 0 {
+			return Err(Error::Io(short(self.kind.mode())));
+		}
+		self.done += count;
+		Ok(true)
+	}
+}
+
+pub(super) struct Gate<S> {
+	handle: Handle<S>,
+	submitter: Submitter,
+	cancel: Option<Cancel>,
+	submit: Submit<S>,
+	origin: &'static Location<'static>,
+	response: Option<Response>,
+	call: Call,
+}
+
+impl<S> Gate<S> {
+	pub(super) fn new(
+		facade: &Facade<S>,
+		origin: &'static Location<'static>,
+		submit: Submit<S>,
+	) -> Gate<S> {
+		Self {
+			handle: facade.handle().clone(),
+			submitter: facade.submitter().clone(),
+			cancel: None,
+			submit,
+			origin,
+			response: None,
+			call: Call::idle(),
+		}
+	}
+
+	pub(super) fn until(mut self, cancel: &Cancel) -> Gate<S> {
+		self.cancel = Some(cancel.clone());
+		self
+	}
+
+	pub(super) fn take_response(&mut self) -> Option<Response> {
+		self.response.take()
+	}
+}
+
+impl<S: AsDescriptor + Send + Sync + 'static> Gate<S> {
+	pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+		loop {
+			if matches!(self.call, Call::Idle) {
+				if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+					return Poll::Ready(Err(Error::Cancelled));
+				}
+				match (self.submit)(&self.submitter, self.origin, &self.handle) {
+					Ok(completion) => self.call.arm(completion, self.cancel.as_ref()),
+					Err(error) => return Poll::Ready(Err(Error::Io(error))),
+				}
+			}
+			match self.call.poll(cx) {
+				Poll::Pending => return Poll::Pending,
+				Poll::Ready(None) => return Poll::Ready(Err(Error::Cancelled)),
+				Poll::Ready(Some(result)) => {
+					self.response = Some(result.map_err(Error::Io)?);
+					return Poll::Ready(Ok(()));
+				}
+			}
+		}
+	}
+}
+
+/// A byte transfer whose [`Outcome`](crate::Outcome) retains partial progress on error or cancellation.
+pub struct Transfer<S> {
+	flow: Flow<S>,
+	finished: bool,
+}
+
+impl<S> Transfer<S> {
+	pub(super) fn new(
+		facade: &Facade<S>,
+		origin: &'static Location<'static>,
+		kind: Kind,
+		memory: Arc<dyn Memory>,
+		extents: Extents,
+	) -> Transfer<S> {
+		Self {
+			flow: Flow::new(facade, origin, kind, memory, extents, Control::None),
+			finished: false,
+		}
+	}
+
+	pub(super) fn with_fds(
+		facade: &Facade<S>,
+		origin: &'static Location<'static>,
+		kind: Kind,
+		memory: Arc<dyn Memory>,
+		extents: Extents,
+		fds: Vec<OwnedDescriptor>,
+	) -> Transfer<S> {
+		Self {
+			flow: Flow::new(facade, origin, kind, memory, extents, Control::Out(fds)),
+			finished: false,
+		}
+	}
+
+	/// Cancels the transfer while retaining bytes already transferred.
+	pub fn until(self, cancel: &Cancel) -> Transfer<S> {
+		let Transfer { flow, .. } = self;
+		Self {
+			flow: flow.until(cancel),
+			finished: false,
+		}
+	}
+}
+
+impl<S: AsDescriptor + Send + Sync + 'static> Future for Transfer<S> {
+	type Output = Outcome<usize>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Outcome<usize>> {
+		let this = self.get_mut();
+		assert!(!this.finished, "a transfer is not polled after it resolved");
+		match this.flow.poll(cx) {
+			Poll::Ready(result) => {
+				this.finished = true;
+				Poll::Ready(Outcome::new(this.flow.done(), result))
+			}
+			Poll::Pending => Poll::Pending,
+		}
+	}
+}
+
+/// Bytes received and descriptors passed in control messages.
+#[derive(Debug)]
+pub struct Received {
+	pub bytes: usize,
+	pub fds: Vec<OwnedDescriptor>,
+}
+
+impl Received {
+	fn new(bytes: usize, fds: Vec<OwnedDescriptor>) -> Received {
+		Self { bytes, fds }
+	}
+}
+
+/// A receive that also takes the descriptors a control message carries.
+pub struct Receive<S> {
+	flow: Flow<S>,
+	finished: bool,
+}
+
+impl<S> Receive<S> {
+	pub(super) fn new(
+		facade: &Facade<S>,
+		origin: &'static Location<'static>,
+		kind: Kind,
+		memory: Arc<dyn Memory>,
+		extents: Extents,
+	) -> Receive<S> {
+		Self {
+			flow: Flow::new(
+				facade,
+				origin,
+				kind,
+				memory,
+				extents,
+				Control::In(Vec::new()),
+			),
+			finished: false,
+		}
+	}
+
+	/// Cancels the receive while retaining bytes and descriptors already received.
+	pub fn until(self, cancel: &Cancel) -> Receive<S> {
+		let Receive { flow, .. } = self;
+		Self {
+			flow: flow.until(cancel),
+			finished: false,
+		}
+	}
+}
+
+impl<S: AsDescriptor + Send + Sync + 'static> Future for Receive<S> {
+	type Output = Outcome<Received>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Outcome<Received>> {
+		let this = self.get_mut();
+		assert!(!this.finished, "a receive is not polled after it resolved");
+		match this.flow.poll(cx) {
+			Poll::Ready(result) => {
+				this.finished = true;
+				let received = Received::new(this.flow.done(), this.flow.take_fds());
+				Poll::Ready(Outcome::new(received, result))
+			}
+			Poll::Pending => Poll::Pending,
+		}
+	}
+}
+
+/// An operation with nothing to hand back: a wait for readiness, or a sync.
+pub struct Op<S> {
+	gate: Gate<S>,
+	finished: bool,
+}
+
+impl<S> Op<S> {
+	pub(super) fn new(
+		facade: &Facade<S>,
+		origin: &'static Location<'static>,
+		submit: Submit<S>,
+	) -> Op<S> {
+		Self {
+			gate: Gate::new(facade, origin, submit),
+			finished: false,
+		}
+	}
+
+	/// Gives the operation up when `cancel` fires.
+	pub fn until(self, cancel: &Cancel) -> Op<S> {
+		let Op { gate, .. } = self;
+		Self {
+			gate: gate.until(cancel),
+			finished: false,
+		}
+	}
+}
+
+impl<S: AsDescriptor + Send + Sync + 'static> Future for Op<S> {
+	type Output = Result<(), Error>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+		let this = self.get_mut();
+		assert!(
+			!this.finished,
+			"an operation is not polled after it resolved"
+		);
+		match this.gate.poll(cx) {
+			Poll::Ready(result) => {
+				this.finished = true;
+				Poll::Ready(result)
+			}
+			Poll::Pending => Poll::Pending,
+		}
+	}
+}
+
+/// An accept: the connection the kernel made, in a facade of its own.
+pub struct Accept<S> {
+	gate: Gate<S>,
+	finished: bool,
+}
+
+impl<S> Accept<S> {
+	pub(super) fn new(
+		facade: &Facade<S>,
+		origin: &'static Location<'static>,
+		submit: Submit<S>,
+	) -> Accept<S> {
+		Self {
+			gate: Gate::new(facade, origin, submit),
+			finished: false,
+		}
+	}
+
+	/// Gives the accept up when `cancel` fires. A connection the kernel made
+	/// anyway goes with the future, and is closed with it.
+	pub fn until(self, cancel: &Cancel) -> Accept<S> {
+		let Accept { gate, .. } = self;
+		Self {
+			gate: gate.until(cancel),
+			finished: false,
+		}
+	}
+}
+
+impl<S: ListenerHandle> Future for Accept<S> {
+	type Output = Result<Facade<S::Stream>, Error>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Facade<S::Stream>, Error>> {
+		let this = self.get_mut();
+		assert!(!this.finished, "an accept is not polled after it resolved");
+		match this.gate.poll(cx) {
+			Poll::Pending => Poll::Pending,
+			Poll::Ready(Err(error)) => {
+				this.finished = true;
+				Poll::Ready(Err(error))
+			}
+			Poll::Ready(Ok(())) => {
+				this.finished = true;
+				let response = this.gate.take_response();
+				match response {
+					Some(Response::Accepted(socket)) => {
+						Poll::Ready(Ok(Facade::new(socket, &this.gate.submitter)))
+					}
+					other => unreachable!("an accept's round reports a socket, not {other:?}"),
+				}
+			}
+		}
+	}
+}
+
+/// A socket supporting send and receive operations. Implementable by caller-owned socket types.
 pub trait SocketHandle: AsDescriptor + Send + Sync + 'static {}
 
-/// A socket pair that carries a byte stream, with the loops a stream needs and
-/// a datagram has no use for.
-///
-/// A stream keeps no messages: a receive may take half of what a send made, so
-/// the loops over the calls are what fill a memory and empty one. A datagram
-/// socket takes a message per call and sends one — there is nothing to
-/// continue, so none of `recv_exact`, `send_all` and their like is on it.
+/// A byte-stream socket, supporting `*_exact` and `*_all` transfers.
 pub trait StreamHandle: SocketHandle {}
 
-/// A socket a connection can be taken out of.
-///
-/// The stream the accept reports is named by [`Stream`](Self::Stream): the
-/// listener says what its connections are, and the caller gets a typed facade
-/// for them. Not a [`SocketHandle`]: a listener is only listened on, and
-/// receiving from it is a mistake the type should not allow.
+/// A listening socket with a typed accepted stream.
 pub trait ListenerHandle: AsDescriptor + Send + Sync + 'static {
 	type Stream: StreamHandle + From<OwnedSocket>;
 }
@@ -98,13 +595,7 @@ impl<S: SocketHandle> Facade<S> {
 		Transfer::with_fds(self, Location::caller(), Kind::Send, mem, extents, fds)
 	}
 
-	/// The error the socket has pending, taking it away: reading `SO_ERROR`
-	/// clears it, so a second call reports nothing — what
-	/// `TcpStream::take_error` does, over a descriptor this crate only borrows.
-	///
-	/// An error the kernel reports asynchronously — a refused datagram, a reset
-	/// the next call would otherwise surface — is what this reads; a healthy
-	/// socket has none.
+	/// Takes and clears the socket's pending error. Failure to read the error is returned as the outer `Err`.
 	pub fn take_error(&self) -> io::Result<Option<io::Error>> {
 		imp::take_error((**self.handle()).as_descriptor())
 	}
@@ -162,9 +653,7 @@ impl<S: StreamHandle> Facade<S> {
 		Transfer::new(self, Location::caller(), Kind::SendAll, mem, extents)
 	}
 
-	/// Sends the whole of `mem` over as many calls as it takes, carrying `fds`
-	/// with the first call's bytes: descriptors travel with bytes, so the one
-	/// call the kernel took them in is the one they are announced in.
+	/// Sends all of `mem`, attaching `fds` only to the first call's bytes.
 	#[track_caller]
 	pub fn send_all_with_fds(
 		&self,
@@ -175,20 +664,7 @@ impl<S: StreamHandle> Facade<S> {
 		Transfer::with_fds(self, Location::caller(), Kind::SendAll, mem, extents, fds)
 	}
 
-	/// Shuts the stream down, one direction or both. `Write` is the half-close:
-	/// the peer reads end of file from there, and the receive side stays open,
-	/// so what the peer sends afterwards is still received. `Both` closes the
-	/// two directions.
-	///
-	/// It is not how an operation in flight is given up — that is a
-	/// [`Cancel`](crate::Cancel) on the future's [`until`](Transfer::until). A
-	/// shutdown is a plain call on the descriptor: it tells the kernel, and what
-	/// an operation already with the kernel then does is the kernel's to report.
-	/// A receive in flight when `Read` or `Both` is asked for ends with that
-	/// report — zero bytes on Linux; the portable backend's poller reports the
-	/// socket ready and the call reads the same zero. A send in flight when
-	/// `Write` or `Both` is asked for fails with the error a closed send side
-	/// gives — [`BrokenPipe`](io::ErrorKind::BrokenPipe) and the like.
+	/// Shuts down one or both directions. `Write` sends EOF to the peer without closing the receive side.
 	pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
 		imp::shutdown((**self.handle()).as_descriptor(), how)
 	}
@@ -227,10 +703,6 @@ mod platform {
 	}
 }
 
-/// The one synchronous socket call each platform spells for itself: the
-/// shutdown how is `SHUT_RD`/`SHUT_WR`/`SHUT_RDWR` on unix and
-/// `SD_RECEIVE`/`SD_SEND`/`SD_BOTH` on Windows, and `SO_ERROR` comes back
-/// through a different call on each.
 #[cfg(unix)]
 mod imp {
 	use std::io;
@@ -238,7 +710,7 @@ mod imp {
 
 	use crate::BorrowedDescriptor;
 
-	pub fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
+	pub(super) fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
 		let how = match how {
 			Shutdown::Read => rustix::net::Shutdown::Read,
 			Shutdown::Write => rustix::net::Shutdown::Write,
@@ -247,9 +719,7 @@ mod imp {
 		rustix::net::shutdown(descriptor, how).map_err(io::Error::from)
 	}
 
-	pub fn take_error(descriptor: BorrowedDescriptor<'_>) -> io::Result<Option<io::Error>> {
-		// `socket_error` reads and clears `SO_ERROR`: the outer result is the
-		// `getsockopt` call, the inner the error the socket held.
+	pub(super) fn take_error(descriptor: BorrowedDescriptor<'_>) -> io::Result<Option<io::Error>> {
 		match rustix::net::sockopt::socket_error(descriptor)? {
 			Ok(()) => Ok(None),
 			Err(errno) => Ok(Some(errno.into())),
@@ -271,7 +741,7 @@ mod imp {
 
 	use crate::BorrowedDescriptor;
 
-	pub fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
+	pub(super) fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
 		let how = match how {
 			Shutdown::Read => SD_RECEIVE,
 			Shutdown::Write => SD_SEND,
@@ -283,7 +753,7 @@ mod imp {
 		Ok(())
 	}
 
-	pub fn take_error(descriptor: BorrowedDescriptor<'_>) -> io::Result<Option<io::Error>> {
+	pub(super) fn take_error(descriptor: BorrowedDescriptor<'_>) -> io::Result<Option<io::Error>> {
 		let mut value: i32 = 0;
 		let mut len = size_of::<i32>() as i32;
 		let socket = socket(descriptor)?;
@@ -302,8 +772,6 @@ mod imp {
 		Ok((value != 0).then(|| io::Error::from_raw_os_error(value)))
 	}
 
-	/// The socket a descriptor names: `shutdown` and `SO_ERROR` are socket
-	/// calls, and a descriptor of the other family is not one.
 	fn socket(descriptor: BorrowedDescriptor<'_>) -> io::Result<SOCKET> {
 		match descriptor {
 			BorrowedDescriptor::Socket(socket) => Ok(socket.as_raw_socket() as SOCKET),

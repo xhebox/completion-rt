@@ -1,6 +1,4 @@
-//! Linux `io_uring` backend: one ring, and either a completion eventfd or —
-//! when the ring is set up for IOPOLL — plain polling, where completions
-//! exist only because someone asked the kernel to look at the device.
+//! Linux `io_uring` backend.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -11,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use crate::core::Response;
 use crate::desc::{RawHandle, from_raw_socket};
+use crate::memory::Extents;
 use crate::memory::Spans;
-use crate::{Extents, Memory, OwnedDescriptor, Span};
+use crate::{Memory, OwnedDescriptor, Span};
 use io_uring::{EnterFlags, IoUring, opcode, squeue, types};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
@@ -21,7 +20,6 @@ use super::Backend;
 use crate::backend::Config;
 use crate::event::Event;
 
-/// `poll(2)` timeouts are a `Timespec`.
 fn timespec(duration: Duration) -> rustix::event::Timespec {
 	rustix::event::Timespec {
 		tv_sec: duration.as_secs() as _,
@@ -29,19 +27,15 @@ fn timespec(duration: Duration) -> rustix::event::Timespec {
 	}
 }
 
-/// `io_uring` rounds this up to a power of two and refuses zero.
 const MIN_RING_ENTRIES: u32 = 2;
 
-/// The most descriptors one control message carries: a memory table has at
-/// most eight regions.
+/// Maximum descriptors per control message.
 const MAX_FDS: usize = 8;
 
-/// The `poll(2)` mask for a readable wait.
 fn readable_mask() -> u32 {
 	rustix::event::PollFlags::IN.bits() as u32
 }
 
-/// The `poll(2)` mask for a writable wait.
 fn writable_mask() -> u32 {
 	rustix::event::PollFlags::OUT.bits() as u32
 }
@@ -54,7 +48,6 @@ const CANCEL_TOKEN: u64 = 0;
 /// start at one and would have to wrap the counter to reach this.
 const NOTIFY_TOKEN: u64 = u64::MAX;
 
-/// What a completion reports, in the shape [`Response`] wants.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Kind {
 	Count,
@@ -63,7 +56,6 @@ enum Kind {
 	Done,
 }
 
-/// One operation in flight.
 enum Step {
 	Read {
 		fd: RawHandle,
@@ -91,16 +83,12 @@ enum Step {
 		fd: RawHandle,
 		memory: Arc<dyn Memory>,
 		extents: Extents,
-		/// The descriptors the call carries. `prepare` moves them into the
-		/// control buffer, which holds them until the entry has run.
 		fds: Vec<OwnedDescriptor>,
 	},
 	Fsync {
 		fd: RawHandle,
 	},
 	Flush {
-		/// The duplicate `flush` made; the CLOSE entry closes this one, so the
-		/// caller's descriptor stays open.
 		fd: RawHandle,
 	},
 	Accept {
@@ -118,8 +106,6 @@ impl Step {
 	fn kind(&self) -> Kind {
 		match self {
 			Step::RecvWithFds { .. } => Kind::CountWithFds,
-			// An accept reports the descriptor the kernel created where a
-			// transfer reports its count.
 			Step::Accept { .. } => Kind::Accepted,
 			Step::Fsync { .. }
 			| Step::Flush { .. }
@@ -130,19 +116,12 @@ impl Step {
 	}
 }
 
-/// The `msghdr`, iovec and control buffer a `recvmsg`/`sendmsg` names.
-///
-/// All three have to live until the completion: the header points at the other
-/// two, and the kernel reads them when it runs the entry — not when it is
-/// queued.
+/// The kernel dereferences the header and its buffers at execution, so all must remain stable until completion.
 struct Control {
 	msg: Box<libc::msghdr>,
-	/// The iovec the header points at, and the control buffer it names:
-	/// held so that both outlive the entry, never read.
 	_iov: Box<libc::iovec>,
 	_cmsg: Box<[u8]>,
-	/// The descriptors a send carries. They stay open until the entry has run,
-	/// because the kernel copies them when it executes the call.
+	/// Descriptors must stay open until the kernel executes the send.
 	_fds: Vec<OwnedDescriptor>,
 }
 
@@ -152,12 +131,10 @@ struct Control {
 unsafe impl Send for Control {}
 
 impl Control {
-	/// A control buffer that takes whatever arrives with `len` bytes at `buf`.
 	fn receive(buf: *mut u8, len: usize) -> Control {
 		Control::new(buf, len, Vec::new(), true)
 	}
 
-	/// A control message carrying `fds` with the first bytes of a send.
 	fn send(buf: *const u8, len: usize, fds: Vec<OwnedDescriptor>) -> Control {
 		Control::new(buf.cast_mut(), len, fds, false)
 	}
@@ -174,8 +151,6 @@ impl Control {
 		msg.msg_iov = iov.as_mut() as *mut libc::iovec;
 		msg.msg_iovlen = 1;
 		let control_len = if fds.is_empty() {
-			// A receive owns the space; the kernel fills it and reports how
-			// much of it it used.
 			cmsg.len()
 		} else {
 			(unsafe { libc::CMSG_LEN((fds.len() * size_of::<libc::c_int>()) as u32) }) as usize
@@ -204,12 +179,10 @@ impl Control {
 		}
 	}
 
-	/// The header the ring entry names.
 	fn message(&mut self) -> *mut libc::msghdr {
 		&mut *self.msg
 	}
 
-	/// The descriptors the kernel wrote into the control buffer.
 	fn take_fds(&mut self) -> Vec<OwnedDescriptor> {
 		let mut out = Vec::new();
 		let msg: *mut libc::msghdr = &mut *self.msg;
@@ -234,57 +207,37 @@ impl Control {
 	}
 }
 
-/// One submission in flight: the operation and the iovec array its SQE names
-/// (which has to live until the completion).
 struct Active {
 	step: Step,
-	/// The resolved iovec array: the SQE names it, so it has to live until the
-	/// completion lands. Held for that, never read.
+	/// The SQE points to this allocation until completion.
 	_buffers: Spans,
-	/// The control buffer a `recvmsg`/`sendmsg` names.
 	control: Option<Control>,
-	/// The descriptors a receive has collected so far.
 	fds: Vec<OwnedDescriptor>,
 }
 
-pub struct Uring {
+pub(crate) struct Uring {
 	ring: IoUring,
-	/// Absent under IOPOLL: there the kernel has nothing to notify us with,
-	/// because a completion only exists once somebody polls the device.
 	completion: Option<Event>,
-	/// The ring was set up to be polled rather than waited on.
 	iopoll: bool,
-	/// The in-flight submissions, each with the spans its SQE points at.
 	active: HashMap<u64, Active>,
-	/// Completions the kernel reported and nobody took yet. One entry into the
-	/// kernel can produce several, and each is taken on its own.
 	ready: VecDeque<(u64, io::Result<Response>)>,
-	/// Whether the kernel accepts `IORING_ENTER_NO_IOWAIT` (Linux 6.15+).
-	/// Without it the wait stays a poll on the notification, because an older
-	/// kernel answers EINVAL for the bit — and would book the sleep as iowait.
+	/// `IORING_ENTER_NO_IOWAIT` requires Linux 6.15+ support; older kernels use the notification fd to avoid iowait accounting.
 	no_iowait: bool,
-	/// Whether the wake-up poll is in the ring, so a `notify` from another
-	/// thread completes an operation and wakes the wait.
 	notify_armed: bool,
-	/// Whether a kernel thread consumes submissions (`SQPOLL`): it sleeps
-	/// while the queue is empty, and only an `io_uring_enter` wakes it.
 	sqpoll: bool,
 }
 
-/// The event's descriptor, in the shape a poller wants.
 fn borrowed(event: &Event) -> BorrowedFd<'_> {
 	event.descriptor()
 }
 
 impl Uring {
-	pub fn new(config: &Config) -> io::Result<(Uring, Event)> {
+	pub(super) fn new(config: &Config) -> io::Result<(Uring, Event)> {
 		let mut builder = IoUring::builder();
 		if config.iopoll {
 			builder.setup_iopoll();
 		}
 		if config.sqpoll {
-			// Milliseconds of spinning before the kernel thread sleeps; zero
-			// leaves the choice to the kernel.
 			builder.setup_sqpoll(0);
 		}
 		let ring = builder.build(config.entries.max(MIN_RING_ENTRIES))?;
@@ -292,12 +245,8 @@ impl Uring {
 		let sqpoll = ring.params().is_setup_sqpoll();
 		let no_iowait = ring.params().is_feature_no_iowait();
 		let (completion, event) = if iopoll {
-			// An IOPOLL ring completes only while somebody polls it, so
-			// there is nothing for a submission to wake.
 			(None, Event::new()?)
 		} else {
-			// The ring writes the eventfd as it completes, and the same
-			// descriptor is what a caller raises to break the wait.
 			let event = Event::new()?;
 			ring.submitter()
 				.register_eventfd(event.handle().as_raw_fd())?;
@@ -318,9 +267,6 @@ impl Uring {
 		))
 	}
 
-	/// Waits for the completion notification, then clears it: one
-	/// notification can cover several completions, and the wait is what earns
-	/// the right to clear it — see `poll`.
 	fn wait_notification(&self, timeout: Option<Duration>) -> io::Result<()> {
 		let Some(event) = self.completion.as_ref() else {
 			return Ok(());
@@ -338,9 +284,6 @@ impl Uring {
 		self.drain_notification()
 	}
 
-	/// Clears the completion notification. The kernel writes it once per
-	/// completion, and a counter nobody reads reports ready forever to a
-	/// [`PollMode::Fd`](crate::PollMode::Fd) caller.
 	fn drain_notification(&self) -> io::Result<()> {
 		let Some(event) = self.completion.as_ref() else {
 			return Ok(());
@@ -356,11 +299,7 @@ impl Uring {
 		Ok(())
 	}
 
-	/// Arms the second wake-up the wait has to see: a standing poll on the
-	/// wake-up descriptor, so a `notify` from another thread wakes
-	/// [`Self::enter_wait`].
-	/// A completion of its own writes the same descriptor, so this poll can
-	/// fire for a completion that raced it; the waiter re-arms either way.
+	/// Polling the notification fd makes external wakes visible to `enter_wait`.
 	fn arm_notify(&mut self) -> io::Result<()> {
 		if self.notify_armed {
 			return Ok(());
@@ -376,29 +315,18 @@ impl Uring {
 		Ok(())
 	}
 
-	/// The flags a blocking wait carries. `NO_IOWAIT` goes to a kernel that
-	/// reports the feature, unless the `iowait` feature withholds it; see
-	/// [`Uring::no_iowait`].
 	fn wait_flags(&self) -> EnterFlags {
 		let mut flags = EnterFlags::GETEVENTS | EnterFlags::EXT_ARG;
 		if self.no_iowait && !cfg!(feature = "iowait") {
 			flags |= EnterFlags::NO_IOWAIT;
 		}
 		if self.sqpoll {
-			// The kernel thread consumes the queue, so the call is here to
-			// wake it when the queue was empty and it went to sleep.
 			flags |= EnterFlags::SQ_WAKEUP;
 		}
 		flags
 	}
 
-	/// Submits what is queued and sleeps until a completion arrives or
-	/// `timeout` passes.
-	///
-	/// `Submitter::submit_and_wait` and `submit_with_args` cannot carry
-	/// `NO_IOWAIT`, so this issues their `io_uring_enter` itself. `GETEVENTS`
-	/// also flushes an overflowed completion queue, so those helpers would add
-	/// nothing else.
+	/// The io-uring submit helpers cannot carry `NO_IOWAIT`, so call `io_uring_enter` directly.
 	fn enter_wait(&mut self, timeout: Option<Duration>) -> io::Result<()> {
 		let flags = self.wait_flags().bits();
 		loop {
@@ -420,22 +348,16 @@ impl Uring {
 			};
 			match result {
 				Ok(_) => return Ok(()),
-				// The deadline passed; whatever completed is reaped anyway.
 				Err(error) if error.raw_os_error() == Some(Errno::TIME.raw_os_error()) => {
 					return Ok(());
 				}
-				// A signal interrupts the wait; that is not a poll failure, and
-				// whatever it meant to report shows up on the next round.
 				Err(error) if error.raw_os_error() == Some(Errno::INTR.raw_os_error()) => continue,
 				Err(error) => return Err(error),
 			}
 		}
 	}
 
-	/// IOPOLL produces nothing on its own: each pass asks the kernel to look
-	/// at the device once, and without a timeout it keeps asking until a
-	/// completion lands. Spinning instead of sleeping is the point of the
-	/// mode, so the loop does not yield.
+	/// IOPOLL must actively poll the device; without a timeout, spin until completion.
 	fn poll_devices(&mut self, timeout: Option<Duration>) -> io::Result<()> {
 		let start = Instant::now();
 		loop {
@@ -455,16 +377,11 @@ impl Uring {
 		}
 	}
 
-	/// One `io_uring_enter` carrying GETEVENTS, which is what makes the kernel
-	/// poll the device. With SQPOLL that thread does its own polling, and this
-	/// costs a load of the SQ flags.
 	fn drive(&mut self) -> io::Result<()> {
 		self.ring.submitter().submit_and_wait(0)?;
 		Ok(())
 	}
 
-	/// Takes every CQE the kernel has posted, releasing each operation's
-	/// iovec array as its completion is collected.
 	fn reap(&mut self) -> io::Result<()> {
 		{
 			let ring = &mut self.ring;
@@ -475,13 +392,9 @@ impl Uring {
 				let id = cqe.user_data();
 				let entry = active.remove(&id);
 				if id == CANCEL_TOKEN {
-					// A cancel has no waiter; its result only says whether the
-					// kernel found the operation.
 					continue;
 				}
 				if id == NOTIFY_TOKEN {
-					// The wake-up poll fired; the waiter arms it again before the
-					// next sleep.
 					*notify_armed = false;
 					continue;
 				}
@@ -492,7 +405,6 @@ impl Uring {
 				}
 				let moved = moved as usize;
 				let Some(mut active) = entry else {
-					// The submission was dropped before its completion landed.
 					ready.push_back((id, Ok(Response::Done)));
 					continue;
 				};
@@ -504,8 +416,6 @@ impl Uring {
 				let response = match active.step.kind() {
 					Kind::Count => Response::Count(moved),
 					Kind::CountWithFds => Response::CountWithFds(moved, active.fds),
-					// `moved` is the descriptor the kernel created for the
-					// accept, and the response is its only owner.
 					Kind::Accepted => {
 						let handle = RawHandle::from_raw(moved);
 						// SAFETY: the kernel created this descriptor for the
@@ -520,7 +430,6 @@ impl Uring {
 		Ok(())
 	}
 
-	/// The ring entry for one operation.
 	fn prepare(
 		&mut self,
 		step: &mut Step,
@@ -604,8 +513,6 @@ impl Uring {
 						"an accept cannot complete on an IOPOLL ring; give it a ring of its own",
 					));
 				}
-				// `accept4` flags: the new descriptor is non-blocking, and it is
-				// not the kind of thing a child process should inherit.
 				let flags = (rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK)
 					.bits() as i32;
 				let entry = opcode::Accept::new(
@@ -624,8 +531,6 @@ impl Uring {
 				extents,
 			} => {
 				let buffers = crate::memory::spans(memory, extents)?;
-				// The ring takes one buffer for a socket transfer; a vectored
-				// one would be a `recvmsg`.
 				let [buf] = buffers.as_slice() else {
 					return Err(io::Error::new(
 						io::ErrorKind::Unsupported,
@@ -657,7 +562,6 @@ impl Uring {
 				let message = area.message();
 				*control = Some(area);
 				let entry = opcode::RecvMsg::new(types::Fd(fd.as_raw_fd()), message)
-					// The descriptors arrive without crossing an exec.
 					.flags(libc::MSG_CMSG_CLOEXEC as u32)
 					.build()
 					.user_data(id);
@@ -695,8 +599,6 @@ impl Uring {
 				}
 			}
 			Step::Readable { fd } => {
-				// A wait reports once per submission, so a caller that wants to
-				// keep waiting submits again.
 				let entry = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), readable_mask());
 				(entry.build().user_data(id), Spans::new())
 			}
@@ -708,7 +610,6 @@ impl Uring {
 		Ok((entry, buffers))
 	}
 
-	/// Hands one operation to the ring.
 	fn submit(&mut self, id: u64, step: Step) -> io::Result<()> {
 		let mut step = step;
 		let mut control = None;
@@ -722,10 +623,7 @@ impl Uring {
 				fds: Vec::new(),
 			},
 		);
-		// The entry is queued here and reaches the kernel with the next wait,
-		// so one `io_uring_enter` carries a whole pass's submissions. Under
-		// SQPOLL the kernel thread consumes the queue itself, but it sleeps
-		// when the queue was empty: the call here is what wakes it.
+		// SQPOLL consumes submissions itself but needs a syscall to wake its sleeping thread.
 		let result = push(&mut self.ring, entry).and_then(|()| {
 			if self.sqpoll {
 				self.ring.submit()?;
@@ -784,10 +682,6 @@ impl Backend for Uring {
 	}
 
 	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
-		// The close has to name a descriptor this operation owns, so the one
-		// the caller named stays open. The duplicate is made here, at submit,
-		// because a failure to make it is the operation's outcome — the same
-		// way a submit-time fsync failure is.
 		let dup = unsafe { libc::dup(fd.as_raw_fd()) };
 		if dup < 0 {
 			return Err(io::Error::last_os_error());
@@ -795,10 +689,7 @@ impl Backend for Uring {
 		let dup = RawHandle::from_raw(dup as usize);
 		let result = self.submit(id, Step::Flush { fd: dup });
 		if result.is_err() {
-			// The ring never took the entry, so the duplicate has to go here
-			// or it leaks. EINTR is not retried: Linux has already closed the
-			// descriptor, and a retry could close a number something else has
-			// reused.
+			// Submission failed: close the duplicate. Do not retry EINTR; Linux already closed it and may reuse the number.
 			unsafe { libc::close(dup.as_raw_fd()) };
 		}
 		result
@@ -899,26 +790,15 @@ impl Backend for Uring {
 		if self.iopoll {
 			self.poll_devices(timeout)?;
 		} else if timeout == Some(Duration::ZERO) {
-			// Not waiting is not having waited. The notification is how
-			// another thread says "look at this": clearing it here would
-			// swallow a wake-up raised while this poll ran, and the caller
-			// that polls without waiting has not looked at anything yet.
-			// Draining it after a wait is what keeps a countered eventfd from
-			// returning empty batches instead of blocking.
+			// Only clear notifications after a wait; a nonblocking poll must not consume an unseen cross-thread wake.
 			self.ring.submit()?;
 			self.reap()?;
 		} else if self.no_iowait {
-			// One syscall carries the submissions and the sleep. `NO_IOWAIT`
-			// keeps an idle device thread out of the host's iowait
-			// accounting: the ring always has something armed, so the kernel
-			// would otherwise book every one of these sleeps as I/O wait.
 			self.arm_notify()?;
 			self.enter_wait(timeout)?;
 			self.drain_notification()?;
 			self.reap()?;
 		} else {
-			// An older kernel rejects the bit, so the wait stays a poll on the
-			// notification.
 			self.ring.submit()?;
 			self.wait_notification(timeout)?;
 			self.reap()?;
@@ -956,8 +836,7 @@ impl Backend for Uring {
 	}
 }
 
-/// Pushes one SQE. A full ring is the caller's to retry: under SQPOLL the
-/// consumption happens on another thread, so spinning here cannot free space.
+/// Return a full-ring error to the caller rather than spinning for space.
 fn push(ring: &mut IoUring, entry: squeue::Entry) -> io::Result<()> {
 	if try_push(ring, &entry) {
 		return Ok(());
@@ -982,8 +861,6 @@ fn count(bufs: &[Span]) -> io::Result<u32> {
 		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many buffers"))
 }
 
-/// Whether `error` is the ring's cancellation: an `AsyncCancel`ed operation
-/// reports `-ECANCELED`.
 pub(super) fn cancelled(error: &io::Error) -> bool {
 	error.raw_os_error() == Some(Errno::CANCELED.raw_os_error())
 }
@@ -1028,7 +905,6 @@ mod tests {
 			!uring.wait_flags().contains(EnterFlags::NO_IOWAIT),
 			"an older kernel answers EINVAL for the bit"
 		);
-		// Nothing is in flight, so the wait can only end at its deadline.
 		let start = Instant::now();
 		let waited = uring.poll(Some(Duration::from_millis(5)));
 		assert!(
@@ -1040,7 +916,6 @@ mod tests {
 			"the wait did not hold for its deadline"
 		);
 
-		// And a raise from another thread still wakes it.
 		let raiser = event.clone();
 		let thread = std::thread::spawn(move || {
 			std::thread::sleep(Duration::from_millis(20));

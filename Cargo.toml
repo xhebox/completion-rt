@@ -10,7 +10,6 @@ license = "MIT"
 repository = "https://github.com/xhebox/completion-rt"
 
 [dependencies]
-async-executor = "1"
 enum_dispatch = "0.3.13"
 log = { version = "0.4.34", features = ["std", "kv"] }
 smallvec = "1"
@@ -40,3 +39,6 @@ tempfile = "3"
 # `iowait` withholds `IORING_ENTER_NO_IOWAIT` from the ring's blocking waits,
 # so their sleep counts as iowait the way the kernel's own default would.
 iowait = []
+
+[lints.rust]
+unreachable_pub = "deny"

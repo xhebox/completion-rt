@@ -201,64 +201,6 @@ fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 	let _ = left;
 }
 
-/// The fallback counter is the witness a caller uses to see a missed
-/// cooperative cancel: a completion dropped while its operation still names the
-/// caller's memory counts once, and a memory-free drop counts not at all.
-///
-/// The count is read after the drop's panic has been caught, so it is the
-/// count the drop left behind either way.
-#[test]
-fn a_fallback_drop_is_counted_and_a_memory_free_one_is_not() {
-	let (_left, right) = socket_pair();
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
-	let before = reactor.fallback_drops();
-	let buf = Arc::new(vec![0u8; 8]);
-	let completion = stalled_recv(&submitter, &right, &buf);
-	reactor.poll(Some(Duration::ZERO)).unwrap();
-	assert!(!reactor.is_idle(), "the receive has to be in flight");
-	drop_in_flight_on_purpose(|| drop(completion));
-	assert_eq!(
-		reactor.fallback_drops(),
-		before + 1,
-		"the in-flight receive was waited out"
-	);
-
-	let timer = submitter.timeout(Duration::from_secs(30)).unwrap();
-	reactor.poll(Some(Duration::ZERO)).unwrap();
-	drop(timer);
-	assert_eq!(
-		reactor.fallback_drops(),
-		before + 1,
-		"a memory-free drop is not a fallback"
-	);
-	while !reactor.is_idle() {
-		reactor.poll(Some(Duration::from_millis(1))).unwrap();
-	}
-}
-
-/// The count belongs to the reactor the completion was dropped on: a witness a
-/// test can read without another reactor's or another test's drops in it.
-#[test]
-fn a_reactor_counts_only_its_own_fallback_drops() {
-	let (_left, right) = socket_pair();
-	let (idle, _idle_submitter) = Reactor::new(Config::default()).unwrap();
-	let (mut busy, submitter) = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(vec![0u8; 8]);
-	let completion = stalled_recv(&submitter, &right, &buf);
-	busy.poll(Some(Duration::ZERO)).unwrap();
-	assert!(!busy.is_idle(), "the receive has to be in flight");
-	drop_in_flight_on_purpose(|| drop(completion));
-	assert_eq!(busy.fallback_drops(), 1, "the drop was waited out");
-	assert_eq!(
-		idle.fallback_drops(),
-		0,
-		"a drop on one reactor was counted against another"
-	);
-	while !busy.is_idle() {
-		busy.poll(Some(Duration::from_millis(1))).unwrap();
-	}
-}
-
 /// Dropping a completion whose cancel already fired is the given-up path, not a
 /// lost operation: the reactor was asked to stop it, and the drop is what waits
 /// for the kernel to let go.
@@ -881,7 +823,6 @@ fn a_send_is_memory_free_only_without_data() {
 
 	let bytes: Arc<Vec<u8>> = Arc::new(vec![1u8; 5]);
 	let payload: Arc<dyn Memory> = Arc::clone(&bytes) as Arc<dyn Memory>;
-	let before = reactor.fallback_drops();
 	let mut send = Box::pin(socket.send_with_fds(payload, Vec::new()));
 	assert!(
 		send.as_mut().poll(&mut cx).is_pending(),
@@ -890,18 +831,13 @@ fn a_send_is_memory_free_only_without_data() {
 	reactor.poll(Some(Duration::ZERO)).unwrap();
 	assert!(!reactor.is_idle(), "the send has to be in flight");
 	drop_in_flight_on_purpose(move || drop(send));
-	assert_eq!(
-		reactor.fallback_drops(),
-		before + 1,
-		"the send named the bytes it carried"
-	);
+	assert_eq!(Arc::strong_count(&bytes), 1, "the send released its buffer");
 	while !reactor.is_idle() {
 		reactor.poll(Some(Duration::from_millis(1))).unwrap();
 	}
 
 	let empty: Arc<Vec<u8>> = Arc::new(Vec::new());
 	let payload: Arc<dyn Memory> = Arc::clone(&empty) as Arc<dyn Memory>;
-	let before = reactor.fallback_drops();
 	let mut send = Box::pin(socket.send_with_fds(payload, Vec::new()));
 	assert!(
 		send.as_mut().poll(&mut cx).is_pending(),
@@ -909,11 +845,6 @@ fn a_send_is_memory_free_only_without_data() {
 	);
 	reactor.poll(Some(Duration::ZERO)).unwrap();
 	drop(send);
-	assert_eq!(
-		reactor.fallback_drops(),
-		before,
-		"a send of no bytes names nothing of the caller's"
-	);
 	while !reactor.is_idle() {
 		reactor.poll(Some(Duration::from_millis(1))).unwrap();
 	}

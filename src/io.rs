@@ -6,8 +6,9 @@ use std::panic::Location;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::flow::{Kind, Op, Transfer, whole};
-use crate::{AsDescriptor, Extent, Extents, Handle, Memory, Submitter};
+use crate::memory::Extents;
+use crate::net::{Kind, Op, Transfer, whole};
+use crate::{AsDescriptor, Extent, Handle, Memory, Submitter};
 
 /// `std::fs::OpenOptions` plus direct I/O, and on Windows the overlapped flag
 /// the iocp backend needs.
@@ -107,12 +108,7 @@ impl OpenOptions {
 	}
 }
 
-/// A resource an operation goes through, and the submitter it goes to.
-///
-/// [`File`] is this over a file, and a [`SocketHandle`](crate::SocketHandle) —
-/// a stream in particular — is this over a socket. The resource is named
-/// through a [`Handle`], so [`take`](Facade::take) resolves only once every
-/// other clone has let go of it.
+/// An owned resource with async operations submitted through a [`Submitter`].
 pub struct Facade<S> {
 	handle: Handle<S>,
 	submitter: Submitter,
@@ -131,16 +127,11 @@ impl<S> Facade<S> {
 		&self.submitter
 	}
 
-	/// The handle the resource is named through. Operations submitted by hand
-	/// take it, so they are waited for by [`take`](Facade::take) like any
-	/// other.
 	pub(super) fn handle(&self) -> &Handle<S> {
 		&self.handle
 	}
 
-	/// Waits until every other clone of the facade has let go, then gives the
-	/// resource back; `None` if another [`take`](Facade::take) is already
-	/// waiting for it.
+	/// Waits for all other facade clones and operations to release the resource; returns `None` if another take is already waiting.
 	pub async fn take(self) -> Option<S> {
 		self.handle.take().await
 	}
@@ -167,7 +158,6 @@ impl<S> Clone for Facade<S> {
 	}
 }
 
-/// An async file facade.
 pub type File = Facade<fs::File>;
 
 impl Facade<fs::File> {
@@ -180,7 +170,6 @@ impl Facade<fs::File> {
 		Transfer::new(self, Location::caller(), Kind::Read { fdoff }, mem, extents)
 	}
 
-	/// Reads the named ranges of `mem` at `fdoff`, in one call.
 	#[track_caller]
 	pub fn read_vectored_at(
 		&self,
@@ -209,8 +198,6 @@ impl Facade<fs::File> {
 		)
 	}
 
-	/// Reads the named ranges of `mem` at `fdoff`, over as many calls as it
-	/// takes to fill them.
 	#[track_caller]
 	pub fn read_exact_vectored_at(
 		&self,
@@ -243,7 +230,6 @@ impl Facade<fs::File> {
 		)
 	}
 
-	/// Writes the named ranges of `mem` at `fdoff`, in one call.
 	#[track_caller]
 	pub fn write_vectored_at(
 		&self,
@@ -277,8 +263,6 @@ impl Facade<fs::File> {
 		)
 	}
 
-	/// Writes the named ranges of `mem` at `fdoff`, over as many calls as it
-	/// takes to write them all.
 	#[track_caller]
 	pub fn write_all_vectored_at(
 		&self,
@@ -296,7 +280,6 @@ impl Facade<fs::File> {
 		)
 	}
 
-	/// Makes everything written to the file durable.
 	#[track_caller]
 	pub fn sync(&self) -> Op<fs::File> {
 		Op::new(self, Location::caller(), Submitter::fsync_at)

@@ -1,19 +1,4 @@
-//! The portable backend: `polling` for readiness, a thread pool for files.
-//!
-//! A regular file has no readiness to wait for: every poller reports it ready
-//! whether or not the read will block, and the answer is settled inside the
-//! syscall. The other way out is the platform's asynchronous file I/O — on
-//! macOS that is POSIX AIO, which holds one process to sixteen outstanding
-//! requests out of ninety for the whole machine, gives a slot back only when
-//! the request's status is *retrieved* rather than when it completes, and
-//! answers the seventeenth with `EAGAIN`. This backend moves the bytes on a
-//! worker thread instead: what cannot be waited for runs on `blocking`'s pool
-//! and comes back through the reactor's own wake-up.
-//!
-//! What is left is readiness for the descriptors that have it — sockets, pipes,
-//! and the wake-up itself — and that is `polling`'s
-//! (`epoll`/`kqueue`/event ports/`poll`), so one implementation covers every
-//! unix.
+//! Readiness polling for sockets and a thread pool for regular files.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -35,20 +20,17 @@ use crate::{Memory, OwnedDescriptor};
 
 use super::Backend;
 
-/// Which way a descriptor is waited on.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Direction {
 	Readable,
 	Writable,
 }
 
-/// How many events one wait takes out of the poller.
 const EVENTS: usize = 64;
 
 /// The most descriptors one control message carries.
 const MAX_FDS: usize = 8;
 
-/// What a file operation does.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Kind {
 	Read,
@@ -57,24 +39,15 @@ enum Kind {
 	Flush,
 }
 
-/// What a readiness-driven operation did.
 enum Progress {
-	/// Finished, with what it produced: the bytes it moved, a descriptor it
-	/// accepted, or a receive that also brought descriptors.
 	Done(Response),
-	/// The descriptor would block.
 	Blocked,
 }
 
-/// One file operation on the pool.
 struct Job {
-	/// Its result, and its completion: polling the task is what drives the job
-	/// to land, so it is kept until it does.
 	task: Task<(u64, io::Result<usize>)>,
 }
 
-/// What a readiness-driven operation is. The variant is the operation's own;
-/// no shared type stands in for all of them.
 enum Work {
 	Read {
 		memory: Arc<dyn Memory>,
@@ -99,24 +72,18 @@ enum Work {
 	Accept,
 }
 
-/// An operation that runs once its descriptor is ready.
 struct Op {
 	fd: RawHandle,
 	direction: Direction,
 	work: Work,
-	/// The descriptors the operation carries: the ones a send owes the peer,
-	/// or the ones a receive has collected.
 	fds: Vec<OwnedDescriptor>,
 }
 
-/// A readiness waiter.
 struct Poll {
 	fd: RawHandle,
 	direction: Direction,
 }
 
-/// Raises the reactor's wake-up when a pool job lands. A job finishes on a
-/// worker's clock, so the driver has to be woken out of its wait.
 struct PoolWake(Wakeup);
 
 impl Wake for PoolWake {
@@ -129,35 +96,26 @@ impl Wake for PoolWake {
 	}
 }
 
-pub struct Portable {
+pub(crate) struct Portable {
 	poller: Poller,
-	/// The reactor's wake-up: a source like any other, with no token of its own.
 	event: Wakeup,
-	/// Readiness waiters, per descriptor and direction.
 	readers: HashMap<RawHandle, HashSet<u64>>,
 	writers: HashMap<RawHandle, HashSet<u64>>,
-	/// The key the poller reports a descriptor under, and the way back.
 	keys: HashMap<RawHandle, usize>,
 	sources: HashMap<usize, RawHandle>,
-	/// Keys the poller holds a registration for.
 	armed: HashSet<usize>,
 	next_key: usize,
-	/// Operations that run once their descriptor is ready.
 	ops: HashMap<u64, Op>,
-	/// Readiness waiters, with what they were armed for.
 	polls: HashMap<u64, Poll>,
-	/// File operations the pool is running.
 	pool: HashMap<u64, Job>,
 	waker: Waker,
-	/// Where a wait puts what it took out of the poller; kept across calls.
 	events: Events,
 	scratch: Vec<Ready>,
-	/// Completions that needed no wait.
 	done: VecDeque<(u64, io::Result<Response>)>,
 }
 
 impl Portable {
-	pub fn new(config: &super::Config) -> io::Result<(Portable, Wakeup)> {
+	pub(super) fn new(config: &super::Config) -> io::Result<(Portable, Wakeup)> {
 		if config.iopoll || config.sqpoll {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
@@ -189,16 +147,12 @@ impl Portable {
 			scratch: Vec::with_capacity(EVENTS),
 			done: VecDeque::new(),
 		};
-		// The wake-up is armed for the reactor's life: a submission from
-		// another thread raises it, and a parked poll has to see that.
 		let fd = event.handle();
 		backend.readers.entry(fd).or_default();
 		backend.arm(fd)?;
 		Ok((backend, event))
 	}
 
-	/// Arms the poller for `fd`'s current interest: the directions some token
-	/// waits on.
 	fn arm(&mut self, fd: RawHandle) -> io::Result<()> {
 		let key = match self.keys.get(&fd) {
 			Some(key) => *key,
@@ -222,8 +176,7 @@ impl Portable {
 		// SAFETY: the descriptor stays open while the reactor holds it, and
 		// every source is `delete`d from the poller before the reactor goes.
 		let source = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
-		// Level-triggered: a source that stays ready is reported again, which
-		// is what a re-armed poll needs.
+		// Level triggering reports a still-ready source again after rearming.
 		if self.armed.contains(&key) {
 			self.poller
 				.modify_with_mode(&source, interest, polling::PollMode::Level)
@@ -237,7 +190,6 @@ impl Portable {
 		}
 	}
 
-	/// Claims `fd` for `token`, and arms it.
 	fn watch(&mut self, fd: RawHandle, direction: Direction, token: u64) -> io::Result<()> {
 		match direction {
 			Direction::Readable => {
@@ -250,7 +202,6 @@ impl Portable {
 		self.arm(fd)
 	}
 
-	/// Drops `token`'s claim on `fd`, and the registration once nobody waits.
 	fn unwatch(&mut self, fd: RawHandle, direction: Direction, token: u64) -> io::Result<()> {
 		match direction {
 			Direction::Readable => {
@@ -273,9 +224,6 @@ impl Portable {
 		self.rearm(fd)
 	}
 
-	/// Re-registers `fd`'s interest, or drops it once nothing waits on it; the
-	/// wake-up keeps its own. A refused deregistration is reported and the key
-	/// goes anyway: `deliver` drops an event whose key it does not know.
 	fn rearm(&mut self, fd: RawHandle) -> io::Result<()> {
 		let waited = self.readers.contains_key(&fd) || self.writers.contains_key(&fd);
 		if waited || fd == self.event.handle() {
@@ -293,9 +241,7 @@ impl Portable {
 		}
 	}
 
-	/// Drains the wake-up. Only a wait that the wake-up ended may clear it: a
-	/// raise another thread did while this poll ran is news nobody has looked
-	/// at yet.
+	/// Only a wait may drain the wake-up; otherwise a concurrent notification could be lost.
 	fn drain_wakeup(&self) -> io::Result<()> {
 		let fd = unsafe { BorrowedFd::borrow_raw(self.event.handle().as_raw_fd()) };
 		let mut buf = [0u8; 64];
@@ -309,7 +255,6 @@ impl Portable {
 		}
 	}
 
-	/// One thing the poller reported: readiness on a descriptor.
 	fn deliver(
 		&mut self,
 		event: &Ready,
@@ -317,7 +262,6 @@ impl Portable {
 		waited: bool,
 	) -> io::Result<()> {
 		let Some(fd) = self.sources.get(&event.key).copied() else {
-			// The registration was dropped while the event was in flight.
 			return Ok(());
 		};
 		let mut tokens: Vec<u64> = Vec::new();
@@ -334,20 +278,15 @@ impl Portable {
 		for token in tokens {
 			self.ready(token, out)?;
 		}
-		// The reactor's own wake-up: its counter is drained last, and only by a
-		// poll that was allowed to wait.
 		if fd == self.event.handle() && waited {
 			self.drain_wakeup()?;
 		}
 		Ok(())
 	}
 
-	/// A descriptor `token` waits on is ready: run the operation it carries, or
-	/// report readiness.
 	fn ready(&mut self, token: u64, out: &mut Vec<(u64, io::Result<Response>)>) -> io::Result<()> {
 		let Some(op) = self.ops.get_mut(&token) else {
 			let Some(poll) = self.polls.get(&token) else {
-				// Cancelled while the event was in flight.
 				return Ok(());
 			};
 			let (fd, direction) = (poll.fd, poll.direction);
@@ -374,8 +313,6 @@ impl Portable {
 		}
 	}
 
-	/// Hands a file operation to the pool. Everything it touches goes with it:
-	/// the memory keeps the spans alive, and the descriptor is a value.
 	fn submit_pool(
 		&mut self,
 		token: u64,
@@ -420,7 +357,6 @@ impl Portable {
 		}
 	}
 
-	/// Takes the pool jobs that landed.
 	fn collect_pool(&mut self, out: &mut Vec<(u64, io::Result<Response>)>) {
 		if self.pool.is_empty() {
 			return;
@@ -444,15 +380,13 @@ impl Portable {
 
 impl Drop for Portable {
 	fn drop(&mut self) {
-		// A registration outliving its descriptor is what the poller's contract
-		// forbids, so every source goes before the reactor does.
+		// The poller requires deregistration before descriptors are closed.
 		for (_, fd) in std::mem::take(&mut self.sources) {
 			let _ = self
 				.poller
 				.delete(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) });
 		}
-		// A worker cannot be interrupted: the jobs in flight are waited out, so
-		// none of them is left touching a descriptor the caller has closed.
+		// Workers cannot be interrupted; wait until no job can access the caller's resources.
 		let mut out = Vec::new();
 		while !self.pool.is_empty() {
 			self.collect_pool(&mut out);
@@ -471,8 +405,6 @@ impl Backend for Portable {
 		memory: Arc<dyn Memory>,
 		extents: Extents,
 	) -> io::Result<()> {
-		// A regular file has no readiness to wait for, so it runs on the pool;
-		// anything else has readiness instead.
 		if takes_pool(fd) {
 			self.submit_pool(id, fd, fdoff, Kind::Read, Some(memory), extents)
 		} else {
@@ -511,8 +443,6 @@ impl Backend for Portable {
 		if takes_pool(fd) {
 			return self.submit_pool(id, fd, 0, Kind::Fsync, None, Extents::new());
 		}
-		// Nothing to wait for on a descriptor the kernel does not sync: the
-		// call answers now.
 		let result = rustix::fs::fsync(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
 			.map(|()| Response::Done)
 			.map_err(io::Error::from);
@@ -524,8 +454,6 @@ impl Backend for Portable {
 		if takes_pool(fd) {
 			return self.submit_pool(id, fd, 0, Kind::Flush, None, Extents::new());
 		}
-		// Nothing to wait for on a descriptor the kernel does not sync: the
-		// dup-and-close answers now.
 		let result = flush_handle(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
 			.map(|()| Response::Done);
 		self.done.push_back((id, result));
@@ -637,25 +565,16 @@ impl Backend for Portable {
 
 	fn cancel(&mut self, id: u64) {
 		if self.pool.contains_key(&id) {
-			// The worker is inside a syscall and cannot be called back. The job
-			// runs to its end and its completion is still reported: a caller
-			// waiting for the buffers to be released waits for exactly that.
+			// A worker already inside a syscall must finish before its buffers can be released.
 			return;
 		}
 		if let Some(op) = self.ops.remove(&id) {
-			// A deregistration the poller refuses is reported by `rearm`; there is
-			// nowhere else to report it, and the completion below is what a caller
-			// waiting on the cancel is after.
 			let _ = self.unwatch(op.fd, op.direction, id);
 		} else if let Some(poll) = self.polls.remove(&id) {
 			let _ = self.unwatch(poll.fd, poll.direction, id);
 		} else {
-			// Nothing held it: the completion already landed.
 			return;
 		}
-		// A cancelled operation still completes, and it is the completion that
-		// releases the reactor's entry: nobody waits for the result any more,
-		// but the caller's `cancel` does wait for this.
 		self.done
 			.push_back((id, Err(rustix::io::Errno::CANCELED.into())));
 	}
@@ -664,15 +583,9 @@ impl Backend for Portable {
 		if let Some((id, _)) = self.done.front() {
 			return Ok(*id);
 		}
-		// A zero timeout is a non-blocking look, not a pass: readiness is the
-		// poller's news, and only a wait takes it out. The wake-up is the
-		// exception — clearing it is what a wait earns.
 		let waited = timeout != Some(Duration::ZERO);
 		let mut out = Vec::new();
-		// A pool job lands on a worker's clock, so it can be finished before
-		// the wait even starts. News in hand is handed back: a completion a
-		// caller waits for while the reactor sleeps on it is a stall the
-		// timeout, not the work, ends.
+		// Collect finished jobs before sleeping so their completions do not wait for the timeout.
 		self.collect_pool(&mut out);
 		if !out.is_empty() {
 			self.done.extend(out);
@@ -680,8 +593,6 @@ impl Backend for Portable {
 		}
 		self.events.clear();
 		self.poller.wait(&mut self.events, timeout)?;
-		// The events borrow the poller's buffer; the batch is copied out so the
-		// dispatch below can take the backend by `&mut`.
 		let mut batch = std::mem::take(&mut self.scratch);
 		batch.clear();
 		batch.extend(self.events.iter());
@@ -690,7 +601,6 @@ impl Backend for Portable {
 			.try_for_each(|event| self.deliver(event, &mut out, waited));
 		self.scratch = batch;
 		result?;
-		// A job that landed while the events were being dispatched.
 		self.collect_pool(&mut out);
 		self.done.extend(out);
 		match self.done.front() {
@@ -723,14 +633,10 @@ impl Backend for Portable {
 	}
 }
 
-/// Whether `error` is a cancellation. A readiness operation is stopped by
-/// dropping it, which reports `-ECANCELED`; a pool job cannot be stopped and
-/// runs to its end.
 pub(super) fn cancelled(error: &io::Error) -> bool {
 	error.raw_os_error() == Some(rustix::io::Errno::CANCELED.raw_os_error())
 }
 
-/// Whether this descriptor runs on the pool: a regular file has no readiness.
 fn takes_pool(fd: RawHandle) -> bool {
 	let Ok(stat) = rustix::fs::fstat(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }) else {
 		return false;
@@ -738,9 +644,6 @@ fn takes_pool(fd: RawHandle) -> bool {
 	rustix::fs::FileType::from_raw_mode(stat.st_mode as _) == rustix::fs::FileType::RegularFile
 }
 
-/// Runs one file operation on a worker thread: one `pread`/`pwrite` over the
-/// first buffer the extents name. The spans are resolved here, on the thread
-/// that moves the bytes, so nothing borrowed crosses the pool.
 fn run_file(
 	fd: RawHandle,
 	fdoff: u64,
@@ -758,10 +661,7 @@ fn run_file(
 			let Some(span) = spans.first() else {
 				return Ok(0);
 			};
-			// The span names a buffer the memory the submission holds owns,
-			// and it stays alive in this job until it returns. The kernel
-			// copies through the pointer: no reference to the buffer is
-			// formed here.
+			// SAFETY: the job retains the memory backing this span; the syscall copies through its pointer without forming a Rust reference.
 			let offset = fdoff as libc::off_t;
 			count(unsafe {
 				match kind {
@@ -778,14 +678,7 @@ fn run_file(
 	}
 }
 
-/// Reports a file's deferred write-back errors: `close(dup(fd))`, so the
-/// descriptor the caller named stays open.
-///
-/// The close is the whole point — it is what reports a write-back error the
-/// filesystem had deferred — so it goes through `libc::close` and the result is
-/// checked: `rustix::io::close` and a dropped `OwnedFd` both discard it. EINTR
-/// is not retried: POSIX leaves the descriptor's state unspecified, and here
-/// Linux has already closed it, so a retry could close a reused number.
+/// Check `close(dup(fd))` for deferred write-back errors; Rust descriptor drops discard them. Do not retry EINTR: POSIX leaves descriptor state unspecified, and Linux may already have reused the number.
 fn flush_handle(fd: BorrowedFd<'_>) -> io::Result<()> {
 	let dup = unsafe { libc::dup(fd.as_raw_fd()) };
 	if dup < 0 {
@@ -797,7 +690,6 @@ fn flush_handle(fd: BorrowedFd<'_>) -> io::Result<()> {
 	Ok(())
 }
 
-/// The bytes a raw syscall moved, `errno` being the error it left.
 fn count(result: libc::ssize_t) -> io::Result<usize> {
 	if result < 0 {
 		Err(io::Error::last_os_error())
@@ -806,16 +698,11 @@ fn count(result: libc::ssize_t) -> io::Result<usize> {
 	}
 }
 
-/// One readiness-driven syscall's answer.
 enum Call {
-	/// The bytes it moved.
 	Bytes(usize),
-	/// The peer is not ready yet, which is what the wait is for.
 	Blocked,
 }
 
-/// As [`count`], except that a not-ready answer is expected rather than an
-/// error.
 fn call(result: libc::ssize_t) -> io::Result<Call> {
 	match count(result) {
 		Ok(bytes) => Ok(Call::Bytes(bytes)),
@@ -824,8 +711,6 @@ fn call(result: libc::ssize_t) -> io::Result<Call> {
 	}
 }
 
-/// One call of a readiness-driven operation; `Done` carries what the call
-/// produced.
 fn run_op(op: &mut Op) -> io::Result<Progress> {
 	let Op { fd, work, fds, .. } = op;
 	// SAFETY: the descriptor stays open for the operation's flight.
@@ -835,10 +720,7 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 			let Some((ptr, len)) = first_buffer(memory, extents)? else {
 				return Ok(Progress::Done(Response::Count(0)));
 			};
-			// The pointer names a buffer the memory the operation carries
-			// owns, and that memory stays alive for as long as its flight
-			// does. The kernel copies through the pointer: no reference to the
-			// buffer is formed here.
+			// SAFETY: the operation retains the memory backing this pointer until the syscall returns.
 			match call(unsafe { libc::read(fd.as_raw_fd(), ptr.cast(), len) })? {
 				Call::Bytes(count) => Ok(Progress::Done(Response::Count(count))),
 				Call::Blocked => Ok(Progress::Blocked),
@@ -848,7 +730,7 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 			let Some((ptr, len)) = first_buffer(memory, extents)? else {
 				return Ok(Progress::Done(Response::Count(0)));
 			};
-			// As on the read side: the kernel copies through the pointer.
+			// SAFETY: the operation retains the memory backing this pointer until the syscall returns.
 			match call(unsafe { libc::write(fd.as_raw_fd(), ptr.cast(), len) })? {
 				Call::Bytes(count) => Ok(Progress::Done(Response::Count(count))),
 				Call::Blocked => Ok(Progress::Blocked),
@@ -856,10 +738,7 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 		}
 		Work::Accept => match rustix::net::accept(fd) {
 			Ok(socket) => {
-				// `SOCK_CLOEXEC`/`SOCK_NONBLOCK` are `accept4` flags, and not
-				// every unix has that call, so they go on the descriptor
-				// afterwards. A failure here drops the accepted socket on the
-				// way out.
+				// Set flags after accept because `accept4` is not available on every Unix.
 				rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
 				rustix::io::ioctl_fionbio(&socket, true)?;
 				let handle = RawHandle::from_raw(socket.into_raw_fd() as usize);
@@ -872,7 +751,6 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 			Err(rustix::io::Errno::AGAIN) => Ok(Progress::Blocked),
 			Err(error) => Err(error.into()),
 		},
-		// A socket transfer takes one buffer.
 		Work::Recv { memory, extents } => {
 			let (ptr, len) = one_buffer(memory, extents)?;
 			match call(unsafe { libc::recv(fd.as_raw_fd(), ptr.cast(), len, 0) })? {
@@ -937,7 +815,6 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 			};
 			match result? {
 				Call::Bytes(count) => {
-					// The descriptors left with the bytes of this one call.
 					fds.clear();
 					Ok(Progress::Done(Response::Count(count)))
 				}
@@ -947,11 +824,6 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 	}
 }
 
-/// The one buffer a socket transfer moves: a `recv`/`send` names exactly one.
-///
-/// The pointer names the memory the operation holds: it comes from a span, and
-/// the `Arc` the operation carries is what keeps that memory alive while the
-/// kernel copies through it.
 fn one_buffer(memory: &Arc<dyn Memory>, extents: &Extents) -> io::Result<(*mut u8, usize)> {
 	let buffers = crate::memory::spans(memory, extents)?;
 	let [buf] = buffers.as_slice() else {
@@ -963,9 +835,6 @@ fn one_buffer(memory: &Arc<dyn Memory>, extents: &Extents) -> io::Result<(*mut u
 	Ok((buf.as_ptr(), buf.len()))
 }
 
-/// The first buffer the extents resolve to, and its length; `None` when they
-/// name no buffer. One call moves one buffer, and the rest is the caller's to
-/// loop over.
 fn first_buffer(
 	memory: &Arc<dyn Memory>,
 	extents: &Extents,
@@ -974,8 +843,6 @@ fn first_buffer(
 	Ok(buffers.first().map(|buf| (buf.as_ptr(), buf.len())))
 }
 
-/// The descriptors the kernel wrote into `msg`'s control buffer, taken into
-/// `out`. `SCM_RIGHTS` is the only message this backend asks for.
 fn take_fds(msg: &libc::msghdr, out: &mut Vec<OwnedDescriptor>) {
 	let mut header = unsafe { libc::CMSG_FIRSTHDR(msg) };
 	while !header.is_null() {
@@ -990,7 +857,6 @@ fn take_fds(msg: &libc::msghdr, out: &mut Vec<OwnedDescriptor>) {
 				// SAFETY: the kernel put this descriptor in the process, and
 				// nothing else in it owns the number.
 				let descriptor = unsafe { OwnedDescriptor::from_raw_fd(raw) };
-				// The descriptors arrive without crossing an exec.
 				let _ = rustix::io::fcntl_setfd(&descriptor, rustix::io::FdFlags::CLOEXEC);
 				out.push(descriptor);
 			}
@@ -1005,17 +871,7 @@ mod tests {
 
 	use crate::{AsDescriptor, Config};
 
-	/// A deregistration of a descriptor the process no longer has leaves the
-	/// reactor with nothing to act on: the token is out of `readers`, and the
-	/// key out of `keys`, `sources` and `armed` — an event for a key `deliver`
-	/// does not know is dropped.
-	///
-	/// Whether the poller calls that a refusal is the host's: `epoll_ctl`
-	/// refuses a number the process has lost, while `kevent` drops a
-	/// descriptor's knotes when it is closed and answers `ENOENT` for the same
-	/// call, which the poller reports as a deregistration that already
-	/// happened. Both leave the reactor with nothing behind, which is what is
-	/// asserted here; the refusal itself is the test below.
+	/// Closed-descriptor deregistration differs by poller: epoll may reject it, while kqueue may have removed it already. Either outcome must discard the registration.
 	#[test]
 	fn a_deregistration_of_a_closed_descriptor_leaves_no_key_behind() {
 		let (mut backend, _event) = Portable::new(&Config::default()).unwrap();
@@ -1024,8 +880,6 @@ mod tests {
 		let fd = RawHandle::from_descriptor(reader.as_descriptor());
 		backend.watch(fd, Direction::Readable, token).unwrap();
 		let key = backend.keys[&fd];
-		// A number the process no longer has is what `epoll_ctl` and `kevent`
-		// are asked to drop.
 		drop(reader);
 		let _ = backend.unwatch(fd, Direction::Readable, token);
 		assert!(!backend.keys.contains_key(&fd));
@@ -1039,14 +893,7 @@ mod tests {
 		);
 	}
 
-	/// A deregistration the poller refuses is reported and the key goes anyway:
-	/// an event the kernel had already reported for that key is one `deliver`
-	/// drops, because `sources` no longer knows it.
-	///
-	/// The poller is made to have lost the source while the reactor's maps
-	/// still name it, which is what a host that answers the close with a
-	/// refusal, rather than with a knote that is already gone, looks like from
-	/// here.
+	/// Simulate a poller that lost the source before deregistration; stale readiness must not retain or dispatch the old key.
 	#[test]
 	fn a_refused_deregistration_leaves_no_key_behind() {
 		let (mut backend, _event) = Portable::new(&Config::default()).unwrap();

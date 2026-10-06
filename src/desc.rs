@@ -7,21 +7,14 @@ mod imp {
 	/// A descriptor as the backend names it: the value it keys an operation
 	/// by, and the one a completion reports.
 	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-	pub struct RawHandle(RawFd);
+	pub(crate) struct RawHandle(RawFd);
 
-	/// A descriptor as a plain value: the [`RawFd`] on this platform, handed
-	/// out without giving up the descriptor it belongs to. See
-	/// [`Submitter::in_flight`](crate::Submitter::in_flight).
+	/// A descriptor number that does not own or keep the resource open.
 	pub type RawDescriptor = RawFd;
 
 	/// A descriptor this value owns and will close.
 	pub type OwnedDescriptor = OwnedFd;
-	/// A descriptor borrowed for a stated lifetime.
-	///
-	/// One type on this platform: this is `BorrowedFd`, so std's own
-	/// [`BorrowedFd::try_clone_to_owned`] — handing back the [`OwnedFd`] behind
-	/// [`OwnedDescriptor`] — is the whole of duplicating one, with no wrapper of
-	/// our own to name.
+	/// A borrowed file descriptor.
 	pub type BorrowedDescriptor<'a> = BorrowedFd<'a>;
 	/// A socket that owns its descriptor.
 	pub type OwnedSocket = OwnedFd;
@@ -29,30 +22,27 @@ mod imp {
 	impl RawHandle {
 		/// The descriptor a completion reports for one it created: the
 		/// kernel hands over a number, and the caller owns it from there.
-		pub const fn from_raw(value: usize) -> Self {
+		pub(crate) const fn from_raw(value: usize) -> Self {
 			Self(value as RawFd)
 		}
 
 		/// The number behind a borrow, for the backend.
-		pub fn from_descriptor(descriptor: BorrowedDescriptor<'_>) -> Self {
+		pub(crate) fn from_descriptor(descriptor: BorrowedDescriptor<'_>) -> Self {
 			Self(descriptor.as_raw_fd())
 		}
 
-		pub const fn as_raw_fd(self) -> RawFd {
+		pub(crate) const fn as_raw_fd(self) -> RawFd {
 			self.0
 		}
 
 		/// The number as the cross-platform [`RawDescriptor`], for
 		/// [`Submitter::in_flight`](crate::Submitter::in_flight).
-		pub const fn into_raw(self) -> RawDescriptor {
+		pub(crate) const fn into_raw(self) -> RawDescriptor {
 			self.0
 		}
 	}
 
-	/// Naming the descriptor a value holds, without giving up ownership of it.
-	///
-	/// A borrow, not a number: a number a caller holds is not a reason to
-	/// believe the descriptor behind it is open.
+	/// Borrows a descriptor without transferring ownership.
 	pub trait AsDescriptor {
 		fn as_descriptor(&self) -> BorrowedDescriptor<'_>;
 	}
@@ -69,13 +59,10 @@ mod imp {
 		}
 	}
 
-	/// Taking the socket the kernel accepted: the descriptor an accept reports
-	/// is the caller's from there.
-	///
 	/// # Safety
 	///
 	/// `raw` must be a live socket nobody else owns.
-	pub unsafe fn from_raw_socket(raw: RawHandle) -> OwnedSocket {
+	pub(crate) unsafe fn from_raw_socket(raw: RawHandle) -> OwnedSocket {
 		unsafe { OwnedSocket::from_raw_fd(raw.as_raw_fd()) }
 	}
 }
@@ -99,11 +86,9 @@ mod imp {
 	/// A descriptor as the backend names it: the value it keys an operation
 	/// by, and the one a completion reports.
 	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-	pub struct RawHandle(usize);
+	pub(crate) struct RawHandle(usize);
 
-	/// A descriptor as a plain value: the handle or socket number on this
-	/// platform, handed out without giving up the descriptor it belongs to.
-	/// See [`Submitter::in_flight`](crate::Submitter::in_flight).
+	/// A descriptor number that does not own or keep the resource open.
 	pub type RawDescriptor = usize;
 
 	/// A descriptor this value owns and will close: the owned counterpart of
@@ -117,9 +102,7 @@ mod imp {
 	pub type OwnedSocket = std::os::windows::io::OwnedSocket;
 
 	impl BorrowedDescriptor<'_> {
-		/// A second, independent descriptor on the same resource: it stays open
-		/// on its own, and closing one descriptor does not close the other.
-		/// std's method of the same name, per family.
+		/// Duplicates the resource into an independently owned descriptor.
 		pub fn try_clone_to_owned(&self) -> io::Result<OwnedDescriptor> {
 			match self {
 				BorrowedDescriptor::Handle(handle) => {
@@ -145,22 +128,22 @@ mod imp {
 	}
 
 	impl RawHandle {
-		pub fn as_platform(self) -> PlatformHandle {
+		pub(crate) fn as_platform(self) -> PlatformHandle {
 			std::ptr::without_provenance_mut(self.0)
 		}
 
-		pub fn from_raw_handle(handle: PlatformHandle) -> Self {
+		pub(crate) fn from_raw_handle(handle: PlatformHandle) -> Self {
 			Self(handle as usize)
 		}
 
 		/// The number as the cross-platform [`RawDescriptor`], for
 		/// [`Submitter::in_flight`](crate::Submitter::in_flight).
-		pub const fn into_raw(self) -> RawDescriptor {
+		pub(crate) const fn into_raw(self) -> RawDescriptor {
 			self.0
 		}
 
 		/// The number behind a borrow, for the backend.
-		pub fn from_descriptor(descriptor: BorrowedDescriptor<'_>) -> Self {
+		pub(crate) fn from_descriptor(descriptor: BorrowedDescriptor<'_>) -> Self {
 			match descriptor {
 				BorrowedDescriptor::Handle(handle) => {
 					Self(std::os::windows::io::AsRawHandle::as_raw_handle(&handle) as usize)
@@ -172,8 +155,7 @@ mod imp {
 		}
 	}
 
-	/// Naming the descriptor a value holds, without giving up ownership of it.
-	/// See the unix side.
+	/// Borrows a descriptor without transferring ownership.
 	pub trait AsDescriptor {
 		fn as_descriptor(&self) -> BorrowedDescriptor<'_>;
 	}
@@ -239,12 +221,9 @@ mod imp {
 	}
 }
 
-#[cfg(windows)]
-pub use imp::{
-	AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor, RawHandle,
-};
+#[cfg(any(unix, windows))]
+pub(crate) use imp::RawHandle;
 #[cfg(unix)]
-pub use imp::{
-	AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor, RawHandle,
-	from_raw_socket,
-};
+pub(crate) use imp::from_raw_socket;
+#[cfg(any(unix, windows))]
+pub use imp::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor};

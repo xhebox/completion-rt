@@ -1,5 +1,6 @@
 //! Core completion engine.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
@@ -13,17 +14,14 @@ use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use crate::desc::{BorrowedDescriptor, RawDescriptor, RawHandle};
-use crate::{AsDescriptor, Extent, Extents, Memory, OwnedDescriptor, OwnedSocket};
+use crate::memory::Extents;
+use crate::{AsDescriptor, Extent, Memory, OwnedDescriptor, OwnedSocket};
 
 use crate::backend::{self, Backend, BackendEnum, Config, create};
 use crate::channel;
 use crate::event::Event;
 
-/// What a completed operation produced.
-///
-/// The variant is the operation's own: a transfer reports what it moved, an
-/// accept reports the socket the kernel created, a receive that asked for
-/// control data reports the descriptors that came with the bytes.
+/// Completed operation result.
 #[derive(Debug)]
 pub enum Response {
 	/// The bytes a transfer moved.
@@ -37,8 +35,7 @@ pub enum Response {
 }
 
 impl Response {
-	/// The count a transfer's response carries. The descriptors a
-	/// [`Response::CountWithFds`] brought go with it, and are closed here.
+	/// Returns the transferred byte count, closing any received descriptors; other response variants return an error.
 	pub fn count(self) -> io::Result<usize> {
 		match self {
 			Response::Count(count) | Response::CountWithFds(count, _) => Ok(count),
@@ -48,26 +45,11 @@ impl Response {
 			Response::Done => Err(io::Error::other("a transfer reported no count")),
 		}
 	}
-
-	/// The count a response carries, counting a sync, a wait or an accept as
-	/// nothing moved.
-	pub fn count_or_zero(self) -> usize {
-		match self {
-			Response::Count(count) | Response::CountWithFds(count, _) => count,
-			Response::Accepted(_) | Response::Done => 0,
-		}
-	}
 }
 
-/// A submission waiting for the reactor: the operation's arguments, kept whole
-/// until a backend takes it.
-///
-/// The variant names the operation and the backend method it goes to; no
-/// single type is shared by every operation beyond this queue entry.
 enum Request {
 	Read {
 		fd: RawHandle,
-		/// The file position the transfer starts at.
 		fdoff: u64,
 		memory: Arc<dyn Memory>,
 		extents: Extents,
@@ -89,8 +71,6 @@ enum Request {
 		memory: Arc<dyn Memory>,
 		extents: Extents,
 	},
-	/// A receive that also takes the descriptors a `recvmsg` control buffer
-	/// carries.
 	RecvWithFds {
 		fd: RawHandle,
 		memory: Arc<dyn Memory>,
@@ -101,16 +81,12 @@ enum Request {
 		memory: Arc<dyn Memory>,
 		extents: Extents,
 	},
-	/// A send that carries `fds` with its first bytes.
 	SendWithFds {
 		fd: RawHandle,
 		memory: Arc<dyn Memory>,
 		extents: Extents,
 		fds: Vec<OwnedDescriptor>,
 	},
-	/// Accepts a connection on a listening socket. The response is
-	/// [`Response::Accepted`]: the kernel reports one descriptor, and the
-	/// backend takes it into an owner before the response is stored.
 	Accept {
 		fd: RawHandle,
 	},
@@ -121,17 +97,13 @@ enum Request {
 	Readable {
 		fd: RawHandle,
 	},
-	/// Waits for `fd` to become writable; sibling of [`Request::Readable`].
 	Writable {
 		fd: RawHandle,
 	},
 }
 
 impl Request {
-	/// Whether the kernel reads or writes the memory this request names. A
-	/// transfer named by `extents` does, whatever descriptors it carries: the
-	/// descriptors go into the backend's control buffer, not the caller's
-	/// memory.
+	/// Control buffers are backend-owned; only payload buffers count as caller memory.
 	fn names_memory(&self) -> bool {
 		match self {
 			Request::Read { .. }
@@ -150,7 +122,6 @@ impl Request {
 		}
 	}
 
-	/// The operation's name, for the drop fallback's report.
 	fn kind(&self) -> &'static str {
 		match self {
 			Request::Read { .. } => "read",
@@ -168,51 +139,33 @@ impl Request {
 	}
 }
 
-/// Where an operation is in its life.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stat {
-	/// The request still waits for the reactor to hand it to a backend.
 	Pending,
-	/// A backend has it.
 	InFlight,
-	/// The result is in `response` and waits for its future.
 	Done,
-	/// The future went without the result.
 	Abandoned,
 }
 
-/// Whether an operation has been asked to stop, and how far the ask has got.
-///
-/// Monotonic: it never goes back to [`GiveUp::None`]. A flag that a reactor
-/// pass cleared could not answer "was this give-up asked for?" once the pass
-/// had carried the ask to a backend, and the drop of a completion whose
-/// give-up a caller had asked for was reported as a lost operation.
+/// Cancellation stays recorded after dispatch so a later drop can distinguish cancellation from an unsignalled abandonment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GiveUp {
-	/// Nobody has asked.
 	None,
-	/// Asked, and no reactor pass has carried it out yet.
 	Asked,
-	/// Carried out: a pass handed the ask to a backend, or settled an entry
-	/// that never reached one.
 	Handled,
 }
 
 impl GiveUp {
-	/// Whether anyone asked the operation to stop.
 	fn asked(self) -> bool {
 		self != GiveUp::None
 	}
 
-	/// Records an ask; a second one changes nothing.
 	fn ask(&mut self) {
 		if *self == GiveUp::None {
 			*self = GiveUp::Asked;
 		}
 	}
 
-	/// Records that a pass carried the ask out. An ask nobody made stays
-	/// unmade, which is what keeps "nobody asked" readable at the drop.
 	fn handled(&mut self) {
 		if *self == GiveUp::Asked {
 			*self = GiveUp::Handled;
@@ -220,49 +173,27 @@ impl GiveUp {
 	}
 }
 
-/// One operation, from submission to response.
 struct Entry {
 	request: Option<Request>,
 	response: Option<io::Result<Response>>,
-	/// The task waiting for `response`.
 	waker: Option<Waker>,
 	stat: Stat,
-	/// The stop asked of this operation: raised by [`Completion::until`] when
-	/// its cancel fires, and by a dropped completion that has to wait for the
-	/// kernel to let go. Monotonic, so the drop can tell the give-up it is
-	/// carrying out from an operation nobody gave up.
 	give_up: GiveUp,
-	/// The kernel reads or writes the caller's memory through this operation,
-	/// so going without awaiting it is not just a lost result.
 	names_memory: bool,
-	/// The operation's name and the submitter's location, for the fallback's
-	/// report of a dropped in-flight operation.
 	kind: &'static str,
 	origin: &'static Location<'static>,
-	/// When the entry was made, for the age [`InFlight`] reports.
 	submitted: Instant,
-	/// A thread waits on [`Shared::settled`] for this entry: [`Core::settle`]
-	/// has to raise it once the entry lands.
 	waiter: bool,
-	/// A timer's deadline. It is what the reactor waits to and what settles
-	/// the entry; a request has none, because a backend does its waiting.
 	deadline: Option<Instant>,
 	/// The descriptor the operation names, held until the entry goes: the
 	/// backend works on the number, which must stay live until then.
 	descriptor: Option<Descriptor>,
 }
 
-/// What an in-flight operation holds so the resource it names stays open: the
-/// clone's share of the caller's [`Handle`], with the value erased by unsizing
-/// so an entry stays concrete whatever the handle names.
 struct Descriptor {
-	/// The number the backend works on, for the snapshot [`InFlight`] is; the
-	/// hold below is what keeps it live.
 	raw: RawDescriptor,
-	/// The hold on the resource, kept for what dropping it does.
 	_value: Arc<dyn Send + Sync>,
-	/// Dropped after `_value`, so the resource is let go before the wake; see
-	/// [`Release`].
+	/// Drop after `_value` so a woken taker sees the resource released.
 	_release: Release,
 }
 
@@ -279,10 +210,7 @@ impl Descriptor {
 	}
 }
 
-/// The reactor's own state: the backend and what one pass over it needs.
-///
-/// Behind [`Shared::core`]. Locking order is this lock first, then
-/// [`Shared::events`], everywhere.
+/// Lock order: `Shared::core` before `Shared::events`.
 struct Core {
 	backend: BackendEnum,
 }
@@ -292,15 +220,10 @@ impl Core {
 		Self { backend }
 	}
 
-	/// Waits for one completion, then takes everything else that came with it.
-	///
-	/// The wait is capped at the nearest timer: a timer is settled by the
-	/// reactor's own clock, so a wait that outlasted one would sleep through it.
 	fn wait(&mut self, shared: &Shared, timeout: Option<Duration>) -> io::Result<()> {
 		let within = shared.events.lock().unwrap().within(timeout);
 		match self.backend.poll(within) {
 			Ok(id) => self.settle(shared, id),
-			// Nothing completed within the deadline.
 			Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
 			Err(error) => return Err(error),
 		}
@@ -308,18 +231,11 @@ impl Core {
 		self.reap(shared)
 	}
 
-	/// Settles every timer whose deadline has passed.
-	///
-	/// A timer has no backend behind it, so nothing else would land it: the
-	/// reactor checks its own table after every wait, and after a poll that did
-	/// not wait.
 	fn settle_timers(&mut self, shared: &Shared) {
 		let now = Instant::now();
 		let mut wakers = Vec::new();
 		{
 			let mut events = shared.events.lock().unwrap();
-			// Deadlines are sorted, so the first entry past `now` ends the
-			// search.
 			while let Some((&(deadline, id), _)) = events.deadlines.first_key_value() {
 				if deadline > now {
 					break;
@@ -328,8 +244,6 @@ impl Core {
 				let Some(entry) = events.entries.get_mut(&id) else {
 					continue;
 				};
-				// A cancelled timer left the table already; only a waiting one
-				// is here.
 				if entry.stat != Stat::Pending {
 					continue;
 				}
@@ -346,8 +260,6 @@ impl Core {
 		}
 	}
 
-	/// Takes every completion the backend already holds, without entering the
-	/// kernel for more.
 	fn reap(&mut self, shared: &Shared) -> io::Result<()> {
 		loop {
 			match self.backend.poll(Some(Duration::ZERO)) {
@@ -358,13 +270,11 @@ impl Core {
 		}
 	}
 
-	/// Hands one finished operation its response.
 	fn settle(&mut self, shared: &Shared, id: u64) {
 		let response = self.backend.take(id);
 		let (waiter, waker) = {
 			let mut events = shared.events.lock().unwrap();
 			let Some(entry) = events.get_mut(id) else {
-				// The future went before the backend reported.
 				return;
 			};
 			if entry.stat == Stat::Abandoned {
@@ -383,7 +293,6 @@ impl Core {
 		}
 	}
 
-	/// Hands a submission failure to whoever waits.
 	fn fail(&mut self, shared: &Shared, id: u64, error: io::Error) {
 		let (waiter, waker) = {
 			let mut events = shared.events.lock().unwrap();
@@ -406,7 +315,6 @@ impl Core {
 		}
 	}
 
-	/// Hands the pending submissions and the cancels to the backend.
 	fn drain(&mut self, shared: &Shared) {
 		let mut wakers = Vec::new();
 		let (pending, cancels) = {
@@ -415,12 +323,9 @@ impl Core {
 			let mut pending = Vec::new();
 			let mut cancels = Vec::new();
 			for (id, entry) in entries.iter_mut() {
-				// An ask a pass has already carried out is not carried again.
 				if entry.give_up == GiveUp::Asked {
 					entry.give_up.handled();
 					match entry.stat {
-						// Never submitted: there is nothing to stop. A timer is
-						// such a one, and its deadline goes with the cancel.
 						Stat::Pending => {
 							entry.request = None;
 							entry.response = Some(Err(not_submitted()));
@@ -432,10 +337,7 @@ impl Core {
 								wakers.push(waker);
 							}
 						}
-						// The future went while the backend held it; an
-						// abandoned entry still has to be stopped and
-						// reaped, or it would sit in the map holding what it
-						// keeps alive for as long as the backend waits.
+						// Abandoned operations must still be cancelled and reaped to release their resources.
 						Stat::InFlight | Stat::Abandoned => cancels.push(*id),
 						_ => {}
 					}
@@ -443,8 +345,6 @@ impl Core {
 				}
 				if entry.stat == Stat::Pending {
 					if let Some(request) = entry.request.take() {
-						// The backend has it from here; a future that goes in
-						// the meantime is marked abandoned and cancelled below.
 						entry.stat = Stat::InFlight;
 						pending.push((*id, request));
 					}
@@ -503,8 +403,7 @@ impl Core {
 				self.fail(shared, id, error);
 				continue;
 			}
-			// The future may have gone, or asked to stop, while the request was
-			// in this loop: the backend has it, so the cancel goes now.
+			// Cancellation may have raced submission while the events lock was released.
 			let stop = {
 				let mut events = shared.events.lock().unwrap();
 				match events.get_mut(id) {
@@ -522,8 +421,6 @@ impl Core {
 		}
 	}
 
-	/// Drives the reactor until `id` is settled, for a drop that has to wait
-	/// for the backend to let go and no other thread will reap for it.
 	fn drive_until(&mut self, shared: &Shared, id: u64) -> io::Result<()> {
 		loop {
 			self.drain(shared);
@@ -538,8 +435,6 @@ impl Core {
 		}
 	}
 
-	/// Drives the reactor until nothing is in flight, for a reactor going away
-	/// with operations still out.
 	fn drive_to_idle(&mut self, shared: &Shared) -> io::Result<()> {
 		loop {
 			self.drain(shared);
@@ -555,17 +450,8 @@ impl Core {
 	}
 }
 
-/// The reactor's table: every operation, keyed by the id the submitter minted,
-/// and — separately — the deadlines of the timers among them.
-///
-/// A timer is an entry with no request: it never reaches a backend, and the
-/// deadline here is what settles it instead. One lock covers an entry and its
-/// deadline, so the two cannot drift apart.
 struct Events {
 	entries: HashMap<u64, Entry>,
-	/// `(deadline, id)` for every timer still waiting, sorted so the nearest is
-	/// `first_key_value`. The id is there because two timers may share a
-	/// deadline.
 	deadlines: BTreeMap<(Instant, u64), ()>,
 }
 
@@ -585,7 +471,6 @@ impl Events {
 		self.entries.get_mut(&id)
 	}
 
-	/// Inserts an entry, recording its deadline when it is a timer.
 	fn insert(&mut self, id: u64, entry: Entry) {
 		if let Some(deadline) = entry.deadline {
 			self.deadlines.insert((deadline, id), ());
@@ -593,7 +478,6 @@ impl Events {
 		self.entries.insert(id, entry);
 	}
 
-	/// Removes an entry and the deadline it held, if any.
 	fn remove(&mut self, id: u64) -> Option<Entry> {
 		let entry = self.entries.remove(&id)?;
 		if let Some(deadline) = entry.deadline {
@@ -602,8 +486,6 @@ impl Events {
 		Some(entry)
 	}
 
-	/// How long a caller may wait: its own timeout, the nearest deadline, or
-	/// whichever comes first. `None` is "until something happens".
 	fn within(&self, timeout: Option<Duration>) -> Option<Duration> {
 		let nearest = self
 			.deadlines
@@ -620,55 +502,21 @@ impl Events {
 
 struct Shared {
 	next: AtomicU64,
-	/// Every operation, keyed by the id the submitter minted, and the timers'
-	/// deadlines. The table is the lock: an entry's fields are read and written
-	/// only under it. Waking is the exception — a `wake` can poll a future that
-	/// takes the same lock, so it happens after the guard is dropped.
+	/// Wake outside this lock: a waker may re-enter the operation table.
 	events: Mutex<Events>,
-	/// What wakes a blocked [`Reactor::poll`], and what every [`Event`] this
-	/// reactor hands out raises.
 	event: Event,
-	/// Set by [`Submitter::stop`], and by [`Reactor`]'s drop under
-	/// [`Shared::events`] so a racing submission is refused or cleaned up, not
-	/// left in a table nobody drives; no new submission is taken afterwards.
 	stopped: AtomicBool,
-	/// Set while the reactor is inside its backend wait: a submission that
-	/// lands now is one the reactor cannot see without being woken, and one
-	/// that lands while it is not waiting is taken by the next drain.
 	parked: AtomicBool,
-	/// Set by [`Shared::wake_reactor`] for a wake raised on the reactor's own
-	/// thread, taken by [`Reactor::poll`] before its wait: what that thread
-	/// readied is run by the loop it returns to, so the wait must not block.
+	/// A driver-thread wake must prevent the next poll from sleeping.
 	ready: AtomicBool,
-	/// The backend, and the one pass at a time the reactor takes over it.
 	core: Mutex<Core>,
-	/// How the backend's cancellation error is told from real work; see
-	/// [`crate::backend::cancelled`]. A plain function so a racing `until` can
-	/// read it without the core lock.
 	cancelled: fn(&io::Error) -> bool,
-	/// Raised by [`Core::settle`] when an entry whose [`Entry::waiter`] is set
-	/// lands: what a drop from another thread waits on.
 	settled: Condvar,
-	/// The thread that drives this reactor: the one that last called
-	/// [`Reactor::poll`] or owns the [`Executor`](crate::Executor). A drop on
-	/// it drives the reactor inline, because nobody else will; on any other
-	/// thread it notifies the reactor and waits on [`Shared::settled`].
 	reactor_thread: Mutex<Option<ThreadId>>,
-	/// What [`Reactor::poll_fd`] borrows, asked of the backend once at
-	/// creation: a second ask would take the core lock.
 	poll_fd: io::Result<Event>,
-	/// How many completions were dropped while their operation still used the
-	/// caller's memory, and so had to be waited out. It witnesses a missed
-	/// cooperative cancel: a cancel that is awaited takes its entry out of the
-	/// table, and counts nothing, while a drop that has to wait the operation out
-	/// counts once — a caller's deliberate give-up among them. A teardown that
-	/// has already taken the entry does not count: the drop finds nothing to
-	/// wait for.
-	fallback_drops: AtomicU64,
 }
 
 impl Shared {
-	/// Records the calling thread as the reactor's driver.
 	fn enter_reactor(&self) {
 		*self.reactor_thread.lock().unwrap() = Some(thread::current().id());
 	}
@@ -677,14 +525,7 @@ impl Shared {
 		*self.reactor_thread.lock().unwrap() == Some(thread::current().id())
 	}
 
-	/// Ends the reactor's wait, or records the wake when it is the reactor's
-	/// own thread that raises it.
-	///
-	/// That thread is running the loop, so it will tick what the wake readied
-	/// before it reaches another wait; `ready` keeps that wait from blocking on
-	/// it. A thread other than the reactor's races with the wait — a raise that
-	/// lands between the drain and it would be lost — so it raises the event,
-	/// unconditionally.
+	/// Cross-thread wakes must notify unconditionally to cover the gap between draining and parking.
 	fn wake_reactor(&self) {
 		if self.on_reactor_thread() {
 			self.ready.store(true, Ordering::Release);
@@ -693,12 +534,10 @@ impl Shared {
 		}
 	}
 
-	/// Whether `id` has been handed to its future, or gone entirely.
 	fn is_settled(&self, id: u64) -> bool {
 		self.is_settled_locked(&self.events.lock().unwrap(), id)
 	}
 
-	/// Whether any operation is still in flight.
 	fn is_idle(&self) -> bool {
 		!self
 			.events
@@ -710,32 +549,13 @@ impl Shared {
 	}
 }
 
-/// A wake-up that reaches a reactor's driver; see [`Shared::wake_reactor`].
-///
-/// It is `Send + Sync` and the `Waker` made from it clones by refcount, so a
-/// task may hand one to another thread; [`ReactorWaker::around`] wraps a task's
-/// own waker, and is what a spawned task polls with.
 pub(super) struct ReactorWaker {
 	shared: Arc<Shared>,
-	/// The task waker this one wraps, when it wraps one: a wake has to run the
-	/// task as well as reach the driver. `None` for the future `block_on` polls.
-	inner: Option<Waker>,
 }
 
 impl ReactorWaker {
 	fn new(shared: Arc<Shared>) -> ReactorWaker {
-		Self {
-			shared,
-			inner: None,
-		}
-	}
-
-	/// `inner`, with this wake-up behind it.
-	pub(super) fn around(&self, inner: &Waker) -> Waker {
-		Waker::from(Arc::new(Self {
-			shared: Arc::clone(&self.shared),
-			inner: Some(inner.clone()),
-		}))
+		Self { shared }
 	}
 }
 
@@ -745,11 +565,6 @@ impl Wake for ReactorWaker {
 	}
 
 	fn wake_by_ref(self: &Arc<Self>) {
-		// The task is queued before the driver is told: the other order lets a
-		// driver woken first find nothing to run and park again.
-		if let Some(inner) = &self.inner {
-			inner.wake_by_ref();
-		}
 		self.shared.wake_reactor();
 	}
 }
@@ -760,12 +575,10 @@ pub struct Reactor {
 }
 
 impl Reactor {
-	/// Creates the backend.
 	pub fn new(config: Config) -> io::Result<(Reactor, Submitter)> {
 		config.validate()?;
 		let (backend, event) = create(&config)?;
-		// Asked once, here: the descriptor never changes, and asking later
-		// would take the core lock, which a blocked `poll` holds.
+		// Cache this before polling: a blocked poll holds the core lock.
 		let poll_fd = backend.poll_fd();
 		let shared = Arc::new(Shared {
 			next: AtomicU64::new(0),
@@ -779,7 +592,6 @@ impl Reactor {
 			poll_fd,
 			settled: Condvar::new(),
 			reactor_thread: Mutex::new(None),
-			fallback_drops: AtomicU64::new(0),
 		});
 		Ok((
 			Reactor {
@@ -789,12 +601,10 @@ impl Reactor {
 		))
 	}
 
-	/// Records this thread as the reactor's driver; see [`Shared::reactor_thread`].
 	pub(super) fn enter_reactor(&self) {
 		self.shared.enter_reactor();
 	}
 
-	/// The wake-up that ends this reactor's wait; see [`ReactorWaker`].
 	pub(super) fn waker(&self) -> ReactorWaker {
 		ReactorWaker::new(Arc::clone(&self.shared))
 	}
@@ -808,18 +618,10 @@ impl Reactor {
 			core.settle_timers(&self.shared);
 			return core.reap(&self.shared);
 		}
-		// A submission from another thread has to raise the wake-up of a
-		// reactor that is waiting, or it would sit unseen; a submission from
-		// inside a future this thread is about to poll must not, or the wait a
-		// device holds on that same wake-up resolves at once and the thread
-		// spins. The flag is what tells them apart, and it is set before the
-		// second drain so nothing queued in between is missed.
+		// Mark parked before the second drain so concurrent submissions cannot be missed.
 		self.shared.parked.store(true, Ordering::Release);
 		core.drain(&self.shared);
 		let result = if self.shared.ready.swap(false, Ordering::AcqRel) {
-			// A wake landed on this thread while it was running: its loop runs
-			// what that readied before it waits again, so this pass takes what
-			// the backend already holds and returns instead of blocking.
 			core.settle_timers(&self.shared);
 			core.reap(&self.shared)
 		} else {
@@ -849,14 +651,6 @@ impl Reactor {
 		self.shared.is_idle()
 	}
 
-	/// How many completions this reactor's threads dropped while their
-	/// operation still named the caller's memory, and so had to be waited out:
-	/// a test witness for a cooperative cancel that was not awaited, and a
-	/// diagnostic.
-	pub fn fallback_drops(&self) -> u64 {
-		self.shared.fallback_drops.load(Ordering::Relaxed)
-	}
-
 	/// Stopped and every in-flight operation landed.
 	#[doc(hidden)]
 	pub fn is_stopped(&self) -> bool {
@@ -864,23 +658,14 @@ impl Reactor {
 	}
 }
 
-/// Stops the reactor and cancels every operation still out, driving them to
-/// their ends so nothing is left touching memory after the reactor goes. A
-/// completion dropped after this finds its entry gone and returns at once, and
-/// a submission after it is refused the same as one after [`Submitter::stop`].
+/// Cancels and drains outstanding operations before releasing their memory; subsequent submissions fail.
 impl Drop for Reactor {
 	fn drop(&mut self) {
 		let shared = &self.shared;
 		{
 			let mut events = shared.events.lock().unwrap();
-			// Set under the table's lock, so a submission racing this drop meets
-			// one or the other: it sees `stopped` and is refused, or its entry is
-			// here in time for the cleanup below. A check outside the lock would
-			// let one insert after the table was cleared, into a reactor nobody
-			// drives.
+			// Synchronize with insertion so a racing submission is either rejected or included in teardown.
 			shared.stopped.store(true, Ordering::Release);
-			// A pending request never reached a backend; it goes with the map.
-			// A timer is such a one, and its deadline goes with it.
 			events
 				.entries
 				.retain(|_, entry| entry.stat != Stat::Pending);
@@ -891,8 +676,6 @@ impl Drop for Reactor {
 		}
 		let _ = shared.event.notify();
 		if let Ok(mut core) = shared.core.lock() {
-			// A settle only happens while someone drives, and here that is this
-			// thread: nothing else will reap, so the pass runs to the end.
 			while !shared.is_idle() {
 				if core.drive_to_idle(shared).is_err() {
 					break;
@@ -906,22 +689,14 @@ impl Drop for Reactor {
 	}
 }
 
-/// An owned resource an operation can name, and a caller can take back.
-///
-/// [`Submitter`] operations borrow one, and each keeps its own clone for as long
-/// as it lives: what a backend works on stays a live descriptor whatever the
-/// caller does with its own clones. [`Handle::take`] resolves only once every
-/// other clone has let go, which is what makes the descriptor safe to close
-/// afterwards.
+/// An owned resource shared by operations; [`Handle::take`] waits for all other holders to release it.
 pub struct Handle<S> {
 	value: Arc<S>,
-	/// Dropped after `value`, so a clone releases the resource before it wakes
-	/// a taker; see [`Release`].
+	/// Drop after `value` so a woken taker sees the resource released.
 	release: Release,
 }
 
 impl<S> Handle<S> {
-	/// Takes ownership of `value`.
 	pub fn new(value: S) -> Handle<S> {
 		Self {
 			value: Arc::new(value),
@@ -929,12 +704,7 @@ impl<S> Handle<S> {
 		}
 	}
 
-	/// Waits until every other clone has let go, then returns the resource;
-	/// `None` if another [`take`](Handle::take) is already waiting for it.
-	///
-	/// A taker registers before it tries, and a clone releases before it wakes:
-	/// a release already past is seen by the try, and one that follows raises
-	/// the registered waker.
+	/// Returns the resource after all other holders release it, or `None` if another take is already waiting.
 	pub fn take(self) -> impl Future<Output = Option<S>> {
 		let value = self.value;
 		Take::new(value, self.release)
@@ -960,10 +730,6 @@ impl<S: AsDescriptor + Send + Sync + 'static> From<S> for Handle<S> {
 }
 
 impl<S: AsDescriptor> Handle<S> {
-	/// The number the backend works on.
-	///
-	/// Not the public `AsDescriptor` impl: on unix that is the blanket over
-	/// `AsFd`, and `S: AsDescriptor` does not imply `S: AsFd`.
 	fn raw(&self) -> RawHandle {
 		RawHandle::from_descriptor(self.value.as_descriptor())
 	}
@@ -986,11 +752,6 @@ impl<S> Deref for Handle<S> {
 	}
 }
 
-/// A clone's share of the hold on the resource a [`Handle`] named.
-///
-/// Its drop is the wake, and it is the handle's last field: the resource is let
-/// go first. A taker woken here cannot look while the resource is still held and
-/// then find no wake left to come.
 struct Release {
 	waker: Arc<WakerSlot>,
 }
@@ -1021,10 +782,6 @@ impl Drop for Release {
 	}
 }
 
-/// Where a taker parks; a clone's release wakes it.
-///
-/// One taker at a time: [`Handle::take`] marks the slot taken, and a second take
-/// gives up rather than share the one waker.
 struct WakerSlot {
 	taken: AtomicBool,
 	waker: Mutex<Option<Waker>>,
@@ -1042,8 +799,7 @@ impl WakerSlot {
 		*self.waker.lock().unwrap() = Some(waker.clone());
 	}
 
-	/// Wakes a parked taker, if any. The waker is taken under the lock and
-	/// raised outside it: a wake may poll a future that registers here again.
+	/// Wake outside the lock: the waker may register here again.
 	fn wake(&self) {
 		let waker = self.waker.lock().unwrap().take();
 		if let Some(waker) = waker {
@@ -1052,13 +808,10 @@ impl WakerSlot {
 	}
 }
 
-/// The future [`Handle::take`] returns.
 struct Take<S> {
-	/// `None` once it resolved, so its drop has nothing to release.
 	value: Option<Arc<S>>,
-	/// Dropped after `value`: the taker's own hold goes first, then the wake.
+	/// Drop after `value` so a woken taker sees the resource released.
 	release: Release,
-	/// Whether this take marked the slot: the second one does not.
 	claimed: bool,
 }
 
@@ -1089,16 +842,13 @@ impl<S> Future for Take<S> {
 				.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
 				.is_err()
 			{
-				// Another take has it: this clone gives up, and its own
-				// release may be the one that other take is waiting for.
 				drop(value);
 				this.release.wake();
 				return Poll::Ready(None);
 			}
 			this.claimed = true;
 		}
-		// Register before the try: a release that follows raises this waker,
-		// and one already past is what the try finds.
+		// Register before checking ownership to avoid losing a concurrent release.
 		this.release.waker.register(cx.waker());
 		match Arc::try_unwrap(value) {
 			Ok(value) => Poll::Ready(Some(value)),
@@ -1112,18 +862,13 @@ impl<S> Future for Take<S> {
 
 impl<S> Drop for Take<S> {
 	fn drop(&mut self) {
-		// A take that ends, however it ends, leaves the slot for the next one.
 		if self.claimed {
 			self.release.waker.taken.store(false, Ordering::Release);
 		}
 	}
 }
 
-/// One operation the reactor still holds, as [`Submitter::in_flight`] reports
-/// it.
-///
-/// A copy taken under the reactor's lock: the descriptor is a number, not a
-/// hold, and a later snapshot may no longer show the entry at all.
+/// A diagnostic snapshot; descriptor numbers are borrowed metadata and keep no resource open.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct InFlight {
@@ -1131,9 +876,7 @@ pub struct InFlight {
 	pub id: u64,
 	/// The operation's name: `"read"`, `"send"`, `"timeout"`, and the rest.
 	pub op: &'static str,
-	/// The submitting call site. A facade takes it where the operation was
-	/// asked for, through `#[track_caller]`; a [`Submitter`] method called
-	/// directly takes its own caller's, the same way.
+	/// The call site that created the operation.
 	pub origin: &'static Location<'static>,
 	/// Where the operation is in its life.
 	pub state: InFlightState,
@@ -1142,12 +885,9 @@ pub struct InFlight {
 	pub descriptor: Option<RawDescriptor>,
 	/// How long since the operation was submitted.
 	pub age: Duration,
-	/// Whether a stop was asked of the operation — by a cancel racing it, or by
-	/// a drop waiting it out — whether or not a pass has carried the ask to a
-	/// backend yet.
+	/// Whether cancellation was requested, including requests not yet sent to the backend.
 	pub cancel_requested: bool,
-	/// Whether the kernel reads or writes the caller's memory through it; the
-	/// fact the drop fallback reports an operation left in flight for.
+	/// Whether the operation reads or writes caller memory.
 	pub names_memory: bool,
 	/// A timer's deadline; `None` for an operation a backend carries.
 	pub deadline: Option<Instant>,
@@ -1194,60 +934,21 @@ impl InFlightState {
 	}
 }
 
-/// The submit side of a [`Reactor`].
+/// Submits operations to a [`Reactor`], retaining each resource until completion.
 ///
-/// An operation names its resource as a [`Handle`]: the operation keeps its own
-/// hold on the handle until it settles, so the descriptor stays open however the
-/// caller treats its own — a number the caller closed and the kernel handed to
-/// another file can never be what an operation reads or writes. A caller that
-/// holds a plain number has to own a descriptor first:
-/// [`BorrowedDescriptor`](crate::BorrowedDescriptor)'s `try_clone_to_owned`
-/// duplicates one into an [`OwnedDescriptor`](crate::OwnedDescriptor), and a
-/// resource comes to a facade through [`Facade::new`](crate::Facade::new).
-///
-/// The submission methods come in pairs, for the two ways a caller reaches
-/// them. The `#[track_caller]` one records the caller's own location; the `_at`
-/// twin takes it as a parameter.
-///
-/// Both exist because an operation is submitted lazily, at its first poll: by
-/// then the frame that asked for it has returned, and the attribute cannot
-/// reach back across a `Future::poll` to it. A facade therefore captures
-/// `Location::caller()` as the operation is built and hands it to the twin —
-/// through the flow loop, whose own calls name the loop, not the caller. A
-/// caller that reaches a submitter directly keeps the attribute and pays
-/// nothing.
-///
-/// A transfer is one kernel call: it completes with what that call moved,
-/// possibly less than the extents name, and `0` at the end of a file. The
-/// backend does not resume it; filling a range takes a loop, which the
-/// facade's `*_exact` and `*_all` methods are.
+/// Transfers may complete short; use the facade's `*_exact` and `*_all` methods to fill a range.
 #[derive(Clone)]
 pub struct Submitter {
 	shared: Arc<Shared>,
 }
 
 impl Submitter {
-	/// The reactor's wake-up, for whoever has no waker of its own to raise —
-	/// an [`Event`] with several waiters. Raising it ends a blocked
-	/// [`Reactor::poll`].
+	/// The event that wakes a blocked [`Reactor::poll`].
 	pub fn event(&self) -> Event {
 		self.shared.event.clone()
 	}
 
-	/// This reactor's fallback drops; see [`Reactor::fallback_drops`].
-	pub fn fallback_drops(&self) -> u64 {
-		self.shared.fallback_drops.load(Ordering::Relaxed)
-	}
-
-	/// A snapshot of every operation the reactor still holds — the requests
-	/// and the timers — in every state, [`InFlightState::Pending`] through
-	/// [`InFlightState::Abandoned`]. Oldest first, by submission id. Callers
-	/// filter to the states they care about; nothing is left out here.
-	///
-	/// Diagnostic, and read-only: it walks the operation table once under its
-	/// lock and touches no waker, response, stat or backend. A caller at human
-	/// rates pays only that walk; one in a hot loop shares the lock with the
-	/// reactor's own passes and should not call it per operation.
+	/// Snapshots all retained operations in submission order. Takes the operation-table lock; intended for diagnostics, not per-operation polling.
 	pub fn in_flight(&self) -> Vec<InFlight> {
 		let now = Instant::now();
 		let mut held: Vec<InFlight> = {
@@ -1262,13 +963,7 @@ impl Submitter {
 		held
 	}
 
-	/// Wakes a reactor that is waiting, and nothing else.
-	///
-	/// The wake-up is a counter: raising it while nobody waits leaves it set,
-	/// and the next wait resolves at once — a device that waits on the same
-	/// wake-up then polls its own submissions in a loop instead of sleeping.
-	/// A submission the reactor is about to take needs no raise:
-	/// [`Reactor::poll`] drains the queue before it parks.
+	/// Wakes the reactor if it is parked.
 	#[doc(hidden)]
 	pub fn wake(&self) {
 		if self.shared.parked.load(Ordering::Acquire) {
@@ -1276,8 +971,7 @@ impl Submitter {
 		}
 	}
 
-	/// Reads the ranges of `memory` named by `extents`, from `fdoff`, into the
-	/// file `fd` names, in one call.
+	/// Reads from `fd` at `fdoff` into the named ranges of `memory`.
 	#[track_caller]
 	pub fn read<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
@@ -1289,8 +983,6 @@ impl Submitter {
 		self.read_at(Location::caller(), fd, fdoff, memory, extents)
 	}
 
-	/// [`read`](Self::read) with the location in hand; see [`Submitter`] for why
-	/// the two exist.
 	pub(super) fn read_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1312,8 +1004,7 @@ impl Submitter {
 		)
 	}
 
-	/// Writes the ranges of `memory` named by `extents`, from `fdoff`, out of
-	/// the file `fd` names.
+	/// Writes the named ranges of `memory` to `fd` at `fdoff`.
 	#[track_caller]
 	pub fn write<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
@@ -1325,8 +1016,6 @@ impl Submitter {
 		self.write_at(Location::caller(), fd, fdoff, memory, extents)
 	}
 
-	/// [`write`](Self::write) with the location in hand; see [`Submitter`] for
-	/// why the two exist.
 	pub(super) fn write_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1357,8 +1046,6 @@ impl Submitter {
 		self.fsync_at(Location::caller(), fd)
 	}
 
-	/// [`fsync`](Self::fsync) with the location in hand; see [`Submitter`] for
-	/// why the two exist.
 	pub(super) fn fsync_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1382,8 +1069,6 @@ impl Submitter {
 		self.flush_at(Location::caller(), fd)
 	}
 
-	/// [`flush`](Self::flush) with the location in hand; see [`Submitter`] for
-	/// why the two exist.
 	pub(super) fn flush_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1408,8 +1093,6 @@ impl Submitter {
 		self.recv_at(Location::caller(), fd, memory, extents)
 	}
 
-	/// [`recv`](Self::recv) with the location in hand; see [`Submitter`] for why
-	/// the two exist.
 	pub(super) fn recv_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1441,8 +1124,6 @@ impl Submitter {
 		self.recv_with_fds_at(Location::caller(), fd, memory, extents)
 	}
 
-	/// [`recv_with_fds`](Self::recv_with_fds) with the location in hand; see
-	/// [`Submitter`] for why the two exist.
 	pub(super) fn recv_with_fds_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1473,8 +1154,6 @@ impl Submitter {
 		self.send_at(Location::caller(), fd, memory, extents)
 	}
 
-	/// [`send`](Self::send) with the location in hand; see [`Submitter`] for why
-	/// the two exist.
 	pub(super) fn send_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1494,9 +1173,7 @@ impl Submitter {
 		)
 	}
 
-	/// Sends the ranges of `memory` named by `extents`, carrying `fds` with the
-	/// bytes. The descriptors travel with the bytes that leave first, which is
-	/// the whole call: nothing resumes it.
+	/// Sends the named ranges of `memory` with `fds`; a short send does not retry.
 	#[track_caller]
 	pub fn send_with_fds<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
@@ -1508,8 +1185,6 @@ impl Submitter {
 		self.send_with_fds_at(Location::caller(), fd, memory, extents, fds)
 	}
 
-	/// [`send_with_fds`](Self::send_with_fds) with the location in hand; see
-	/// [`Submitter`] for why the two exist.
 	pub(super) fn send_with_fds_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1531,9 +1206,7 @@ impl Submitter {
 		)
 	}
 
-	/// Accepts a connection on the listening socket `fd`: the response owns the
-	/// socket the kernel reports, and closing it is what dropping the response
-	/// does.
+	/// Accepts a connection, returning ownership of the socket in [`Response::Accepted`].
 	#[track_caller]
 	pub fn accept<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
@@ -1542,8 +1215,6 @@ impl Submitter {
 		self.accept_at(Location::caller(), fd)
 	}
 
-	/// [`accept`](Self::accept) with the location in hand; see [`Submitter`] for
-	/// why the two exist.
 	pub(super) fn accept_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1566,8 +1237,6 @@ impl Submitter {
 		self.wait_readable_at(Location::caller(), fd)
 	}
 
-	/// [`wait_readable`](Self::wait_readable) with the location in hand; see
-	/// [`Submitter`] for why the two exist.
 	pub(super) fn wait_readable_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1590,8 +1259,6 @@ impl Submitter {
 		self.wait_writable_at(Location::caller(), fd)
 	}
 
-	/// [`wait_writable`](Self::wait_writable) with the location in hand; see
-	/// [`Submitter`] for why the two exist.
 	pub(super) fn wait_writable_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
@@ -1605,12 +1272,7 @@ impl Submitter {
 		)
 	}
 
-	/// Waits for this reactor's own wake-up (`Submitter::event`), which a
-	/// channel send or a `notify` raises.
-	///
-	/// No facade stands in front of this one, so the attribute reaches the frame
-	/// that asked: a `wake` waited on from the reactor's own thread would
-	/// otherwise name this body.
+	/// Waits for this reactor's [`Submitter::event`] to be notified.
 	#[track_caller]
 	pub fn wait(&self) -> io::Result<Completion> {
 		if !cfg!(unix) {
@@ -1628,20 +1290,14 @@ impl Submitter {
 		)
 	}
 
-	/// Completes once `duration` has passed on the reactor's clock.
-	///
-	/// No backend sees this: the timer is an entry in the reactor's own table
-	/// whose deadline a wait is capped at, and the reactor settles it there.
+	/// Completes after `duration`.
 	#[track_caller]
 	pub fn timeout(&self, duration: Duration) -> io::Result<Completion> {
 		self.arm(Location::caller(), Instant::now() + duration)
 	}
 
-	/// Registers a timer due at `deadline`; the entry `enqueue` makes, without
-	/// the request a backend would need.
 	fn arm(&self, origin: &'static Location<'static>, deadline: Instant) -> io::Result<Completion> {
 		let id = {
-			// The check and the insert are one lock hold; see [`Reactor`]'s drop.
 			let mut events = self.shared.events.lock().unwrap();
 			if self.shared.stopped.load(Ordering::Acquire) {
 				return Err(stopped());
@@ -1676,22 +1332,13 @@ impl Submitter {
 		})
 	}
 
-	/// Wake and stop the reactor: no further submission is taken — each is
-	/// refused with [`BrokenPipe`](io::ErrorKind::BrokenPipe) — while the
-	/// operations already in flight are left to land. Dropping the reactor
-	/// stops it the same way.
+	/// Refuses new submissions with [`BrokenPipe`](io::ErrorKind::BrokenPipe) and wakes the reactor; existing operations are left to complete.
 	pub fn stop(&self) {
 		self.shared.stopped.store(true, Ordering::Release);
 		let _ = self.shared.event.notify();
 	}
 
-	/// Registers `request` under a fresh id and returns the completion that
-	/// awaits it, with `descriptor` held for as long as the operation lives.
-	///
-	/// `origin` is the caller's own location, taken by whoever knows it: a facade
-	/// captures it when it builds the operation, because the frame that reaches
-	/// this one through `Flow::submit` is not the frame that asked, and
-	/// `#[track_caller]` cannot cross a `Future::poll` to find it.
+	/// Facade call sites are captured before polling: `#[track_caller]` cannot cross `Future::poll`.
 	fn enqueue(
 		&self,
 		origin: &'static Location<'static>,
@@ -1701,7 +1348,6 @@ impl Submitter {
 		let names_memory = request.names_memory();
 		let kind = request.kind();
 		let id = {
-			// The check and the insert are one lock hold; see [`Reactor`]'s drop.
 			let mut events = self.shared.events.lock().unwrap();
 			if self.shared.stopped.load(Ordering::Acquire) {
 				return Err(stopped());
@@ -1736,26 +1382,13 @@ impl Submitter {
 		})
 	}
 
-	/// A channel bound to this reactor's wake-up.
-	///
-	/// The send end queues and raises the wake-up where a receiver waits;
-	/// the receive end is a `Future` resolving to one value. Both ends are
-	/// the caller's, and they keep working after this handle goes.
+	/// Creates a channel bound to this reactor's wake-up.
 	pub fn channel<T>(&self) -> (channel::Sender<T>, channel::Receiver<T>) {
 		channel::Shared::split(self.shared.event.clone())
 	}
 }
 
-/// The cancellation primitive.
-///
-/// Cloning gives another handle on the same `Cancel`; [`Cancel::child`] gives one
-/// that the parent cancels too. The scope and the shape of the tree are the
-/// caller's: the library only hands out the primitive.
-///
-/// A [`Cancel`] carries the wake-ups of the reactors its operations were
-/// submitted to and raises them when it fires: a [`Submitter`] is `Send`, so
-/// the reactor that has to carry the cancel to the backend is not always the
-/// one the waiter's own waker reaches.
+/// A clonable cancellation signal. Clones share the signal; [`Cancel::child`] creates a signal also cancelled by its parent.
 #[derive(Clone)]
 pub struct Cancel {
 	inner: Arc<CancelInner>,
@@ -1763,20 +1396,9 @@ pub struct Cancel {
 
 struct CancelInner {
 	cancelled: AtomicBool,
-	/// Tasks waiting for the cancel, keyed by their registration and taken and
-	/// woken when it fires. A waiter re-registers in place on every poll, so the
-	/// map only holds the live ones; see `Wait`.
 	wakers: Mutex<HashMap<u64, Waker>>,
-	/// The key the next [`Wait`] registers under.
 	next: AtomicU64,
-	/// Reactor wake-ups to raise, so a thread parked in `Reactor::poll` returns.
-	/// Deduplicated: a cancel waited on from many operations of one reactor
-	/// keeps that reactor's single wake-up, and the list only grows with the
-	/// reactors the cancel spans.
 	events: Mutex<Vec<Event>>,
-	/// Signals that fire when this one does. Held weakly: a child is owned by
-	/// whoever asked for it, and a parent that kept it alive would leak one
-	/// per driver reset.
 	children: Mutex<Vec<Weak<CancelInner>>>,
 }
 
@@ -1839,38 +1461,24 @@ impl Cancel {
 			return child;
 		}
 		let mut children = self.inner.children.lock().unwrap();
-		// The parent may have fired between the check and the lock; the lock
-		// orders this against `fire`, so the check is made again under it.
+		// Recheck under the lock to cover cancellation racing child registration.
 		if self.is_cancelled() {
 			drop(children);
 			child.cancel();
 			return child;
 		}
-		// Whatever its holder dropped is gone: the list is the live children
-		// only, so a device that makes one per reset does not grow it.
 		children.retain(|child| child.strong_count() > 0);
 		children.push(Arc::downgrade(&child.inner));
 		child
 	}
 
-	/// How many children the cancel holds; a test measure of the pruning.
 	#[cfg(test)]
 	fn children(&self) -> usize {
 		self.inner.children.lock().unwrap().len()
 	}
 
-	/// A future that resolves once the cancel fires.
-	pub fn wait(&self) -> impl Future<Output = ()> {
-		Wait::new(Arc::clone(&self.inner))
-	}
-
-	/// Registers a reactor wake-up to raise when the cancel fires. The same
-	/// reactor registered twice is one entry: [`Event::same`] compares identity,
-	/// so the list is bounded by the distinct reactors the cancel's waiters run
-	/// on, not by how many times the cancel is waited on.
 	fn attach(&self, event: Event) {
 		let mut events = self.inner.events.lock().unwrap();
-		// A cancel that fired before the attach raises it at once.
 		if self.is_cancelled() {
 			drop(events);
 			let _ = event.notify();
@@ -1882,7 +1490,6 @@ impl Cancel {
 		events.push(event);
 	}
 
-	/// How many waiters are registered; a test measure of the deregistration.
 	#[cfg(test)]
 	fn waiting(&self) -> usize {
 		self.inner.wakers.lock().unwrap().len()
@@ -1895,17 +1502,9 @@ impl Default for Cancel {
 	}
 }
 
-/// The future [`Cancel::wait`] returns.
-///
-/// It holds a registration in the cancel's waiter map, replaced in place on
-/// every poll and removed when the future goes — resolved, dropped, or taken
-/// with an `until` that returned first. A cancel outliving millions of waits
-/// therefore keeps only the waiters still parked.
 struct Wait {
 	inner: Arc<CancelInner>,
 	key: u64,
-	/// Whether the map holds `key`; a fired cancel takes the whole map, so a
-	/// later drop has nothing to remove.
 	registered: bool,
 }
 
@@ -1927,7 +1526,6 @@ impl Future for Wait {
 		let this = self.get_mut();
 		let mut wakers = this.inner.wakers.lock().unwrap();
 		if this.inner.cancelled.load(Ordering::Acquire) {
-			// The cancel has fired; nothing to register, and nothing to remove.
 			this.registered = false;
 			return Poll::Ready(());
 		}
@@ -1945,25 +1543,24 @@ impl Drop for Wait {
 	}
 }
 
-/// Gives up the entry when the completion goes without being awaited: the
-/// result then lands with nobody to take it, and the backend's operation is
-/// cancelled.
-///
-/// It is a field rather than a [`Drop`] impl on [`Completion`] so that a
-/// completion is not `Drop`: dropping one still releases the entry, while the
-/// userdata can be moved out by [`Completion::tag`].
-///
-/// An operation still in flight that names the caller's memory is a bug the
-/// drop has to pay for: the kernel would go on reading or writing memory the
-/// caller may free, so the drop stays until the backend has let go — the
-/// semantics the caller needs — and reports it. A build with debug assertions
-/// panics on it too, once the backend is off the memory; a release build only
-/// reports.
-///
-/// A give-up the caller asked for is not that bug: a cancel that already fired,
-/// or a reactor carrying out a stop, leaves the future to be dropped with the
-/// operation still in flight, and the wait above is the give-up's own path. The
-/// drop reports that at `debug`, and does not panic.
+thread_local! {
+	static TASK_CANCEL: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn cancel_task_future<F>(future: F) {
+	struct Restore(bool);
+
+	impl Drop for Restore {
+		fn drop(&mut self) {
+			TASK_CANCEL.set(self.0);
+		}
+	}
+
+	// A cancelled task is an explicit give-up, even when its opaque future hides a Completion.
+	let _restore = Restore(TASK_CANCEL.replace(true));
+	drop(future);
+}
+
 struct SlotGuard {
 	id: u64,
 	shared: Arc<Shared>,
@@ -1973,16 +1570,15 @@ impl Drop for SlotGuard {
 	fn drop(&mut self) {
 		let shared = &self.shared;
 		let id = self.id;
-		// The decision and what it changes are one lock hold. A cross-thread
-		// drop that read `Pending` and then released the lock could lose it to a
-		// `drain` that marks the entry `InFlight` and pushes it, leaving the
-		// request running with nobody waiting for it.
+		// Keep the state check and transition atomic with submission, or a pending request could become in-flight after the drop decides not to wait.
 		let abandoned = {
 			let mut events = shared.events.lock().unwrap();
-			let Some(entry) = events.get(id) else {
-				// Settled and taken, or the reactor's teardown removed it.
+			let Some(entry) = events.get_mut(id) else {
 				return;
 			};
+			if TASK_CANCEL.get() {
+				entry.give_up.ask();
+			}
 			let (stat, names_memory, kind, origin, give_up) = (
 				entry.stat,
 				entry.names_memory,
@@ -1991,36 +1587,22 @@ impl Drop for SlotGuard {
 				entry.give_up,
 			);
 			match stat {
-				// Nobody has it yet, and nobody will: it never reaches a
-				// backend. A landed response goes too — dropping it closes any
-				// descriptor it carries.
 				Stat::Pending | Stat::Done => {
 					events.remove(id);
 					return;
 				}
-				// The backend has it, but it touches no memory of the caller's,
-				// so the result is all that is lost. The operation waits for
-				// nothing, so it may wait forever: the drop asks for a cancel,
-				// and the entry goes — with whatever it holds open — once the
-				// backend reports the stopped operation.
+				// Cancel without blocking: memory-free operations may wait indefinitely.
 				Stat::InFlight if !names_memory => {
 					if let Some(entry) = events.get_mut(id) {
 						entry.stat = Stat::Abandoned;
 						entry.give_up.ask();
 					}
 					drop(events);
-					// Nothing else is coming to wake the reactor: the
-					// completion that would have is the one given up.
 					if shared.parked.load(Ordering::Acquire) {
 						let _ = shared.event.notify();
 					}
 					return;
 				}
-				// The backend has it and it touches the caller's memory: the
-				// drop has to wait for it to let go. The ask is recorded here,
-				// under the same lock, so the reactor sees it whichever thread
-				// it drains from — and so the wait below can tell the give-up
-				// it is carrying out from an operation nobody gave up.
 				Stat::InFlight => {
 					if let Some(entry) = events.get_mut(id) {
 						entry.give_up.ask();
@@ -2032,16 +1614,10 @@ impl Drop for SlotGuard {
 			(kind, origin, give_up)
 		};
 		let (kind, origin, give_up) = abandoned;
-		shared.fallback_drops.fetch_add(1, Ordering::Relaxed);
 		let started = Instant::now();
 		wait_released(shared, id);
 		shared.events.lock().unwrap().remove(id);
 		let elapsed = started.elapsed();
-		// A give-up a caller had already asked for is the drop carrying it out,
-		// not a bug: the future went with the memory still named, and the wait
-		// above is what keeps the caller's memory untouched until the backend has
-		// let go. One nobody asked for is the caller losing an operation that
-		// could still be read or written — the case the report is for.
 		if give_up.asked() {
 			log::debug!(
 				id,
@@ -2059,10 +1635,7 @@ impl Drop for SlotGuard {
 			elapsed:? = elapsed;
 			"a completion naming caller memory was dropped: the op waited out its end"
 		);
-		// The panic comes after the wait, so what it unwinds through holds no
-		// lock and names memory the backend has already let go. A thread
-		// already unwinding panics abort the process instead, so it only gets
-		// the report.
+		// Panic only after releasing kernel access and locks; never double-panic during unwinding.
 		#[cfg(debug_assertions)]
 		if !thread::panicking() {
 			panic!(
@@ -2073,14 +1646,9 @@ impl Drop for SlotGuard {
 	}
 }
 
-/// Waits for the backend to let go of `id`, so the caller may free the memory
-/// the operation named. The entry's give-up is already recorded and its waiter
-/// flag set, so the reactor's next pass carries the ask and wakes this wait.
 fn wait_released(shared: &Shared, id: u64) {
 	let _ = shared.event.notify();
 	if shared.on_reactor_thread() {
-		// Nobody else will reap: the reactor is not polling while user code
-		// runs on its thread, so the pass is driven here.
 		match shared.core.try_lock() {
 			Ok(mut core) => {
 				let _ = core.drive_until(shared, id);
@@ -2091,8 +1659,7 @@ fn wait_released(shared: &Shared, id: u64) {
 			),
 			Err(TryLockError::Poisoned(_)) => {}
 		}
-		// The inline pass may have eaten a wake-up the next `block_on` round is
-		// about to sleep through.
+		// The inline drive may have consumed a wake needed by the next `block_on` iteration.
 		let _ = shared.event.notify();
 	} else {
 		let mut events = shared.events.lock().unwrap();
@@ -2103,7 +1670,6 @@ fn wait_released(shared: &Shared, id: u64) {
 }
 
 impl Shared {
-	/// [`Shared::is_settled`], with the events lock already held.
 	fn is_settled_locked(&self, events: &Events, id: u64) -> bool {
 		match events.get(id) {
 			None => true,
@@ -2112,9 +1678,7 @@ impl Shared {
 	}
 }
 
-/// The response of an operation cancelled before it reached the backend. A
-/// type of its own so that an `Interrupted` the kernel reports is not mistaken
-/// for it: that is a failure of the operation, not a cancellation.
+/// Distinct from kernel `Interrupted` errors, which must not be mistaken for cancellation.
 #[derive(Debug)]
 struct NotSubmitted;
 
@@ -2130,8 +1694,6 @@ fn not_submitted() -> io::Error {
 	io::Error::other(NotSubmitted)
 }
 
-/// The error a submission gets once the reactor is stopped — by
-/// [`Submitter::stop`], or by the reactor being dropped.
 fn stopped() -> io::Error {
 	io::Error::new(io::ErrorKind::BrokenPipe, "the reactor has been stopped")
 }
@@ -2142,30 +1704,20 @@ fn is_not_submitted(error: &io::Error) -> bool {
 		.is_some_and(|inner| inner.is::<NotSubmitted>())
 }
 
-/// The outcome of a [`Completion::until`] whose cancel fired: the caller's own
-/// value. The response of the cancelled operation goes with it, closing any
-/// descriptor it carried.
+/// Userdata returned when [`Completion::until`] cancels an operation.
 #[derive(Debug)]
 pub struct Cancelled<U = ()>(pub U);
 
-/// Waiter for an operation's completion, carrying the caller's own value.
+/// Resolves to `(userdata, response)`.
 ///
-/// Resolves to `(userdata, response)`: the response is what the backend
-/// produced, passed through as it is, and `U` is a value of the caller's own
-/// handed back when the completion lands. The value lives in the future rather
-/// than in the entry, which is what lets one reactor serve callers that each
-/// carry something different.
+/// Dropping an in-flight operation that accesses caller memory waits for the kernel to release it. An unsignalled drop logs an error and panics in debug builds unless already unwinding; a requested cancellation does not panic.
 pub struct Completion<U = ()> {
 	guard: SlotGuard,
 	userdata: Option<U>,
 }
 
 impl<U> Completion<U> {
-	/// Hands back `userdata` with the result, replacing whatever was there.
-	///
-	/// The tag is what a caller carries to act on the result: a driver keeping
-	/// many requests in flight tags each with the guest chain it came from and
-	/// reads it back out of the future.
+	/// Replaces the userdata returned alongside the result.
 	pub fn tag<V>(self, userdata: V) -> Completion<V> {
 		let Completion { guard, .. } = self;
 		Completion {
@@ -2174,8 +1726,6 @@ impl<U> Completion<U> {
 		}
 	}
 
-	/// Asks the backend to stop the operation, as [`Completion::until`] does
-	/// when its cancel fires.
 	fn request_cancel(&self) {
 		let shared = &self.guard.shared;
 		{
@@ -2189,12 +1739,8 @@ impl<U> Completion<U> {
 		}
 	}
 
-	/// Whether the response is the cancellation this operation was asked for,
-	/// rather than something it produced.
 	fn was_cancelled(&self, response: &io::Result<Response>) -> bool {
 		match response {
-			// Anything that landed is the operation's own result, even a short
-			// one: bytes already moved must not be thrown away.
 			Ok(_) => false,
 			Err(error) => is_not_submitted(error) || (self.guard.shared.cancelled)(error),
 		}
@@ -2214,24 +1760,12 @@ impl<U: Unpin> Completion<U> {
 	}
 }
 
-/// The future [`Completion::until`] returns: the operation raced against a
-/// cancel.
+/// Waits for completion or cancellation, including release of kernel access to memory.
 ///
-/// The operation first returns `Ok((userdata, response))`. The cancel first
-/// asks the backend to stop and then keeps waiting until it has let go — the
-/// future is only `Ready` once the kernel is done with the spans.
-///
-/// The result is `Err(Cancelled(userdata))` only when the operation was in
-/// fact stopped: its response is the cancellation error, and it is dropped,
-/// closing any descriptor it carried. An operation that finished anyway — it
-/// won the race, or the backend could not stop it — keeps its result and
-/// returns `Ok`, even though a cancel was asked for: a receive that already
-/// moved bytes has them, and discarding them would lose them.
+/// Returns `Err(Cancelled(userdata))` only if the operation was actually cancelled; an operation that finishes despite cancellation retains its result.
 pub struct Until<U> {
 	completion: Completion<U>,
-	/// The cancel's waiting side; polled until it fires, then never again.
 	wait: Wait,
-	/// Whether the cancel fired and the backend was asked to stop.
 	requested: bool,
 }
 
@@ -2240,8 +1774,6 @@ impl<U: Unpin> Future for Until<U> {
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = self.get_mut();
-		// The operation is looked at first: one that is already settled
-		// completed first, whatever the cancel has done since.
 		match Pin::new(&mut this.completion).poll(cx) {
 			Poll::Ready((userdata, response)) => {
 				if this.requested && this.completion.was_cancelled(&response) {
@@ -2265,8 +1797,6 @@ impl<U: Unpin> Future for Completion<U> {
 	type Output = (U, io::Result<Response>);
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		// Nothing here is self-referential, so the pin is `get_mut`-able and
-		// the userdata can be moved out on readiness.
 		let this = self.get_mut();
 		let ready = {
 			let mut events = this.guard.shared.events.lock().unwrap();
@@ -2301,17 +1831,10 @@ impl<U: Unpin> Future for Completion<U> {
 mod tests {
 	use super::*;
 
-	/// A reactor on this target's own backend.
 	fn platform() -> (Reactor, Submitter) {
 		Reactor::new(Config::default()).unwrap()
 	}
 
-	/// Turns the reactor until the raced operation lands.
-	///
-	/// A turn waits for a completion, with a second as its bound: the operation
-	/// is the only one out, so a backend that never lands it fails the test
-	/// here instead of hanging it. Polling without waiting would make the round
-	/// count a race against how soon the kernel posts the completion.
 	fn race_to_completion(reactor: &mut Reactor, submitter: &Submitter, cancel: &Cancel) {
 		// A pipe cannot be synced, so the operation lands on an error; that it
 		// lands at all is all this helper needs.
@@ -2328,10 +1851,7 @@ mod tests {
 		panic!("the operation did not complete");
 	}
 
-	/// A cancel outlives the operations raced against it without keeping them: a
-	/// waiter's registration goes when its `until` lands. Millions of operations
-	/// through one per-device cancel would otherwise grow its waiter map without
-	/// bound.
+	/// A long-lived cancel must not retain waiters after their operations finish.
 	#[test]
 	fn a_cancel_keeps_no_waiter_that_finished() {
 		let (mut reactor, submitter) = platform();
@@ -2342,9 +1862,7 @@ mod tests {
 		assert_eq!(cancel.waiting(), 0, "a finished waiter was left behind");
 	}
 
-	/// A cancel owns the children it made only while their holders keep them:
-	/// a device makes one per driver reset, and a parent that outlived them
-	/// would hold one per reset.
+	/// A long-lived parent must not retain dropped children.
 	#[test]
 	fn a_cancel_keeps_no_child_that_was_dropped() {
 		let cancel = Cancel::new();
@@ -2358,10 +1876,7 @@ mod tests {
 		);
 	}
 
-	/// A cancel waited on from many operations of one reactor holds that
-	/// reactor's wake-up once. The list grows with the reactors the cancel
-	/// spans, not with the number of waits — so a later reactor still gets its
-	/// wake-up registered instead of falling off a full list.
+	/// Reactor registrations must grow with distinct reactors, not repeated waits.
 	#[test]
 	fn a_cancel_keeps_one_wake_up_per_reactor() {
 		let (_first, first) = platform();

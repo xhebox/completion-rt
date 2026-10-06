@@ -13,28 +13,23 @@ pub struct Extent {
 	pub len: usize,
 }
 
-/// Extents, inlined for at most two items.
-///
-/// `len` counts the extents; [`Extents::len_bytes`] is what they carry.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Extents(SmallVec<[Extent; 2]>);
+pub(crate) struct Extents(SmallVec<[Extent; 2]>);
 
 impl Extents {
-	pub fn new() -> Extents {
+	pub(crate) fn new() -> Extents {
 		Extents(SmallVec::new())
 	}
 
-	pub fn from_slice(extents: &[Extent]) -> Extents {
+	pub(crate) fn from_slice(extents: &[Extent]) -> Extents {
 		Extents(SmallVec::from_slice(extents))
 	}
 
-	pub fn push(&mut self, extent: Extent) {
+	pub(crate) fn push(&mut self, extent: Extent) {
 		self.0.push(extent);
 	}
 
-	/// The extents that follow the first `bytes` bytes of this set: what a
-	/// transfer that stopped partway still has to move.
-	pub fn skip(&self, bytes: usize) -> Extents {
+	pub(crate) fn skip(&self, bytes: usize) -> Extents {
 		let mut remaining = bytes;
 		let mut out = Extents::new();
 		for extent in &self.0 {
@@ -51,8 +46,7 @@ impl Extents {
 		out
 	}
 
-	/// The bytes the extents cover, in total.
-	pub fn len_bytes(&self) -> usize {
+	pub(crate) fn len_bytes(&self) -> usize {
 		self.0
 			.iter()
 			.fold(0, |len, extent| len.saturating_add(extent.len))
@@ -130,9 +124,7 @@ impl std::fmt::Debug for Span {
 
 unsafe impl Send for Span {}
 
-/// A submission's resolved spans, in a heap allocation its queued ring entry
-/// points at.
-pub type Spans = Vec<Span>;
+pub(super) type Spans = Vec<Span>;
 
 /// A buffer an operation transfers through, shared with the backend rather
 /// than owned by it.
@@ -142,15 +134,10 @@ pub type Spans = Vec<Span>;
 pub unsafe trait Memory: Send + Sync {
 	fn span(&self, extent: Extent) -> io::Result<Span>;
 
-	/// How many bytes the address space holds.
 	fn len(&self) -> usize;
 }
 
-/// Spans named by `extents`, resolved in order.
-///
-/// Resolving a list is the backend's business, not a caller's; the trait
-/// keeps the one extent a caller names.
-pub fn spans<T: Memory + ?Sized>(memory: &T, extents: &[Extent]) -> io::Result<Spans> {
+pub(super) fn spans<T: Memory + ?Sized>(memory: &T, extents: &[Extent]) -> io::Result<Spans> {
 	extents.iter().map(|extent| memory.span(*extent)).collect()
 }
 

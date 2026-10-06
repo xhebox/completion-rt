@@ -10,7 +10,10 @@ rule:
     - kind: use_declaration
     - has:
         kind: visibility_modifier
+    # Scoped to the `use` path: matching `crate`/`super` anywhere would also
+    # hit the one inside a `pub(crate)` visibility modifier.
     - has:
+        field: argument
         any:
           - kind: crate
           - kind: super

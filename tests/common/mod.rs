@@ -18,7 +18,7 @@ use std::thread::{self, Thread};
 /// These tests drive their reactor on a thread of its own, so the crate's
 /// executor — which polls a reactor it owns — is not what can wait for them:
 /// this parks until the completion's waker unparks it.
-pub fn block_on<F: Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
 	init_logging();
 
 	struct Unpark(Thread);
@@ -46,7 +46,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// depends on the `log` facade alone. Idempotent, and a logger installed by
 /// something else is left alone. The helpers below reach it, so a test that
 /// waits on a completion has its records whether or not it asks.
-pub fn init_logging() {
+pub(crate) fn init_logging() {
 	static INIT: Once = Once::new();
 	INIT.call_once(|| {
 		let _ = env_logger::builder().is_test(true).try_init();
@@ -57,7 +57,7 @@ pub fn init_logging() {
 /// `target/test-tmp` (`COMPLETION_RT_TEST_TMP` overrides the root). `tag` names
 /// the call site and becomes the directory name prefix; tempfile appends a
 /// random suffix, so parallel and repeated runs never collide.
-pub struct Scratch {
+pub(crate) struct Scratch {
 	/// Owns the directory: dropping the `Scratch` removes it.
 	dir: tempfile::TempDir,
 	path: PathBuf,
@@ -71,14 +71,14 @@ impl Scratch {
 	/// `target/package/<crate>-<version>` when the packed crate is tested) into
 	/// every path a test hands the kernel; a unix socket has to fit
 	/// `sockaddr_un::sun_path`, 104 bytes including the NUL on macOS.
-	pub fn path(&self) -> &Path {
+	pub(crate) fn path(&self) -> &Path {
 		&self.path
 	}
 }
 
 /// Makes a scratch directory below `target/test-tmp`. Remove it by dropping the
 /// returned `Scratch`, so bind it for the lifetime of the test.
-pub fn tempdir(tag: &str) -> io::Result<Scratch> {
+pub(crate) fn tempdir(tag: &str) -> io::Result<Scratch> {
 	init_logging();
 	let base = std::env::var_os("COMPLETION_RT_TEST_TMP")
 		.map(PathBuf::from)

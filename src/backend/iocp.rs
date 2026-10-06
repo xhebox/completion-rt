@@ -1,14 +1,4 @@
-//! Windows IOCP backend: one completion port, one OVERLAPPED per operation.
-//!
-//! File handles must be opened with `FILE_FLAG_OVERLAPPED`, which
-//! `OpenOptions` sets on Windows; this backend associates each handle with the
-//! port on first use and issues `ReadFile`/`WriteFile` with a per-operation
-//! OVERLAPPED. Operations without an overlapped form (`FlushFileBuffers`) run
-//! inline and post their result through the port.
-//!
-//! Only the file operations are implemented: a completion port has no socket
-//! receive/send and no readiness wait, and each of those methods says so rather
-//! than pretending.
+//! Windows IOCP backend; file handles require `FILE_FLAG_OVERLAPPED`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -24,7 +14,8 @@ use windows_sys::Win32::System::IO::{
 
 use crate::core::Response;
 use crate::desc::RawHandle;
-use crate::{Extents, Memory, OwnedDescriptor};
+use crate::memory::Extents;
+use crate::{Memory, OwnedDescriptor};
 
 use super::Backend;
 use crate::backend::{Config, PollMode};
@@ -35,44 +26,33 @@ const ERROR_IO_PENDING: u32 = 997;
 /// `ERROR_OPERATION_ABORTED`: what `CancelIoEx` makes a stopped operation
 /// report.
 const ERROR_OPERATION_ABORTED: u32 = 995;
-/// An NTSTATUS's low word is its facility-specific code; close enough for an
-/// experimental crate, and the common cases (access denied, invalid handle,
-/// disk full) map to recognizable errno values.
+/// The current NTSTATUS conversion uses only the low word; it is not a general NTSTATUS-to-Win32 mapping.
 const fn ntstatus_errno(status: usize) -> i32 {
 	(status & 0xFFFF) as i32
 }
 
-pub struct Iocp {
-	/// The port that carries this backend's completions. The event made it,
-	/// and only this backend drains it.
+pub(crate) struct Iocp {
 	event: Event,
 	active: HashMap<u64, Active>,
-	/// Completions the port reported and nobody took yet.
 	ready: VecDeque<(u64, io::Result<Response>)>,
 }
 
-/// One in-flight operation: the OVERLAPPED the kernel writes into, plus the
-/// memory keeping the buffer it names alive until the completion.
 struct Active {
 	ov: Box<Overlapped>,
-	/// Kept only to own the buffer the OVERLAPPED names.
 	_memory: Option<Arc<dyn Memory>>,
 }
 
-/// The OVERLAPPED plus the token that names its operation. `inner` is the
-/// first field so a pointer to the box is a valid `*mut OVERLAPPED`.
+/// `inner` must be first so the kernel's `OVERLAPPED` pointer also identifies this allocation.
 #[repr(C)]
 struct Overlapped {
 	inner: OVERLAPPED,
 	token: u64,
-	/// A Win32 error from an immediate submit-time failure, or 0.
 	submit_error: i32,
-	/// The handle the operation was issued on, for `CancelIoEx`.
 	handle: HANDLE,
 }
 
 impl Iocp {
-	pub fn new(config: &Config) -> io::Result<(Iocp, Event)> {
+	pub(super) fn new(config: &Config) -> io::Result<(Iocp, Event)> {
 		if config.wakeup == PollMode::Fd {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
@@ -106,9 +86,6 @@ impl Iocp {
 		unsafe { PostQueuedCompletionStatus(self.event.handle().as_platform(), 0, 0, ov_ptr) };
 	}
 
-	/// Associates `fd` with the port so its completions land here.
-	/// Re-associating an already-associated handle with the same port is a
-	/// no-op returning the existing port.
 	fn associate(&self, fd: HANDLE) -> io::Result<()> {
 		let port = unsafe { CreateIoCompletionPort(fd, self.event.handle().as_platform(), 0, 0) };
 		if port.is_null() {
@@ -117,8 +94,6 @@ impl Iocp {
 		Ok(())
 	}
 
-	/// Issues one overlapped read or write: a per-operation OVERLAPPED, with
-	/// the outcome posted when the kernel reports or the call fails outright.
 	fn issue(
 		&mut self,
 		id: u64,
@@ -169,13 +144,11 @@ impl Iocp {
 				self.post(id);
 			}
 		} else {
-			// Completed inline; InternalHigh holds the byte count.
 			self.post(id);
 		}
 		Ok(())
 	}
 
-	/// The one buffer an overlapped call names, and its offset.
 	fn buffer(memory: &Arc<dyn Memory>, extents: &Extents) -> io::Result<(*mut u8, usize)> {
 		let buffers = crate::memory::spans(memory, extents)?;
 		let [buf] = buffers.as_slice() else {
@@ -227,7 +200,6 @@ impl Backend for Iocp {
 	fn fsync(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
 		let handle: HANDLE = fd.as_platform();
 		self.associate(handle)?;
-		// No overlapped form: sync inline and post the outcome.
 		let ok = unsafe { FlushFileBuffers(handle) };
 		let submit_error = if ok == 0 {
 			(unsafe { GetLastError() }) as i32
@@ -251,11 +223,7 @@ impl Backend for Iocp {
 	}
 
 	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
-		// Windows reports no deferred write-back error when a handle is closed:
-		// there is no close-time error to surface. `FlushFileBuffers`
-		// approximates a fsync, not a flush, and is too costly to run on every
-		// close — so the operation succeeds without touching the disk. Should a
-		// mechanism appear, only this backend changes.
+		// Windows exposes no close-time deferred write-back error; `FlushFileBuffers` would force durability instead.
 		let handle: HANDLE = fd.as_platform();
 		self.active.insert(
 			id,
@@ -372,7 +340,6 @@ impl Backend for Iocp {
 			return Err(error);
 		}
 		for entry in entries[..count as usize].iter() {
-			// A wake carries no OVERLAPPED; nothing waits for it.
 			if entry.lpOverlapped.is_null() {
 				continue;
 			}
@@ -390,8 +357,6 @@ impl Backend for Iocp {
 						(*ov).inner.Internal,
 					)))
 				};
-				// Drops the OVERLAPPED box and the memory holding the buffer
-				// it named.
 				self.active.remove(&id);
 				(id, result)
 			};
@@ -427,8 +392,6 @@ impl Backend for Iocp {
 	}
 }
 
-/// Whether `error` is a cancellation. `CancelIoEx` reports the aborted operation
-/// as `ERROR_OPERATION_ABORTED`.
 pub(super) fn cancelled(error: &io::Error) -> bool {
 	error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32)
 }

@@ -1,11 +1,4 @@
-//! A message channel on a reactor's wake-up.
-//!
-//! One queue, two ends: a [`Sender`] any thread can push into, and a
-//! [`Receiver`] that is a `Future` resolving to one value at a time.
-//! [`Submitter::channel`](crate::Submitter::channel) binds the pair to a
-//! reactor's wake-up, and every send that finds a waiting receiver raises
-//! it, so the reactor's `poll` returns and the executor above it polls that
-//! receiver.
+//! A channel bound to a reactor's wake-up.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -30,8 +23,6 @@ impl<T: std::fmt::Debug> std::error::Error for Closed<T> {}
 
 struct State<T> {
 	queue: VecDeque<T>,
-	/// One entry per waiting receiver. The id belongs to the receiver, so it
-	/// replaces or drops its own entry alone.
 	waiters: Vec<(u64, Waker)>,
 	closed: bool,
 }
@@ -46,20 +37,14 @@ impl<T> State<T> {
 	}
 }
 
-/// The channel: the queue, its waiters, and the wake-up they are raised on.
-pub struct Shared<T> {
+pub(super) struct Shared<T> {
 	state: Mutex<State<T>>,
 	event: Event,
-	/// Live senders; the channel closes when the last one goes.
 	senders: AtomicUsize,
 	next_id: AtomicU64,
 }
 
 impl<T> Shared<T> {
-	/// Binds a fresh pair to `event`.
-	///
-	/// Reached through [`Submitter::channel`](crate::Submitter::channel),
-	/// which supplies the reactor's own wake-up.
 	pub(super) fn split(event: Event) -> (Sender<T>, Receiver<T>) {
 		let sender = Sender(Arc::new(Self::new(event)));
 		let receiver = Receiver::attach(&sender.0);
@@ -75,18 +60,12 @@ impl<T> Shared<T> {
 		}
 	}
 
-	/// Queues `value`, then wakes one waiting receiver.
-	///
-	/// The check and the queueing share one lock, so a closed channel takes
-	/// nothing and hands the value back.
 	fn enqueue(&self, value: T) -> Result<(), T> {
 		let mut state = self.state.lock().unwrap();
 		if state.closed {
 			return Err(value);
 		}
 		state.queue.push_back(value);
-		// The oldest waiter takes the value, and leaves the list: the receiver
-		// registers itself again on its next poll.
 		let woken = if state.waiters.is_empty() {
 			None
 		} else {
@@ -96,15 +75,11 @@ impl<T> Shared<T> {
 		if let Some(waker) = woken {
 			waker.wake();
 		}
-		// The reactor has to look at the queue whether or not a receiver was
-		// waiting when the value landed: one that is running right now has no
-		// waiter registered, and the thread it runs on parks on the wake-up
-		// alone — nothing else would ever tick it again.
+		// Notify even without a registered receiver: a running receiver may be about to park.
 		let _ = self.event.notify();
 		Ok(())
 	}
 
-	/// Closes the channel: waiting receivers wake to their `None`.
 	fn close(&self) {
 		let waiters = {
 			let mut state = self.state.lock().unwrap();
@@ -121,7 +96,7 @@ impl<T> Shared<T> {
 	}
 }
 
-/// The send end of a [`Shared`] channel.
+/// The sending end; dropping the last sender closes the channel.
 pub struct Sender<T>(Arc<Shared<T>>);
 
 impl<T> Sender<T> {
@@ -151,18 +126,13 @@ impl<T> Drop for Sender<T> {
 	}
 }
 
-/// The receive end of a [`Shared`] channel.
-///
-/// `Clone` gives another receiver on the same queue. Each one is a `Future`
-/// resolving to one queued value, then `None` once the channel is closed and
-/// the queue drained.
+/// A clonable receiver. Each poll sequence yields one queued value, or `None` once closed and drained.
 pub struct Receiver<T> {
 	id: u64,
 	shared: Arc<Shared<T>>,
 }
 
 impl<T> Receiver<T> {
-	/// A receiver on `shared`, with an id of its own.
 	fn attach(shared: &Arc<Shared<T>>) -> Receiver<T> {
 		Self {
 			id: shared.next_id.fetch_add(1, Ordering::Relaxed),
@@ -215,9 +185,6 @@ impl<T> Future for Receiver<T> {
 			if state.closed {
 				return Poll::Ready(None);
 			}
-			// Registering before the second look closes the window a send
-			// would otherwise fall into: it saw no waiter, so it did not
-			// raise the wake-up.
 			this.register(&mut state.waiters, cx.waker());
 			if state.queue.is_empty() && !state.closed {
 				return Poll::Pending;

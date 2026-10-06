@@ -45,12 +45,10 @@ mod core;
 mod desc;
 mod event;
 mod executor;
-mod flow;
 mod io;
 mod memory;
 mod net;
 mod outcome;
-mod tasks;
 
 pub use backend::{Config, PollMode};
 pub use channel::{Closed, Receiver, Sender};
@@ -60,10 +58,10 @@ pub use core::{
 };
 pub use desc::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor};
 pub use event::Event;
-pub use executor::{Executor, Spawner};
-pub use flow::{Accept, Op, Receive, Transfer};
+pub use executor::{Executor, Spawner, Task};
 pub use io::{Facade, File, OpenOptions};
-pub use memory::{Extent, Extents, Memory, Span};
-pub use net::{ListenerHandle, SocketHandle, StreamHandle};
-pub use outcome::{Error, Outcome, Received};
-pub use tasks::Tasks;
+pub use memory::{Extent, Memory, Span};
+pub use net::{
+	Accept, ListenerHandle, Op, Receive, Received, SocketHandle, StreamHandle, Transfer,
+};
+pub use outcome::{Error, Outcome};

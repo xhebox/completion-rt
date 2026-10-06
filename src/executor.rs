@@ -1,151 +1,342 @@
 //! The executor a completion reactor's tasks run on.
 
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
-use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::pin::Pin;
+use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, Weak as SyncWeak};
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
-use async_executor::{LocalExecutor, Task};
+use crate::{Config, Reactor, Submitter};
 
-use crate::core::ReactorWaker;
-use crate::{Config, Event, Reactor, Submitter};
+const TICK_BUDGET: usize = 64;
 
-thread_local! {
-	static EXECUTOR: LocalExecutor<'static> = LocalExecutor::new();
-}
-
-/// The calling thread's tasks, as a handle a task or a device can hold.
-///
-/// The tasks belong to the thread they run on: a `LocalExecutor` is `!Send`,
-/// so it is made where it runs and this is a handle to it, created on first
-/// use and dropped when the thread exits — taking the tasks still in flight
-/// with it. The `'static` is fabricated: a task spawned there is `'static` and
-/// has to name the executor it runs on, but the slot grants no lifetime that
-/// outlives the closure. It holds because the reference cannot leave the
-/// thread (`LocalExecutor` is `!Sync`, so `&LocalExecutor` is not `Send`) and
-/// because `with` refuses a slot whose destructor is already running, where a
-/// task's own `Drop` would otherwise reach a half-destroyed executor.
-///
-/// An [`Executor`] is the only thing that hands one out, and a holder clones
-/// it: it is what a device spawns its own tasks on, and what a task carries to
-/// spawn the next. A device that has to wait for its tasks keeps them through
-/// [`crate::Tasks`], which is built from one of these.
+/// A handle for spawning thread-local tasks while its executor exists.
 #[derive(Clone)]
 pub struct Spawner {
-	executor: &'static LocalExecutor<'static>,
-	/// The reactor wake-up of the thread those tasks run on.
-	event: Event,
-	/// What a task spawned here polls its future with, behind the task's own
-	/// waker.
-	waker: Arc<ReactorWaker>,
+	local: Weak<Local>,
 }
 
 impl Spawner {
-	/// Spawns a task on the thread.
-	///
-	/// The task polls its future with the reactor's wake-up behind its own: a
-	/// wake from another thread, or from a primitive that is not the reactor,
-	/// queues the task and has to reach the driver parked in `Reactor::poll`
-	/// as well, or the task waits for whatever wakes the driver next.
+	/// Panics if the executor has been dropped.
 	pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Task<T> {
-		let waker = Arc::clone(&self.waker);
-		self.executor.spawn(async move {
-			let mut future = std::pin::pin!(future);
-			// The task's own waker and the one wrapping it, made on the first
-			// poll and remade only if the task's changes: async-executor's is
-			// the same waker for the life of the task.
-			let mut task: Option<(Waker, Waker)> = None;
-			std::future::poll_fn(move |cx| {
-				if task
-					.as_ref()
-					.is_none_or(|(own, _)| !own.will_wake(cx.waker()))
-				{
-					task = Some((cx.waker().clone(), waker.around(cx.waker())));
-				}
-				let (_, combined) = task.as_ref().unwrap();
-				future.as_mut().poll(&mut Context::from_waker(combined))
-			})
-			.await
-		})
-	}
-
-	/// The thread's reactor wake-up; what a task set has to raise to be run.
-	pub(super) fn event(&self) -> Event {
-		self.event.clone()
+		let local = self
+			.local
+			.upgrade()
+			.filter(|local| !local.ready.state.lock().unwrap().closed)
+			.expect("the executor was dropped before spawning a task");
+		let id = local.next_id.get();
+		local
+			.next_id
+			.set(id.checked_add(1).expect("task id overflow"));
+		let join = Rc::new(RefCell::new(Join::Waiting(None)));
+		let waker = Waker::from(Arc::new(TaskWake {
+			id,
+			ready: Arc::downgrade(&local.ready),
+		}));
+		local.tasks.borrow_mut().insert(
+			id,
+			Box::new(Job {
+				future: Some(Box::pin(future)),
+				join: Rc::clone(&join),
+				waker: waker.clone(),
+			}),
+		);
+		waker.wake_by_ref();
+		Task { join, waker }
 	}
 }
 
-/// A thread's executor: the reactor its operations are submitted to, and the
-/// tasks they are awaited on.
-///
-/// The tasks are the thread's ([`Spawner`]), because a `LocalExecutor` is
-/// `!Send`: it is made where it runs, and this type only names it. The reactor
-/// is `Send`, so the side that spawns a thread builds the executor and hands it
-/// over.
+/// A thread-local task result. Dropping it requests cancellation on the next executor pass.
+#[must_use = "await the task or detach it to keep it running"]
+pub struct Task<T> {
+	join: Rc<RefCell<Join<T>>>,
+	waker: Waker,
+}
+
+impl<T> Task<T> {
+	/// Lets the task finish without keeping its result.
+	pub fn detach(self) {
+		let previous = self.join.replace(Join::Detached);
+		drop(previous);
+	}
+}
+
+impl<T> Future for Task<T> {
+	type Output = T;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+		let mut join = self.join.borrow_mut();
+		match &mut *join {
+			Join::Waiting(waker) => {
+				if waker
+					.as_ref()
+					.is_none_or(|waker| !waker.will_wake(cx.waker()))
+				{
+					*waker = Some(cx.waker().clone());
+				}
+				Poll::Pending
+			}
+			Join::Done(_) => {
+				let Join::Done(output) = std::mem::replace(&mut *join, Join::Taken) else {
+					unreachable!()
+				};
+				Poll::Ready(output)
+			}
+			Join::Gone => panic!("the executor was dropped before the task finished"),
+			Join::Taken | Join::Detached | Join::Cancelled => {
+				panic!("the task result is no longer available")
+			}
+		}
+	}
+}
+
+impl<T> Drop for Task<T> {
+	fn drop(&mut self) {
+		let waiting = matches!(*self.join.borrow(), Join::Waiting(_));
+		if waiting {
+			let previous = self.join.replace(Join::Cancelled);
+			drop(previous);
+			self.waker.wake_by_ref();
+		}
+	}
+}
+
+enum Join<T> {
+	Detached,
+	Waiting(Option<Waker>),
+	Done(T),
+	Taken,
+	Gone,
+	Cancelled,
+}
+
+trait Runnable {
+	fn waker(&self) -> &Waker;
+	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()>;
+	fn abandon(&mut self);
+}
+
+struct Job<F: Future> {
+	future: Option<Pin<Box<F>>>,
+	join: Rc<RefCell<Join<F::Output>>>,
+	waker: Waker,
+}
+
+impl<F: Future> Runnable for Job<F> {
+	fn waker(&self) -> &Waker {
+		&self.waker
+	}
+
+	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+		if matches!(*self.join.borrow(), Join::Cancelled) {
+			crate::core::cancel_task_future(self.future.take());
+			return Poll::Ready(());
+		}
+		let output = match self.future.as_mut().unwrap().as_mut().poll(cx) {
+			Poll::Pending => return Poll::Pending,
+			Poll::Ready(output) => output,
+		};
+		if matches!(*self.join.borrow(), Join::Cancelled) {
+			crate::core::cancel_task_future((self.future.take(), output));
+			return Poll::Ready(());
+		}
+		drop(self.future.take());
+		let previous = self.join.replace(Join::Taken);
+		match previous {
+			Join::Waiting(waker) => {
+				*self.join.borrow_mut() = Join::Done(output);
+				if let Some(waker) = waker {
+					waker.wake();
+				}
+			}
+			Join::Detached => drop(output),
+			Join::Cancelled => crate::core::cancel_task_future(output),
+			_ => unreachable!(),
+		}
+		Poll::Ready(())
+	}
+
+	fn abandon(&mut self) {
+		let previous = self.join.replace(Join::Gone);
+		if let Join::Waiting(Some(waker)) = previous {
+			waker.wake();
+		}
+	}
+}
+
+struct Local {
+	tasks: RefCell<HashMap<u64, Box<dyn Runnable>>>,
+	ready: Arc<Ready>,
+	next_id: Cell<u64>,
+}
+
+impl Local {
+	fn tick(&self, budget: usize) -> bool {
+		for _ in 0..budget {
+			let Some(id) = self.ready.dequeue() else {
+				break;
+			};
+			let Some(mut job) = self.tasks.borrow_mut().remove(&id) else {
+				continue;
+			};
+			let waker = job.waker().clone();
+			let result = catch_unwind(AssertUnwindSafe(|| {
+				job.poll(&mut Context::from_waker(&waker))
+			}));
+			match result {
+				Ok(Poll::Pending) => {
+					self.tasks.borrow_mut().insert(id, job);
+				}
+				Ok(Poll::Ready(())) => {
+					self.ready.retire(id);
+				}
+				Err(panic) => {
+					self.ready.retire(id);
+					job.abandon();
+					resume_unwind(panic);
+				}
+			}
+		}
+		!self.ready.state.lock().unwrap().queued.is_empty()
+	}
+}
+
+impl Drop for Local {
+	fn drop(&mut self) {
+		let mut tasks = self.tasks.take();
+		for job in tasks.values_mut() {
+			job.abandon();
+		}
+		drop(tasks);
+	}
+}
+
+struct Ready {
+	state: Mutex<Queue>,
+	driver: Waker,
+}
+
+struct Queue {
+	runnable: VecDeque<u64>,
+	queued: HashSet<u64>,
+	closed: bool,
+}
+
+impl Ready {
+	fn enqueue(&self, id: u64) {
+		let mut queue = self.state.lock().unwrap();
+		if queue.closed || !queue.queued.insert(id) {
+			return;
+		}
+		queue.runnable.push_back(id);
+		drop(queue);
+		self.driver.wake_by_ref();
+	}
+
+	fn dequeue(&self) -> Option<u64> {
+		let mut queue = self.state.lock().unwrap();
+		while let Some(id) = queue.runnable.pop_front() {
+			if queue.queued.remove(&id) {
+				return Some(id);
+			}
+		}
+		None
+	}
+
+	fn retire(&self, id: u64) {
+		// A task can wake itself and then finish; queued is authoritative over the remaining deque entry.
+		self.state.lock().unwrap().queued.remove(&id);
+	}
+
+	fn close(&self) {
+		let mut queue = self.state.lock().unwrap();
+		queue.closed = true;
+		queue.queued.clear();
+		queue.runnable.clear();
+	}
+}
+
+struct TaskWake {
+	id: u64,
+	ready: SyncWeak<Ready>,
+}
+
+impl Wake for TaskWake {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		if let Some(ready) = self.ready.upgrade() {
+			ready.enqueue(self.id);
+		}
+	}
+}
+
+/// Drives a completion reactor and its tasks on the thread that created it.
 pub struct Executor {
+	// Drop the reactor first so in-flight I/O settles before task futures release their Completions.
 	reactor: Reactor,
 	submitter: Submitter,
-	/// Made once, here: a task's waker wraps a clone of it, and `block_on`
-	/// polls its future with one, so neither path allocates per poll.
-	waker: Arc<ReactorWaker>,
+	local: Rc<Local>,
 }
 
 impl Executor {
-	/// Creates the reactor.
 	pub fn new(config: Config) -> io::Result<Executor> {
 		let (reactor, submitter) = Reactor::new(config)?;
-		let waker = Arc::new(reactor.waker());
+		let driver = Waker::from(Arc::new(reactor.waker()));
+		let local = Rc::new(Local {
+			tasks: RefCell::new(HashMap::new()),
+			ready: Arc::new(Ready {
+				state: Mutex::new(Queue {
+					runnable: VecDeque::new(),
+					queued: HashSet::new(),
+					closed: false,
+				}),
+				driver,
+			}),
+			next_id: Cell::new(0),
+		});
 		Ok(Executor {
 			reactor,
 			submitter,
-			waker,
+			local,
 		})
 	}
 
-	/// The submit side, for whatever the tasks are built from.
 	pub fn submitter(&self) -> Submitter {
 		self.submitter.clone()
 	}
 
-	/// This reactor's fallback drops; see [`Reactor::fallback_drops`].
-	pub fn fallback_drops(&self) -> u64 {
-		self.reactor.fallback_drops()
-	}
-
-	/// The thread's tasks, for a task or a device that outlives this call. It is
-	/// the only way to get one.
 	pub fn spawner(&self) -> Spawner {
 		Spawner {
-			executor: EXECUTOR
-				.with(|executor| unsafe { &*(executor as *const LocalExecutor<'static>) }),
-			event: self.submitter.event(),
-			waker: Arc::clone(&self.waker),
+			local: Rc::downgrade(&self.local),
 		}
 	}
 
-	/// Runs `fut` to completion: the ready tasks, then `fut`, then a wait on the
-	/// reactor.
-	///
-	/// Every ready task runs before the future is polled: a tick readies
-	/// further tasks, so `try_tick` loops until none are left. The wait is the
-	/// reactor's own: a landing completion and anything the tasks raise (a
-	/// channel send, a [`crate::Event`]) both reach it, which is what a future
-	/// waiting on either is woken by. The future's waker is the reactor's own
-	/// wake-up, so a wake from off this thread also ends it.
+	/// Runs the root future, with bounded passes over ready tasks so I/O and timers keep advancing.
 	pub fn block_on<F: Future>(&mut self, fut: F) -> io::Result<F::Output> {
-		// This thread is the reactor's driver from here on: a completion
-		// dropped on it has nobody else to reap for it.
-		self.reactor.enter_reactor();
+		let reactor = &mut self.reactor;
+		reactor.enter_reactor();
 		let mut fut = std::pin::pin!(fut);
-		let waker = Waker::from(Arc::clone(&self.waker));
-		let mut cx = Context::from_waker(&waker);
-		let spawner = self.spawner();
+		let mut cx = Context::from_waker(&self.local.ready.driver);
 		loop {
-			while spawner.executor.try_tick() {}
+			let more = self.local.tick(TICK_BUDGET);
 			match fut.as_mut().poll(&mut cx) {
 				Poll::Ready(out) => return Ok(out),
-				Poll::Pending => self.reactor.poll(None)?,
+				Poll::Pending => reactor.poll(if more { Some(Duration::ZERO) } else { None })?,
 			}
 		}
+	}
+}
+
+impl Drop for Executor {
+	fn drop(&mut self) {
+		self.local.ready.close();
 	}
 }

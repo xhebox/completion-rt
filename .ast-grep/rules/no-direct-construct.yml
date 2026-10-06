@@ -36,11 +36,11 @@ rule:
             Accept|Active|Completion
             |Config|Control|Entry|Event|Events|Executor|Extent|File|Fsync
             |Immediate|Inner|Iocp
-            |Job|Op|OpenOptions|Overlapped|Portable|Poll|Pool
-            |Reactor|Readable|ReadAt|Readv|Recv
+            |Job|Local|Op|OpenOptions|Overlapped|Portable|Poll|Pool|Queue
+            |Reactor|Readable|ReadAt|Readv|Ready|Recv
             |Self|Send
             |Shared|SlotGuard|Socket|Spawner|Submitter
-            |SyncAt|Tasks|TasksInner|Timeout|Timespec|Timer|Until|Uring
+            |SyncAt|Task|Tasks|TasksInner|TaskWake|Timeout|Timespec|Timer|Until|Uring
             |Wait|Writable|Writev
             |OVERLAPPED|OVERLAPPED_0|OVERLAPPED_0_0
             )$

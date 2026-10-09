@@ -369,6 +369,10 @@ fn recv_with_fds_hands_the_descriptors_back() {
 
 /// `take_error` hands over the socket's pending error and clears it: a refused
 /// datagram shows up once, and the second call reports a clean socket.
+///
+/// Windows: the refused datagram is not reported through `SO_ERROR`; it
+/// surfaces as the error of the socket's next operation instead.
+#[cfg(unix)]
 #[test]
 fn take_error_takes_a_pending_error_off_the_socket() {
 	use std::net::UdpSocket;
@@ -526,10 +530,14 @@ fn a_cancel_ends_a_recv_exact_loop_mid_way() {
 /// out: the progress is not thrown away with the cancel.
 #[test]
 fn a_cancel_ends_a_send_all_loop_with_its_progress() {
-	// The peer is held, and never reads: the socket's own buffers take a few
-	// calls' worth and the loop is left with the kernel. Eight mebibytes are
-	// more than any default socket buffer holds, so the loop cannot finish.
-	let (client, _server) = pair();
+	// The peer is held, and never reads: the buffers take a few calls' worth
+	// and the loop is left with the kernel. They are held to a slice of the
+	// payload, so eight mebibytes cannot all leave whatever the platform's
+	// defaults would buffer.
+	let (client, server) = pair();
+	common::cap_buffers(&client, 64 << 10);
+	common::cap_buffers(&server, 64 << 10);
+	let _server = server;
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
@@ -562,9 +570,12 @@ fn a_cancel_ends_a_send_all_loop_with_its_progress() {
 /// bytes that left.
 #[test]
 fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
-	// The peer reads a little and is gone: the send fills what is left of the
-	// socket's buffers, and the connection it is going down with it.
+	// The peer reads nothing and is gone: buffers held to a slice of the
+	// payload are filled, the rest is left waiting, and the connection goes
+	// down with the peer.
 	let (client, server) = pair();
+	common::cap_buffers(&client, 64 << 10);
+	common::cap_buffers(&server, 64 << 10);
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
@@ -591,6 +602,10 @@ fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 /// A receive already in front of the kernel ends when the read side is shut
 /// down: it comes back, with the zero bytes the kernel reports, instead of
 /// waiting for a peer that never sends.
+///
+/// Windows: shutting down the read side leaves a receive already in front of
+/// the kernel waiting, so there is nothing to come back.
+#[cfg(unix)]
 #[test]
 fn a_shutdown_read_ends_a_receive_in_flight() {
 	use std::net::Shutdown;
@@ -626,14 +641,17 @@ fn a_shutdown_read_ends_a_receive_in_flight() {
 fn a_shutdown_write_ends_a_send_in_flight() {
 	use std::net::Shutdown;
 
-	let (client, _server) = pair();
+	let (client, server) = pair();
+	common::cap_buffers(&client, 64 << 10);
+	common::cap_buffers(&server, 64 << 10);
+	let _server = server;
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
 	let len = 8 << 20;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
-	// Eight mebibytes never fit the socket's buffers with the peer not reading:
-	// the send is still pending when the write side goes.
+	// Buffers held to a slice of the payload with the peer not reading: the
+	// send is still pending when the write side goes.
 	let shutdown = socket.clone();
 	let thread = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(50));

@@ -639,13 +639,17 @@ fn a_reactor_drop_releases_a_waiting_drop() {
 	let completion = stalled_recv(&submitter, &right, &buf);
 	// The reactor's driver: one pass to put the receive in flight, then the
 	// reactor goes, with the dropping thread still waiting.
+	let (in_flight, submitted) = std::sync::mpsc::channel();
 	let driver = std::thread::spawn(move || {
 		let mut reactor = reactor;
 		reactor.poll(Some(Duration::ZERO)).unwrap();
+		in_flight.send(()).unwrap();
 		std::thread::sleep(Duration::from_millis(30));
 		drop(reactor);
 	});
-	std::thread::sleep(Duration::from_millis(10));
+	// A fixed head start lost the race on a loaded runner: the drop came before
+	// the pass, found nothing in flight, and did not wait.
+	submitted.recv().unwrap();
 	let started = Instant::now();
 	drop_in_flight_on_purpose(|| drop(completion));
 	driver.join().unwrap();

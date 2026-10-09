@@ -1,5 +1,3 @@
 [profile.default]
 # A hung test fails after two minutes instead of holding the job until CI's own timeout.
 slow-timeout = { period = "60s", terminate-after = 2 }
-# TEMPORARY: report every failure instead of stopping at the first.
-fail-fast = false

@@ -25,6 +25,12 @@ fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
 	memory
 }
 
+/// More than any platform's socket buffers hold when the peer never reads:
+/// windows autotunes its receive window into the mebibytes whatever
+/// `SO_RCVBUF` asks for, so a test that needs a send the kernel has not
+/// finished with has to ask for more than that.
+const MORE_THAN_ANY_WINDOW: usize = 64 << 20;
+
 /// A connected pair over loopback: the portable way to two real sockets.
 fn pair() -> (TcpStream, TcpStream) {
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -597,15 +603,13 @@ fn a_cancel_ends_a_recv_exact_loop_mid_way() {
 /// out: the progress is not thrown away with the cancel.
 #[test]
 fn a_cancel_ends_a_send_all_loop_with_its_progress() {
-	// The peer is held, and never reads: the buffers take a few calls' worth
-	// and the loop is left with the kernel. They are held to a slice of the
-	// payload from before the connection is made, so eight mebibytes cannot all
-	// leave whatever the platform's defaults would buffer.
+	// The peer is held, and never reads: the payload is larger than anything
+	// that can hold it, so the loop is left with the kernel.
 	let (client, _server) = held_pair(64 << 10);
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
-	let len = 8 << 20;
+	let len = MORE_THAN_ANY_WINDOW;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
@@ -634,14 +638,13 @@ fn a_cancel_ends_a_send_all_loop_with_its_progress() {
 /// bytes that left.
 #[test]
 fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
-	// The peer reads nothing and is gone: buffers held to a slice of the
-	// payload are filled, the rest is left waiting, and the connection goes
-	// down with the peer.
+	// The peer reads nothing and is gone: the payload fills whatever can hold
+	// it, the rest is left waiting, and the connection goes down with the peer.
 	let (client, server) = held_pair(64 << 10);
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
-	let len = 8 << 20;
+	let len = MORE_THAN_ANY_WINDOW;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
 	let gone = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(100));
@@ -707,10 +710,10 @@ fn a_shutdown_write_ends_a_send_in_flight() {
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
-	let len = 8 << 20;
+	let len = MORE_THAN_ANY_WINDOW;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
-	// Buffers held to a slice of the payload with the peer not reading: the
-	// send is still pending when the write side goes.
+	// Nothing can hold the payload with the peer not reading: the send is still
+	// pending when the write side goes.
 	let shutdown = socket.clone();
 	let thread = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(50));

@@ -26,6 +26,7 @@ assert_eq!(read.into_result()?, 5);
 ## Usage notes
 
 - On the portable backend, pass non-blocking descriptors for anything that is not a regular file: a blocking one stalls the reactor.
+- io_uring requires Linux 5.11 or later: every blocking wait passes `IORING_ENTER_EXT_ARG` for its timeout.
 - On io_uring, waits carry `IORING_ENTER_NO_IOWAIT` (Linux 6.15+), so an idle reactor is not counted as iowait; enable the `iowait` feature to leave the flag off.
 
 ## Development

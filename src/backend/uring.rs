@@ -13,19 +13,11 @@ use crate::memory::Extents;
 use crate::memory::Spans;
 use crate::{Memory, OwnedDescriptor, Span};
 use io_uring::{EnterFlags, IoUring, opcode, squeue, types};
-use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
 
 use super::Backend;
 use crate::backend::Config;
 use crate::event::Event;
-
-fn timespec(duration: Duration) -> rustix::event::Timespec {
-	rustix::event::Timespec {
-		tv_sec: duration.as_secs() as _,
-		tv_nsec: duration.subsec_nanos() as _,
-	}
-}
 
 const MIN_RING_ENTRIES: u32 = 2;
 
@@ -221,7 +213,7 @@ pub(crate) struct Uring {
 	iopoll: bool,
 	active: HashMap<u64, Active>,
 	ready: VecDeque<(u64, io::Result<Response>)>,
-	/// `IORING_ENTER_NO_IOWAIT` requires Linux 6.15+ support; older kernels use the notification fd to avoid iowait accounting.
+	/// Whether the kernel takes `IORING_ENTER_NO_IOWAIT` (Linux 6.15+). A kernel that does not still blocks in `io_uring_enter`, and that sleep counts as iowait.
 	no_iowait: bool,
 	notify_armed: bool,
 	sqpoll: bool,
@@ -267,23 +259,7 @@ impl Uring {
 		))
 	}
 
-	fn wait_notification(&self, timeout: Option<Duration>) -> io::Result<()> {
-		let Some(event) = self.completion.as_ref() else {
-			return Ok(());
-		};
-		let descriptor = borrowed(event);
-		let mut fds = [PollFd::new(&descriptor, PollFlags::IN)];
-		let timeout = timeout.map(timespec);
-		loop {
-			match poll(&mut fds, timeout.as_ref()) {
-				Ok(_) => break,
-				Err(Errno::INTR) => continue,
-				Err(error) => return Err(error.into()),
-			}
-		}
-		self.drain_notification()
-	}
-
+	/// Reads the notification fd back to zero: a counter left raised makes the next armed poll complete at once, ending the wait early.
 	fn drain_notification(&self) -> io::Result<()> {
 		let Some(event) = self.completion.as_ref() else {
 			return Ok(());
@@ -793,14 +769,10 @@ impl Backend for Uring {
 			// Only clear notifications after a wait; a nonblocking poll must not consume an unseen cross-thread wake.
 			self.ring.submit()?;
 			self.reap()?;
-		} else if self.no_iowait {
+		} else {
 			self.arm_notify()?;
 			self.enter_wait(timeout)?;
 			self.drain_notification()?;
-			self.reap()?;
-		} else {
-			self.ring.submit()?;
-			self.wait_notification(timeout)?;
 			self.reap()?;
 		}
 		match self.ready.front() {
@@ -895,16 +867,12 @@ mod tests {
 		Ok(())
 	}
 
-	/// The same wait on a kernel without `NO_IOWAIT`: the flag is never sent,
-	/// and the wait is the notification poll (the path a 6.x host takes).
+	/// A kernel without `NO_IOWAIT` takes the same `io_uring_enter` wait, and
+	/// a raise on the notification still ends it.
 	#[test]
 	fn a_blocking_wait_works_without_the_feature() -> io::Result<()> {
 		let (mut uring, event) = Uring::new(&Config::default())?;
 		uring.no_iowait = false;
-		assert!(
-			!uring.wait_flags().contains(EnterFlags::NO_IOWAIT),
-			"an older kernel answers EINVAL for the bit"
-		);
 		let start = Instant::now();
 		let waited = uring.poll(Some(Duration::from_millis(5)));
 		assert!(

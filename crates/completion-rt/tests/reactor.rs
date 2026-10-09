@@ -780,6 +780,10 @@ fn a_cancel_from_another_thread_wakes_a_parked_reactor() {
 #[test]
 #[cfg(unix)]
 fn a_drop_racing_the_reactor_leaves_no_request_running() {
+	// The flood raises thousands of caught panics; the default hook prints each and,
+	// under RUST_BACKTRACE, captures a backtrace for each, which alone outlasts the
+	// test's time limit. The hook is restored before the assertions.
+	std::panic::set_hook(Box::new(|_| {}));
 	let (left, right) = socket_pair();
 	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
 	let stop = Arc::new(AtomicBool::new(false));
@@ -819,11 +823,14 @@ fn a_drop_racing_the_reactor_leaves_no_request_running() {
 			}
 		}));
 	}
-	for worker in workers {
-		worker.join().unwrap();
-	}
+	let joined: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
 	stop.store(true, Ordering::SeqCst);
-	let mut reactor = reactor_thread.join().unwrap();
+	let reactor = reactor_thread.join();
+	drop(std::panic::take_hook());
+	for worker in joined {
+		worker.unwrap();
+	}
+	let mut reactor = reactor.unwrap();
 	// Let the reactor finish whatever the workers left pending.
 	reactor.poll(Some(Duration::ZERO)).unwrap();
 	assert_eq!(

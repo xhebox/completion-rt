@@ -10,9 +10,13 @@ mod common;
 
 use common::block_on;
 
+use std::future::Future;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use completion_rt::{
@@ -167,6 +171,108 @@ fn a_child_follows_its_parent() {
 	assert!(
 		later.is_cancelled(),
 		"a child made after the raise is raised"
+	);
+}
+
+#[derive(Default)]
+struct Woken(AtomicBool);
+
+impl Wake for Woken {
+	fn wake(self: Arc<Self>) {
+		self.0.store(true, Ordering::SeqCst);
+	}
+}
+
+/// A wait on a cancel that already fired resolves on its first poll.
+#[test]
+fn a_wait_on_a_fired_cancel_is_ready_at_once() {
+	let cancel = Cancel::new();
+	cancel.cancel();
+	let mut cx = Context::from_waker(Waker::noop());
+	assert!(
+		pin!(cancel.wait()).poll(&mut cx).is_ready(),
+		"the wait missed a cancel that had already fired"
+	);
+}
+
+/// A cancel raised on another thread while a wait's first poll is checking and
+/// registering either resolves that poll or wakes the waker it registered.
+///
+/// Both threads spin on one counter to start each round together, so the raise
+/// lands inside the poll's window in some rounds. Lost rounds are counted, not
+/// asserted in the loop: a panic there would leave the raiser spinning on a
+/// round that never starts.
+#[test]
+fn a_cancel_racing_the_wait_registration_is_not_lost() {
+	const ROUNDS: usize = 20_000;
+	let cancels: Vec<Cancel> = (0..ROUNDS).map(|_| Cancel::new()).collect();
+	let round = AtomicUsize::new(0);
+	let mut lost = 0;
+	let mut stuck = 0;
+	std::thread::scope(|scope| {
+		scope.spawn(|| {
+			for (at, cancel) in cancels.iter().enumerate() {
+				while round.load(Ordering::Acquire) != at * 2 + 1 {
+					std::hint::spin_loop();
+				}
+				cancel.cancel();
+				round.store(at * 2 + 2, Ordering::Release);
+			}
+		});
+		for (at, cancel) in cancels.iter().enumerate() {
+			let woken = Arc::new(Woken::default());
+			let waker = Waker::from(Arc::clone(&woken));
+			let mut cx = Context::from_waker(&waker);
+			let mut wait = pin!(cancel.wait());
+			round.store(at * 2 + 1, Ordering::Release);
+			let ready = wait.as_mut().poll(&mut cx).is_ready();
+			while round.load(Ordering::Acquire) != at * 2 + 2 {
+				std::hint::spin_loop();
+			}
+			if !ready && !woken.0.load(Ordering::SeqCst) {
+				lost += 1;
+			}
+			if wait.as_mut().poll(&mut cx).is_pending() {
+				stuck += 1;
+			}
+		}
+	});
+	assert_eq!(
+		lost, 0,
+		"a cancel fired around the registration and nothing woke the wait"
+	);
+	assert_eq!(stuck, 0, "a wait stayed pending on a fired cancel");
+}
+
+/// A wait dropped before its cancel fires gives its waker back, so a
+/// long-lived cancel holds nothing of the futures that gave up on it.
+#[test]
+fn a_dropped_wait_lets_go_of_its_waker() {
+	let cancel = Cancel::new();
+	let woken = Arc::new(Woken::default());
+	let waker = Waker::from(Arc::clone(&woken));
+	let held = Arc::strong_count(&woken);
+	{
+		let mut wait = pin!(cancel.wait());
+		assert!(
+			wait.as_mut()
+				.poll(&mut Context::from_waker(&waker))
+				.is_pending()
+		);
+		assert!(
+			Arc::strong_count(&woken) > held,
+			"the pending wait registered no waker"
+		);
+	}
+	assert_eq!(
+		Arc::strong_count(&woken),
+		held,
+		"the dropped wait left its waker in the cancel"
+	);
+	cancel.cancel();
+	assert!(
+		!woken.0.load(Ordering::SeqCst),
+		"the cancel woke a wait that was gone"
 	);
 }
 

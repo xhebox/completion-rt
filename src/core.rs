@@ -1472,6 +1472,12 @@ impl Cancel {
 		child
 	}
 
+	/// Resolves once the cancel fires, at once if it already has. Dropping the
+	/// future before then takes its waker out of the cancel.
+	pub fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
+		Wait::new(Arc::clone(&self.inner))
+	}
+
 	#[cfg(test)]
 	fn children(&self) -> usize {
 		self.inner.children.lock().unwrap().len()

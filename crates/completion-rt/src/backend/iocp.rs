@@ -34,6 +34,10 @@ const IO_PENDING: u32 = 997;
 /// `ERROR_OPERATION_ABORTED`: what `CancelIoEx` makes a stopped operation
 /// report.
 const ERROR_OPERATION_ABORTED: u32 = 995;
+/// `STATUS_END_OF_FILE`: the status a read beginning at or past the end of a
+/// file completes with. The status block carries the NTSTATUS itself, not the
+/// `ERROR_HANDLE_EOF` the same condition reports from a synchronous call.
+const STATUS_END_OF_FILE: usize = 0xC000_0011;
 /// The room `AcceptEx` needs beyond the two addresses it writes; the kernel
 /// takes `sizeof(SOCKADDR) + 16` per address, and `SOCKADDR_STORAGE` is the
 /// widest `SOCKADDR`.
@@ -525,6 +529,11 @@ impl Backend for Iocp {
 				let id = (*ov).token;
 				let result = if (*ov).submit_error != 0 {
 					Err(io::Error::from_raw_os_error((*ov).submit_error))
+				} else if (*ov).inner.Internal == STATUS_END_OF_FILE {
+					// A read beginning at or past the end of a file: a `read`
+					// moves nothing there, and reporting that is what a unix
+					// file does too.
+					Ok(0)
 				} else if (*ov).inner.Internal == 0 {
 					Ok((*ov).inner.InternalHigh as usize)
 				} else {

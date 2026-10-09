@@ -33,6 +33,73 @@ fn pair() -> (TcpStream, TcpStream) {
 	(client, server)
 }
 
+/// A connected pair whose buffers are held to `bytes` from before anything
+/// flows, so a send larger than them is left waiting in the kernel instead of
+/// being buffered whole — which is what the platform's defaults do here.
+fn held_pair(bytes: usize) -> (TcpStream, TcpStream) {
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	cap_buffers(&listener, bytes);
+	let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+	cap_buffers(&client, bytes);
+	let (server, _) = listener.accept().unwrap();
+	cap_buffers(&server, bytes);
+	(client, server)
+}
+
+/// Holds `socket`'s send and receive buffers to `bytes`.
+#[cfg(unix)]
+fn cap_buffers(socket: &impl std::os::fd::AsFd, bytes: usize) {
+	use rustix::net::sockopt::{set_socket_recv_buffer_size, set_socket_send_buffer_size};
+
+	assert!(set_socket_send_buffer_size(socket, bytes).is_ok());
+	assert!(set_socket_recv_buffer_size(socket, bytes).is_ok());
+}
+
+/// Holds `socket`'s send and receive buffers to `bytes`.
+#[cfg(windows)]
+fn cap_buffers(socket: &impl std::os::windows::io::AsRawSocket, bytes: usize) {
+	use std::mem::size_of;
+	use windows_sys::Win32::Networking::WinSock::{
+		SO_RCVBUF, SO_SNDBUF, SOCKET, SOL_SOCKET, getsockopt, setsockopt,
+	};
+
+	let raw = socket.as_raw_socket() as SOCKET;
+	let value = bytes as i32;
+	for option in [SO_SNDBUF, SO_RCVBUF] {
+		// SAFETY: `value` is the `int` both options take, and the call is told
+		// how many bytes to read from it.
+		let rc = unsafe {
+			setsockopt(
+				raw,
+				SOL_SOCKET,
+				option,
+				&value as *const i32 as *const u8,
+				size_of::<i32>() as i32,
+			)
+		};
+		assert_eq!(
+			rc,
+			0,
+			"setsockopt({option}) failed: {}",
+			std::io::Error::last_os_error()
+		);
+		let mut read_back: i32 = 0;
+		let mut len = size_of::<i32>() as i32;
+		// SAFETY: `read_back` is an `int` and `len` its size, as both options
+		// report.
+		unsafe {
+			getsockopt(
+				raw,
+				SOL_SOCKET,
+				option,
+				&mut read_back as *mut i32 as *mut u8,
+				&mut len,
+			)
+		};
+		eprintln!("buffer {option}: asked {value}, reads back {read_back}");
+	}
+}
+
 /// A listener to connect to inside `directory`, and the path its socket lives
 /// at.
 ///
@@ -532,12 +599,9 @@ fn a_cancel_ends_a_recv_exact_loop_mid_way() {
 fn a_cancel_ends_a_send_all_loop_with_its_progress() {
 	// The peer is held, and never reads: the buffers take a few calls' worth
 	// and the loop is left with the kernel. They are held to a slice of the
-	// payload, so eight mebibytes cannot all leave whatever the platform's
-	// defaults would buffer.
-	let (client, server) = pair();
-	common::cap_buffers(&client, 64 << 10);
-	common::cap_buffers(&server, 64 << 10);
-	let _server = server;
+	// payload from before the connection is made, so eight mebibytes cannot all
+	// leave whatever the platform's defaults would buffer.
+	let (client, _server) = held_pair(64 << 10);
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
@@ -573,9 +637,7 @@ fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 	// The peer reads nothing and is gone: buffers held to a slice of the
 	// payload are filled, the rest is left waiting, and the connection goes
 	// down with the peer.
-	let (client, server) = pair();
-	common::cap_buffers(&client, 64 << 10);
-	common::cap_buffers(&server, 64 << 10);
+	let (client, server) = held_pair(64 << 10);
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
@@ -641,10 +703,7 @@ fn a_shutdown_read_ends_a_receive_in_flight() {
 fn a_shutdown_write_ends_a_send_in_flight() {
 	use std::net::Shutdown;
 
-	let (client, server) = pair();
-	common::cap_buffers(&client, 64 << 10);
-	common::cap_buffers(&server, 64 << 10);
-	let _server = server;
+	let (client, _server) = held_pair(64 << 10);
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 

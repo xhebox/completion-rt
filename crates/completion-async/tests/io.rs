@@ -48,6 +48,10 @@ fn a_direct_open_asks_the_kernel_for_direct_io() {
 
 /// A pipe is not seekable, so the vector path must not insist on an offset:
 /// the console's rotated output and its stdin are pipes.
+///
+/// Windows: an anonymous pipe is a synchronous handle, which a completion port
+/// cannot own.
+#[cfg(unix)]
 #[test]
 fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 	let (reader, writer) = std::io::pipe().unwrap();
@@ -150,7 +154,7 @@ fn read_exact_at_reports_the_file_ending_first() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file = File::new(std::fs::File::open(&path).unwrap(), &submitter);
+	let file = File::new(common::open(&path).unwrap(), &submitter);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
 	// One call: five bytes are left, and that is what it reports.
@@ -276,7 +280,7 @@ fn a_facade_with_no_operations_gives_its_file_back_at_once() {
 	std::fs::write(&path, b"data").unwrap();
 	let executor = executor();
 	let submitter = executor.submitter();
-	let file = File::new(std::fs::File::open(&path).unwrap(), &submitter);
+	let file = File::new(common::open(&path).unwrap(), &submitter);
 
 	let plain = block_on(file.take()).expect("nothing else names the file");
 	assert_eq!(plain.metadata().unwrap().len(), 4);
@@ -306,7 +310,7 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file = File::new(std::fs::File::open(&path).unwrap(), &submitter);
+	let file = File::new(common::open(&path).unwrap(), &submitter);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;

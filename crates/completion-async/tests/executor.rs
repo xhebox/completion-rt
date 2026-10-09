@@ -203,7 +203,7 @@ fn an_operation_after_the_executor_drops_is_refused() {
 	std::fs::write(&path, b"hello").unwrap();
 
 	let executor = executor();
-	let file = File::new(std::fs::File::open(&path).unwrap(), &executor.submitter());
+	let file = File::new(common::open(&path).unwrap(), &executor.submitter());
 	drop(executor);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
@@ -229,7 +229,7 @@ fn a_local_executor_reads_a_real_file() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file = File::new(std::fs::File::open(&path).unwrap(), &executor.submitter());
+	let file = File::new(common::open(&path).unwrap(), &executor.submitter());
 	let buffer = Arc::new(vec![0u8; 5]);
 	let payload: Arc<dyn Memory> = buffer.clone();
 	let outcome = executor.block_on(file.read_at(payload, 0)).unwrap();
@@ -278,7 +278,7 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 				Poll::Pending
 			}
 		}));
-		let file = File::new(std::fs::File::open(&path).unwrap(), &submitter);
+		let file = File::new(common::open(&path).unwrap(), &submitter);
 		let buffer = Arc::new(vec![0u8; 5]);
 		let payload: Arc<dyn Memory> = buffer.clone();
 		executor

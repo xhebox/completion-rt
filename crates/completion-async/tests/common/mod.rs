@@ -76,6 +76,26 @@ impl Scratch {
 	}
 }
 
+/// Opens `path` read-only, in the shape the backend needs: a completion port
+/// only ever owns a handle opened for overlapped I/O, and `File::open` does not
+/// ask for that on Windows.
+pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<std::fs::File> {
+	let path = path.as_ref();
+	#[cfg(windows)]
+	{
+		use std::os::windows::fs::OpenOptionsExt;
+		use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+		std::fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(FILE_FLAG_OVERLAPPED)
+			.open(path)
+	}
+	#[cfg(not(windows))]
+	{
+		std::fs::File::open(path)
+	}
+}
+
 /// Makes a scratch directory below `target/test-tmp`. Remove it by dropping the
 /// returned `Scratch`, so bind it for the lifetime of the test.
 pub(crate) fn tempdir(tag: &str) -> io::Result<Scratch> {

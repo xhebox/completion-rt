@@ -48,7 +48,7 @@ fn seeded_file(contents: &[u8]) -> Handle<std::fs::File> {
 	let path = dir.path().join("data");
 	std::fs::write(&path, contents).unwrap();
 	// The returned descriptor outlives the deleted directory entry.
-	Handle::new(std::fs::File::open(path).unwrap())
+	Handle::new(common::open(path).unwrap())
 }
 
 /// A connected pair, both ends non-blocking: a receive on one waits for a send
@@ -153,6 +153,10 @@ fn a_landed_file_operation_does_not_wait_out_the_timeout() {
 /// it raised: another thread may have raised it while this poll ran, and
 /// clearing it here leaves the next waiting poll asleep with news waiting for
 /// it.
+///
+/// Windows: the notification is a completion packet, which a poll takes off
+/// the port to see at all; there is no level-triggered state to leave raised.
+#[cfg(unix)]
 #[test]
 fn a_poll_without_a_wait_leaves_the_notification_raised() {
 	let (mut reactor, _submitter) = Reactor::new(Config::default()).unwrap();
@@ -316,6 +320,10 @@ fn stopping_the_reactor_drains_what_is_in_flight() {
 /// (`Submitter::wait`): a raise from another thread must complete that wait,
 /// not only make `poll` return — otherwise the task waiting on it never runs
 /// again.
+///
+/// Windows: a completion port is not a descriptor, so `Submitter::wait` has
+/// nothing to arm.
+#[cfg(unix)]
 #[test]
 fn an_event_completes_a_wait_armed_on_it() {
 	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();

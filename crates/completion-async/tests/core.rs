@@ -32,7 +32,7 @@ fn seeded(submitter: &Submitter, contents: &[u8]) -> File {
 	let path = dir.path().join("data");
 	std::fs::write(&path, contents).unwrap();
 	// The returned descriptor outlives the deleted directory entry.
-	File::new(std::fs::File::open(path).unwrap(), submitter)
+	File::new(common::open(path).unwrap(), submitter)
 }
 
 /// The buffer in the shape the engine names memory: a second handle on it, so

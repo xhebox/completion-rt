@@ -117,6 +117,11 @@ pub struct Facade<S> {
 
 impl<S> Facade<S> {
 	/// Wraps `resource`, its operations going to `submitter`.
+	///
+	/// On Windows the resource must be opened for overlapped I/O: a file
+	/// through [`OpenOptions`], which asks for `FILE_FLAG_OVERLAPPED`. A handle
+	/// opened without that flag cannot be owned by a completion port, so its
+	/// operations fail with the invalid-parameter error the association gives.
 	pub fn new(resource: impl Into<S>, submitter: &crate::Submitter) -> Facade<S> {
 		Self {
 			handle: Handle::new(resource.into()),

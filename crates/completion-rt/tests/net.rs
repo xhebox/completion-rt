@@ -216,7 +216,7 @@ fn an_operation_reports_the_line_that_asked_for_it() {
 	let before = line!();
 	let mut receive = pin!(
 		submitter
-			.recv_with_fds(&client, memory(&buffer), whole(&buffer))
+			.recv(&client, memory(&buffer), whole(&buffer))
 			.unwrap()
 	);
 	let after = line!();
@@ -230,7 +230,7 @@ fn an_operation_reports_the_line_that_asked_for_it() {
 	let entry = submitter
 		.in_flight()
 		.into_iter()
-		.find(|entry| entry.op == "recv_with_fds")
+		.find(|entry| entry.op == "recv")
 		.expect("the receive is in the reactor");
 	assert_eq!(
 		entry.origin.file(),

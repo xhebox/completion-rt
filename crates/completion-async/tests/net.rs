@@ -213,6 +213,10 @@ fn a_datagram_socket_takes_a_message_a_call() {
 
 /// A wait is an operation of its own, with nothing to count: `wait_writable`
 /// resolves once the socket can take bytes, `wait_readable` once it has some.
+///
+/// A completion port has no readiness wait: readiness is what an operation
+/// completing already says, so the backend reports this Unsupported.
+#[cfg(unix)]
 #[test]
 fn waits_resolve_when_the_socket_is_ready() {
 	use std::io::Write;
@@ -257,6 +261,53 @@ fn an_accept_gives_a_stream_facade_of_its_own() {
 		5
 	);
 
+	client
+		.set_read_timeout(Some(Duration::from_secs(5)))
+		.unwrap();
+	let mut got = [0u8; 5];
+	client.read_exact(&mut got).unwrap();
+	assert_eq!(&got, b"hello");
+
+	// The connection reaches the other way too: the client's bytes come out of
+	// the accepted stream.
+	client.write_all(b"world").unwrap();
+	let received: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
+	assert_eq!(
+		executor
+			.block_on(stream.recv(memory(&received)))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		5
+	);
+	assert_eq!(&received[..], b"world");
+}
+
+/// The same accept over TCP, on every platform: the listener says what its
+/// streams are, and the connection is live both ways.
+#[test]
+fn a_tcp_accept_gives_a_stream_facade_of_its_own() {
+	use std::io::Write;
+
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	listener.set_nonblocking(true).unwrap();
+	let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+	let mut executor = executor();
+	let listener: Facade<TcpListener> = Facade::new(listener, &executor.submitter());
+
+	let stream: Facade<TcpStream> = executor
+		.block_on(listener.accept())
+		.unwrap()
+		.expect("the accept landed");
+	let payload: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
+	assert_eq!(
+		executor
+			.block_on(stream.send(memory(&payload)))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		5
+	);
 	client
 		.set_read_timeout(Some(Duration::from_secs(5)))
 		.unwrap();

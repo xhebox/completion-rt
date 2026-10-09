@@ -18,14 +18,14 @@ use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use completion_async::{
-	Accept, AsDescriptor, Cancel, Config, Error, Executor, Facade, File, ListenerHandle, Memory,
-	Op, Receive, Transfer,
+	Accept, AsDescriptor, Cancel, Config, Error, Executor as _, ExecutorEnum, Facade, File,
+	ListenerHandle, Memory, Op, Receive, Transfer,
 };
 
 /// The async driver the operations run on.
-fn executor() -> Executor {
+fn executor() -> ExecutorEnum {
 	common::init_logging();
-	Executor::new(Config::default()).unwrap()
+	ExecutorEnum::new(Config::default()).unwrap()
 }
 
 /// The buffer in the shape the engine names memory.

@@ -18,7 +18,7 @@ use std::sync::mpsc::Sender;
 use std::task::Poll;
 use std::time::Duration;
 
-use completion_async::{Cancel, Config, Executor, Submitter, Timeout};
+use completion_async::{Cancel, Config, Executor as _, ExecutorEnum, Submitter, Timeout};
 
 /// Rounds the other thread fires and the root future has to observe.
 const ROUNDS: usize = 2_000;
@@ -81,7 +81,7 @@ async fn rounds(
 #[test]
 fn a_parked_block_on_is_woken_from_another_thread_every_round() {
 	common::init_logging();
-	let mut executor = Executor::new(Config::default()).unwrap();
+	let mut executor = ExecutorEnum::new(Config::default()).unwrap();
 	let submitter = executor.submitter();
 
 	let (cancels_tx, cancels) = std::sync::mpsc::channel::<Cancel>();

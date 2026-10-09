@@ -7,13 +7,15 @@ use common::block_on;
 use std::io;
 use std::sync::Arc;
 
-use completion_async::{Config, Error, Executor, Extent, Facade, File, Memory, OpenOptions};
+use completion_async::{
+	Config, Error, Executor as _, ExecutorEnum, Extent, Facade, File, Memory, OpenOptions,
+};
 
 /// The async driver the file operations run on: it owns the reactor, so
 /// `block_on` both polls the operation and drives the backend under it.
-fn executor() -> Executor {
+fn executor() -> ExecutorEnum {
 	common::init_logging();
-	Executor::new(Config::default()).unwrap()
+	ExecutorEnum::new(Config::default()).unwrap()
 }
 
 #[test]

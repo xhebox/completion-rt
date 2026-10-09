@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use completion_async::{Cancel, Config, Error, Executor, Facade, Memory};
+use completion_async::{Cancel, Config, Error, Executor as _, ExecutorEnum, Facade, Memory};
 
 /// The async driver the socket operations run on.
-fn executor() -> Executor {
+fn executor() -> ExecutorEnum {
 	common::init_logging();
-	Executor::new(Config::default()).unwrap()
+	ExecutorEnum::new(Config::default()).unwrap()
 }
 
 /// The buffer in the shape the engine names memory.
@@ -58,6 +58,50 @@ fn cap_buffers(socket: &impl std::os::fd::AsFd, bytes: usize) {
 
 	assert!(set_socket_send_buffer_size(socket, bytes).is_ok());
 	assert!(set_socket_recv_buffer_size(socket, bytes).is_ok());
+}
+
+#[cfg(windows)]
+fn cap_buffers(socket: &impl std::os::windows::io::AsRawSocket, bytes: usize) {
+	use std::mem::size_of;
+	use windows_sys::Win32::Networking::WinSock::{
+		SO_RCVBUF, SO_SNDBUF, SOCKET, SOL_SOCKET, getsockopt, setsockopt,
+	};
+
+	let raw = socket.as_raw_socket() as SOCKET;
+	let value = bytes as i32;
+	for option in [SO_SNDBUF, SO_RCVBUF] {
+		// SAFETY: `value` is the `int` both options take, and the call is told
+		// how many bytes to read from it.
+		let rc = unsafe {
+			setsockopt(
+				raw,
+				SOL_SOCKET,
+				option,
+				&value as *const i32 as *const u8,
+				size_of::<i32>() as i32,
+			)
+		};
+		assert_eq!(
+			rc,
+			0,
+			"setsockopt({option}) failed: {}",
+			std::io::Error::last_os_error()
+		);
+		let mut read_back: i32 = 0;
+		let mut len = size_of::<i32>() as i32;
+		// SAFETY: `read_back` is an `int` and `len` its size, as both options
+		// report.
+		unsafe {
+			getsockopt(
+				raw,
+				SOL_SOCKET,
+				option,
+				&mut read_back as *mut i32 as *mut u8,
+				&mut len,
+			)
+		};
+		eprintln!("buffer {option}: asked {value}, reads back {read_back}");
+	}
 }
 
 /// A listener to connect to inside `directory`, and the path its socket lives

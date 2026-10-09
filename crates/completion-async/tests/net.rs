@@ -25,12 +25,6 @@ fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
 	memory
 }
 
-/// More than any platform's socket buffers hold when the peer never reads:
-/// windows autotunes its receive window into the mebibytes whatever
-/// `SO_RCVBUF` asks for, so a test that needs a send the kernel has not
-/// finished with has to ask for more than that.
-const MORE_THAN_ANY_WINDOW: usize = 64 << 20;
-
 /// A connected pair over loopback: the portable way to two real sockets.
 fn pair() -> (TcpStream, TcpStream) {
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -42,6 +36,11 @@ fn pair() -> (TcpStream, TcpStream) {
 /// A connected pair whose buffers are held to `bytes` from before anything
 /// flows, so a send larger than them is left waiting in the kernel instead of
 /// being buffered whole — which is what the platform's defaults do here.
+///
+/// Unix only: windows completes a loopback send to a peer that never reads
+/// whole, whatever the buffers are held to, so there is no send left in flight
+/// there for the tests below to act on.
+#[cfg(unix)]
 fn held_pair(bytes: usize) -> (TcpStream, TcpStream) {
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 	cap_buffers(&listener, bytes);
@@ -59,51 +58,6 @@ fn cap_buffers(socket: &impl std::os::fd::AsFd, bytes: usize) {
 
 	assert!(set_socket_send_buffer_size(socket, bytes).is_ok());
 	assert!(set_socket_recv_buffer_size(socket, bytes).is_ok());
-}
-
-/// Holds `socket`'s send and receive buffers to `bytes`.
-#[cfg(windows)]
-fn cap_buffers(socket: &impl std::os::windows::io::AsRawSocket, bytes: usize) {
-	use std::mem::size_of;
-	use windows_sys::Win32::Networking::WinSock::{
-		SO_RCVBUF, SO_SNDBUF, SOCKET, SOL_SOCKET, getsockopt, setsockopt,
-	};
-
-	let raw = socket.as_raw_socket() as SOCKET;
-	let value = bytes as i32;
-	for option in [SO_SNDBUF, SO_RCVBUF] {
-		// SAFETY: `value` is the `int` both options take, and the call is told
-		// how many bytes to read from it.
-		let rc = unsafe {
-			setsockopt(
-				raw,
-				SOL_SOCKET,
-				option,
-				&value as *const i32 as *const u8,
-				size_of::<i32>() as i32,
-			)
-		};
-		assert_eq!(
-			rc,
-			0,
-			"setsockopt({option}) failed: {}",
-			std::io::Error::last_os_error()
-		);
-		let mut read_back: i32 = 0;
-		let mut len = size_of::<i32>() as i32;
-		// SAFETY: `read_back` is an `int` and `len` its size, as both options
-		// report.
-		unsafe {
-			getsockopt(
-				raw,
-				SOL_SOCKET,
-				option,
-				&mut read_back as *mut i32 as *mut u8,
-				&mut len,
-			)
-		};
-		eprintln!("buffer {option}: asked {value}, reads back {read_back}");
-	}
 }
 
 /// A listener to connect to inside `directory`, and the path its socket lives
@@ -601,15 +555,21 @@ fn a_cancel_ends_a_recv_exact_loop_mid_way() {
 
 /// A cancel that lands in a `send_all` loop reports the bytes the loop had put
 /// out: the progress is not thrown away with the cancel.
+///
+/// Windows: a loopback send to a peer that never reads completes whole, so the
+/// loop is never left in front of the kernel for the cancel to end.
+#[cfg(unix)]
 #[test]
 fn a_cancel_ends_a_send_all_loop_with_its_progress() {
-	// The peer is held, and never reads: the payload is larger than anything
-	// that can hold it, so the loop is left with the kernel.
+	// The peer is held, and never reads: the buffers take a few calls' worth
+	// and the loop is left with the kernel. They are held to a slice of the
+	// payload from before the connection is made, so eight mebibytes cannot all
+	// leave whatever the platform's defaults would buffer.
 	let (client, _server) = held_pair(64 << 10);
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
-	let len = MORE_THAN_ANY_WINDOW;
+	let len = 8 << 20;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
@@ -636,15 +596,20 @@ fn a_cancel_ends_a_send_all_loop_with_its_progress() {
 /// A `send_all` loop that fails keeps the progress it made before the call that
 /// failed: the peer going away is the call's error, not a reason to forget the
 /// bytes that left.
+///
+/// Windows: a loopback send to a peer that never reads completes whole, so the
+/// peer going away leaves no send for the reset to fail.
+#[cfg(unix)]
 #[test]
 fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
-	// The peer reads nothing and is gone: the payload fills whatever can hold
-	// it, the rest is left waiting, and the connection goes down with the peer.
+	// The peer reads nothing and is gone: buffers held to a slice of the
+	// payload are filled, the rest is left waiting, and the connection goes
+	// down with the peer.
 	let (client, server) = held_pair(64 << 10);
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
-	let len = MORE_THAN_ANY_WINDOW;
+	let len = 8 << 20;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
 	let gone = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(100));
@@ -702,6 +667,10 @@ fn a_shutdown_read_ends_a_receive_in_flight() {
 /// down: the peer never reads, the send waits on the socket's buffers, and the
 /// shutdown is what turns it into the error a closed send side gives — not a
 /// write left waiting.
+///
+/// Windows: a loopback send to a peer that never reads completes whole, so
+/// there is no send in front of the kernel for the shutdown to end.
+#[cfg(unix)]
 #[test]
 fn a_shutdown_write_ends_a_send_in_flight() {
 	use std::net::Shutdown;
@@ -710,10 +679,10 @@ fn a_shutdown_write_ends_a_send_in_flight() {
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
 
-	let len = MORE_THAN_ANY_WINDOW;
+	let len = 8 << 20;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
-	// Nothing can hold the payload with the peer not reading: the send is still
-	// pending when the write side goes.
+	// Buffers held to a slice of the payload with the peer not reading: the
+	// send is still pending when the write side goes.
 	let shutdown = socket.clone();
 	let thread = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(50));

@@ -9,10 +9,9 @@ vars:
   # `--profile` on nextest names a nextest profile; the cargo profile a recipe
   # wants goes through `--cargo-profile`.
   CARGO_PROFILE_ARG: '{{if ne .PROFILE "dev"}}--cargo-profile {{.PROFILE}}{{end}}'
-  RUSTFLAGS: '-D warnings -C force-frame-pointers=yes -C symbol-mangling-version=v0'
-
-env:
-  RUSTFLAGS: '{{.RUSTFLAGS}}'
+  # Every target `check` cross-checks; keep in step with rust-toolchain.toml and
+  # the CI matrix.
+  TARGETS: aarch64-unknown-linux-musl x86_64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc
 
 tasks:
   default:
@@ -23,19 +22,20 @@ tasks:
     cmds:
       - cargo build {{.PROFILE_ARG}} --locked {{.CLI_ARGS}}
 
+  # CI calls this, so it must fail on a formatting diff rather than rewrite the tree.
   check:
-    desc: "Format, lint and cross-check every target"
+    desc: "Check formatting and cross-check every target, without rewriting files"
+    cmds:
+      - cargo fmt --all --check
+      - ast-grep scan --report-style short
+      - for: { var: TARGETS }
+        task: check-target
+        vars: { TARGET: '{{.ITEM}}' }
+
+  fmt:
+    desc: "Rewrite every source file in place with rustfmt"
     cmds:
       - cargo fmt --all
-      - ast-grep scan --report-style short
-      - task: check-target
-        vars: { TARGET: aarch64-unknown-linux-musl }
-      - task: check-target
-        vars: { TARGET: x86_64-unknown-linux-musl }
-      - task: check-target
-        vars: { TARGET: aarch64-apple-darwin }
-      - task: check-target
-        vars: { TARGET: x86_64-pc-windows-gnu }
 
   check-target:
     internal: true

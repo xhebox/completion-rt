@@ -1,0 +1,15 @@
+name: Set up task and ast-grep
+description: Install task and ast-grep. Node is preinstalled on every GitHub runner, so ast-grep comes from npm.
+runs:
+  using: composite
+  steps:
+    - name: Install task
+      uses: arduino/setup-task@v3
+      with:
+        repo-token: ${{ github.token }}
+
+    # No maintained official ast-grep setup action is pinned here; the npm package
+    # ships prebuilt binaries for linux, macos and windows on both architectures.
+    - name: Install ast-grep
+      shell: bash
+      run: npm install -g @ast-grep/cli

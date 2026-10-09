@@ -162,6 +162,12 @@ impl Portable {
 		let key = match self.keys.get(&fd) {
 			Some(key) => *key,
 			None => {
+				// A readiness backend calls the operation when the poller says it
+				// is ready, and a socket the caller left in blocking mode would
+				// stall the reactor in that call. MSG_DONTWAIT does not cover it:
+				// XNU's sosendcheck only honours SS_NBIO.
+				// SAFETY: the descriptor stays open while the reactor holds it.
+				rustix::io::ioctl_fionbio(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }, true)?;
 				let key = self.next_key;
 				self.next_key += 1;
 				self.keys.insert(fd, key);
@@ -716,8 +722,6 @@ fn call(result: libc::ssize_t) -> io::Result<Call> {
 	}
 }
 
-// The socket calls pass MSG_DONTWAIT: the caller's socket may be in blocking
-// mode, and a call that blocked would stall the reactor thread behind it.
 fn run_op(op: &mut Op) -> io::Result<Progress> {
 	let Op { fd, work, fds, .. } = op;
 	// SAFETY: the descriptor stays open for the operation's flight.
@@ -760,8 +764,7 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 		},
 		Work::Recv { memory, extents } => {
 			let (ptr, len) = one_buffer(memory, extents)?;
-			match call(unsafe { libc::recv(fd.as_raw_fd(), ptr.cast(), len, libc::MSG_DONTWAIT) })?
-			{
+			match call(unsafe { libc::recv(fd.as_raw_fd(), ptr.cast(), len, 0) })? {
 				Call::Bytes(count) => Ok(Progress::Done(Response::Count(count))),
 				Call::Blocked => Ok(Progress::Blocked),
 			}
@@ -778,7 +781,7 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 			msg.msg_iovlen = 1;
 			msg.msg_control = space.as_mut_ptr().cast();
 			msg.msg_controllen = space.len() as _;
-			match call(unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) })? {
+			match call(unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, 0) })? {
 				Call::Bytes(count) => {
 					take_fds(&msg, fds);
 					Ok(Progress::Done(Response::CountWithFds(
@@ -793,7 +796,7 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 			let (ptr, len) = one_buffer(memory, extents)?;
 			let carried: Vec<libc::c_int> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
 			let result = if carried.is_empty() {
-				call(unsafe { libc::send(fd.as_raw_fd(), ptr.cast(), len, libc::MSG_DONTWAIT) })
+				call(unsafe { libc::send(fd.as_raw_fd(), ptr.cast(), len, 0) })
 			} else {
 				let mut iov = libc::iovec {
 					iov_base: ptr.cast(),
@@ -819,7 +822,7 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 						*data.add(index) = *raw;
 					}
 				}
-				call(unsafe { libc::sendmsg(fd.as_raw_fd(), &msg, libc::MSG_DONTWAIT) })
+				call(unsafe { libc::sendmsg(fd.as_raw_fd(), &msg, 0) })
 			};
 			match result? {
 				Call::Bytes(count) => {

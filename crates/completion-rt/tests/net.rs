@@ -90,7 +90,7 @@ fn assert_the_connection_ended(client: &mut std::os::unix::net::UnixStream) {
 /// Drives the reactor by hand until the peer sees the connection end. An entry
 /// whose result was given up on no longer counts as outstanding, so nothing
 /// else reaps for it, and a socket left open keeps the peer waiting.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn drive_until_the_connection_ends(
 	reactor: &mut Reactor,
 	client: &mut std::os::unix::net::UnixStream,
@@ -136,8 +136,12 @@ fn a_dropped_accept_closes_the_new_socket() {
 
 /// An accept dropped while the kernel still has it, and which succeeds
 /// anyway, closes the socket that comes back with nobody waiting for it.
+///
+/// io_uring only: a readiness backend calls accept only when the listener is
+/// ready, so one given up on before that never accepts, and the connection
+/// stays in the backlog with no socket to close.
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn an_abandoned_accept_that_succeeds_closes_its_socket() {
 	use std::os::unix::net::UnixStream;
 
@@ -162,8 +166,12 @@ fn an_abandoned_accept_that_succeeds_closes_its_socket() {
 /// An until future dropped after its cancel fired, whose accept raced to
 /// success anyway, leaves no socket behind: the caller never takes the result,
 /// and the peer still sees the connection end.
+///
+/// io_uring only: a readiness backend calls accept only when the listener is
+/// ready, so one given up on before that never accepts, and the connection
+/// stays in the backlog with no socket to close.
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn a_cancelled_accept_that_succeeded_closes_its_socket() {
 	use std::os::unix::net::UnixStream;
 

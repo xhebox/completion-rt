@@ -1,8 +1,9 @@
 //! The in-flight snapshot: what the reactor still holds, read back without
 //! disturbing it.
 //!
-//! Unix only: the snapshot's descriptor is a raw fd, and the two operations the
-//! test keeps un-landed are a blocked pipe read and a far-off timer.
+//! This drives the reactor by hand, so it lives with the low layer. Unix only:
+//! the snapshot's descriptor is a raw fd, and the two operations the test keeps
+//! un-landed are a blocked pipe read and a far-off timer.
 #![cfg(unix)]
 
 mod common;

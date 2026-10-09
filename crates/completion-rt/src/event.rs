@@ -28,10 +28,6 @@ impl Event {
 	pub(super) fn descriptor(&self) -> BorrowedDescriptor<'_> {
 		self.0.descriptor()
 	}
-
-	pub(super) fn same(&self, other: &Event) -> bool {
-		Arc::ptr_eq(&self.0, &other.0)
-	}
 }
 
 #[cfg(unix)]

@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 
-use completion_rt::AsDescriptor as _;
+use completion_async::AsDescriptor as _;
 
 /// A descriptor cloned from a pipe's write end keeps the pipe writable after
 /// the descriptor it came from is gone: `try_clone_to_owned` makes a second
@@ -20,7 +20,7 @@ fn a_cloned_descriptor_outlives_the_original() {
 	let mut clone = std::fs::File::from(owned);
 	#[cfg(windows)]
 	let mut clone = {
-		use completion_rt::OwnedDescriptor;
+		use completion_async::OwnedDescriptor;
 		match owned {
 			OwnedDescriptor::Handle(handle) => std::fs::File::from(handle),
 			OwnedDescriptor::Socket(_) => panic!("a pipe carries a handle, not a socket"),

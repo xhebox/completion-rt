@@ -7,12 +7,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::memory::Extents;
-use crate::outcome::{Error, Outcome};
-use crate::{
-	AsDescriptor, Cancel, Completion, Extent, Facade, Handle, Memory, OwnedDescriptor, OwnedSocket,
-	Response, Submitter, Until,
+use completion_rt::{
+	AsDescriptor, Cancel, Completion, Extent, Extents, Handle, Memory, OwnedDescriptor,
+	OwnedSocket, Response, Submitter, Until,
 };
+
+use crate::Facade;
+use crate::outcome::{Error, Outcome};
 
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
@@ -517,9 +518,10 @@ impl<S: ListenerHandle> Future for Accept<S> {
 				this.finished = true;
 				let response = this.gate.take_response();
 				match response {
-					Some(Response::Accepted(socket)) => {
-						Poll::Ready(Ok(Facade::new(socket, &this.gate.submitter)))
-					}
+					Some(Response::Accepted(socket)) => Poll::Ready(Ok(Facade::new(
+						socket,
+						&crate::Submitter(this.gate.submitter.clone()),
+					))),
 					other => unreachable!("an accept's round reports a socket, not {other:?}"),
 				}
 			}
@@ -708,7 +710,7 @@ mod imp {
 	use std::io;
 	use std::net::Shutdown;
 
-	use crate::BorrowedDescriptor;
+	use completion_rt::BorrowedDescriptor;
 
 	pub(super) fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
 		let how = match how {
@@ -739,7 +741,7 @@ mod imp {
 		shutdown as winsock_shutdown,
 	};
 
-	use crate::BorrowedDescriptor;
+	use completion_rt::BorrowedDescriptor;
 
 	pub(super) fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
 		let how = match how {

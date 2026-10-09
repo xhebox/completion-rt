@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use completion_rt::{Config, Error, Executor, File, Memory};
+use completion_async::{Config, Error, Executor, File, Memory, Timeout};
 
 fn executor() -> Executor {
 	common::init_logging();
@@ -136,6 +136,48 @@ fn a_wake_on_the_driver_thread_does_not_park_the_loop() {
 		.expect("block_on runs the task it readied");
 }
 
+/// kibotos notifies the reactor right after spawning a task, so a freshly
+/// spawned task runs even when nothing else stirs the loop. That notify is
+/// redundant: `spawn` raises the executor's own wake, and the loop has to carry
+/// it into the pass that follows while the root future stays pending. Reading
+/// the wake without running the task — consuming it below the top of the loop —
+/// leaves the reactor parked with a runnable task in hand. Nothing raises a
+/// second notification here, so a lost wake parks forever and the run is watched
+/// by a deadline.
+#[test]
+fn a_task_spawned_while_the_root_future_is_pending_runs_without_a_notify() {
+	let (done, finished) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let mut executor = executor();
+		let ran = Arc::new(AtomicBool::new(false));
+		let flag = Arc::clone(&ran);
+		let spawner = executor.spawner();
+		let mut spawned = false;
+		let outcome = executor.block_on(std::future::poll_fn(move |_| {
+			if ran.load(Ordering::Acquire) {
+				return Poll::Ready(());
+			}
+			if !spawned {
+				// The spawn's own wake is the only notification: the root future
+				// raises no other, and nothing touches the reactor.
+				spawned = true;
+				let flag = Arc::clone(&flag);
+				spawner
+					.spawn(async move { flag.store(true, Ordering::Release) })
+					.detach();
+			}
+			Poll::Pending
+		}));
+		let _ = done.send(outcome.is_ok());
+	});
+	let completed = finished.recv_timeout(Duration::from_secs(10));
+	assert!(
+		completed.is_ok(),
+		"the spawned task never ran: the executor parked with the wake the spawn raised"
+	);
+	assert!(completed.unwrap(), "block_on failed before the task ran");
+}
+
 #[test]
 fn block_on_runs_the_tasks_it_finds_ready() {
 	let mut executor = executor();
@@ -242,8 +284,9 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 		executor
 			.block_on(async {
 				assert_eq!(file.read_at(payload, 0).await.into_result().unwrap(), 5);
-				let (_, result) = submitter.timeout(Duration::from_millis(1)).unwrap().await;
-				result.unwrap();
+				Timeout::new(Duration::from_millis(1), &submitter)
+					.await
+					.unwrap();
 			})
 			.unwrap();
 		assert_eq!(&buffer[..], b"hello");
@@ -257,16 +300,16 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 }
 
 fn socket_pair(
-	submitter: &completion_rt::Submitter,
+	submitter: &completion_async::Submitter,
 ) -> (
 	std::net::TcpStream,
-	completion_rt::Facade<std::net::TcpStream>,
+	completion_async::Facade<std::net::TcpStream>,
 ) {
 	let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
 	let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let (stream, _) = listener.accept().unwrap();
 	stream.set_nonblocking(true).unwrap();
-	(peer, completion_rt::Facade::new(stream, submitter))
+	(peer, completion_async::Facade::new(stream, submitter))
 }
 
 fn stalled_task(
@@ -279,17 +322,10 @@ fn stalled_task(
 		socket.recv(payload).await.into_result().unwrap();
 	});
 	let submitter = executor.submitter();
-	let (_, result) = executor
-		.block_on(submitter.timeout(Duration::from_millis(1)).unwrap())
+	executor
+		.block_on(Timeout::new(Duration::from_millis(1), &submitter))
+		.unwrap()
 		.unwrap();
-	result.unwrap();
-	assert!(
-		submitter
-			.in_flight()
-			.iter()
-			.any(|operation| operation.names_memory
-				&& operation.state == completion_rt::InFlightState::InFlight)
-	);
 	(peer, task)
 }
 
@@ -322,7 +358,7 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 	let buffer = Arc::new(vec![0u8; 8]);
 	let payload: Arc<dyn Memory> = buffer.clone();
 	let mut receive = Box::pin(socket.recv(payload));
-	let handle = Rc::new(RefCell::new(None::<completion_rt::Task<()>>));
+	let handle = Rc::new(RefCell::new(None::<completion_async::Task<()>>));
 	let cancel = Rc::new(Cell::new(false));
 	let wake = Rc::new(RefCell::new(None::<Waker>));
 	let own_handle = Rc::clone(&handle);
@@ -337,17 +373,10 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 		assert!(receive.as_mut().poll(cx).is_pending());
 		Poll::Pending
 	})));
-	let (_, result) = executor
-		.block_on(submitter.timeout(Duration::from_millis(1)).unwrap())
+	executor
+		.block_on(Timeout::new(Duration::from_millis(1), &submitter))
+		.unwrap()
 		.unwrap();
-	result.unwrap();
-	assert!(
-		submitter
-			.in_flight()
-			.iter()
-			.any(|operation| operation.names_memory
-				&& operation.state == completion_rt::InFlightState::InFlight)
-	);
 	cancel.set(true);
 	wake.borrow().as_ref().unwrap().wake_by_ref();
 	executor.block_on(async {}).unwrap();
@@ -380,17 +409,10 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		assert!(receive.as_mut().poll(cx).is_pending());
 		Poll::Pending::<()>
 	}));
-	let (_, result) = executor
-		.block_on(submitter.timeout(Duration::from_millis(1)).unwrap())
+	executor
+		.block_on(Timeout::new(Duration::from_millis(1), &submitter))
+		.unwrap()
 		.unwrap();
-	result.unwrap();
-	assert!(
-		submitter
-			.in_flight()
-			.iter()
-			.any(|operation| operation.names_memory
-				&& operation.state == completion_rt::InFlightState::InFlight)
-	);
 	panic_next.set(true);
 	handed.try_recv().unwrap().wake();
 	let caught =
@@ -445,17 +467,10 @@ fn cancellation_unwinding_does_not_hide_later_unsignalled_io_drops() {
 			.poll(&mut Context::from_waker(Waker::noop()))
 			.is_pending()
 	);
-	let (_, result) = executor
-		.block_on(submitter.timeout(Duration::from_millis(1)).unwrap())
+	executor
+		.block_on(Timeout::new(Duration::from_millis(1), &submitter))
+		.unwrap()
 		.unwrap();
-	result.unwrap();
-	assert!(
-		submitter
-			.in_flight()
-			.iter()
-			.any(|operation| operation.names_memory
-				&& operation.state == completion_rt::InFlightState::InFlight)
-	);
 	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(receive)));
 	assert_eq!(
 		caught.is_err(),
@@ -475,7 +490,7 @@ fn task_destructors_observe_other_joins_as_gone_during_executor_teardown() {
 	use std::rc::Rc;
 
 	struct Observe {
-		tasks: Rc<RefCell<Vec<completion_rt::Task<()>>>>,
+		tasks: Rc<RefCell<Vec<completion_async::Task<()>>>>,
 		all_gone: Rc<Cell<bool>>,
 	}
 

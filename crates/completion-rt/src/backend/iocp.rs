@@ -18,8 +18,9 @@ use crate::memory::Extents;
 use crate::{Memory, OwnedDescriptor};
 
 use super::Backend;
-use crate::backend::{Config, PollMode};
+use crate::backend::Config;
 use crate::event::Event;
+use crate::park::Park;
 
 /// `ERROR_IO_PENDING`: the operation was accepted and will complete later.
 const ERROR_IO_PENDING: u32 = 997;
@@ -52,8 +53,8 @@ struct Overlapped {
 }
 
 impl Iocp {
-	pub(super) fn new(config: &Config) -> io::Result<(Iocp, Event)> {
-		if config.wakeup == PollMode::Fd {
+	pub(super) fn new(config: &Config, embedded: bool) -> io::Result<(Iocp, Event)> {
+		if embedded {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
 				"an IOCP port is consumed by GetQueuedCompletionStatusEx, not waited on",
@@ -310,7 +311,7 @@ impl Backend for Iocp {
 		unsafe { CancelIoEx(active.ov.handle, pointer) };
 	}
 
-	fn poll(&mut self, timeout: Option<Duration>) -> io::Result<u64> {
+	fn poll(&mut self, timeout: Option<Duration>, _park: &Park) -> io::Result<u64> {
 		if let Some((id, _)) = self.ready.front() {
 			return Ok(*id);
 		}

@@ -18,6 +18,7 @@ use rustix::io::Errno;
 use super::Backend;
 use crate::backend::Config;
 use crate::event::Event;
+use crate::park::Park;
 
 const MIN_RING_ENTRIES: u32 = 2;
 
@@ -224,7 +225,7 @@ fn borrowed(event: &Event) -> BorrowedFd<'_> {
 }
 
 impl Uring {
-	pub(super) fn new(config: &Config) -> io::Result<(Uring, Event)> {
+	pub(super) fn new(config: &Config, _embedded: bool) -> io::Result<(Uring, Event)> {
 		let mut builder = IoUring::builder();
 		if config.iopoll {
 			builder.setup_iopoll();
@@ -257,22 +258,6 @@ impl Uring {
 			},
 			event,
 		))
-	}
-
-	/// Reads the notification fd back to zero: a counter left raised makes the next armed poll complete at once, ending the wait early.
-	fn drain_notification(&self) -> io::Result<()> {
-		let Some(event) = self.completion.as_ref() else {
-			return Ok(());
-		};
-		loop {
-			match rustix::io::read(borrowed(event), &mut [0u8; 8]) {
-				Ok(_) => break,
-				Err(Errno::AGAIN) => break,
-				Err(Errno::INTR) => continue,
-				Err(error) => return Err(error.into()),
-			}
-		}
-		Ok(())
 	}
 
 	/// Polling the notification fd makes external wakes visible to `enter_wait`.
@@ -334,12 +319,17 @@ impl Uring {
 	}
 
 	/// IOPOLL must actively poll the device; without a timeout, spin until completion.
-	fn poll_devices(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+	fn poll_devices(&mut self, timeout: Option<Duration>, park: &Park) -> io::Result<()> {
 		let start = Instant::now();
 		loop {
 			self.drive()?;
 			self.reap()?;
 			if !self.ready.is_empty() {
+				return Ok(());
+			}
+			// An IOPOLL ring has no doorbell, so a cross-thread wake is only in
+			// the state word: see it within one spin instead of to the timeout.
+			if park.woke() {
 				return Ok(());
 			}
 			if self.active.is_empty() {
@@ -759,12 +749,12 @@ impl Backend for Uring {
 		let _ = push(&mut self.ring, entry).and_then(|()| self.ring.submit());
 	}
 
-	fn poll(&mut self, timeout: Option<Duration>) -> io::Result<u64> {
+	fn poll(&mut self, timeout: Option<Duration>, park: &Park) -> io::Result<u64> {
 		if let Some((id, _)) = self.ready.front() {
 			return Ok(*id);
 		}
 		if self.iopoll {
-			self.poll_devices(timeout)?;
+			self.poll_devices(timeout, park)?;
 		} else if timeout == Some(Duration::ZERO) {
 			// Only clear notifications after a wait; a nonblocking poll must not consume an unseen cross-thread wake.
 			self.ring.submit()?;
@@ -805,6 +795,22 @@ impl Backend for Uring {
 				"IOPOLL only completes while polling, so it has no poll_fd",
 			)),
 		}
+	}
+
+	/// Reads the notification fd back to zero: a counter left raised makes the next armed poll complete at once, ending the wait early. An external poller drains it before driving, so a completion or a wake raised afterwards re-raises it.
+	fn drain_notification(&mut self) -> io::Result<()> {
+		let Some(event) = self.completion.as_ref() else {
+			return Ok(());
+		};
+		loop {
+			match rustix::io::read(borrowed(event), &mut [0u8; 8]) {
+				Ok(_) => break,
+				Err(Errno::AGAIN) => break,
+				Err(Errno::INTR) => continue,
+				Err(error) => return Err(error.into()),
+			}
+		}
+		Ok(())
 	}
 }
 
@@ -856,7 +862,7 @@ mod tests {
 	/// feature, unless the `iowait` feature withholds it.
 	#[test]
 	fn the_no_iowait_flag_follows_the_kernel_and_the_feature() -> io::Result<()> {
-		let (mut uring, _event) = Uring::new(&Config::default())?;
+		let (mut uring, _event) = Uring::new(&Config::default(), false)?;
 		uring.no_iowait = false;
 		assert!(!uring.wait_flags().contains(EnterFlags::NO_IOWAIT));
 		uring.no_iowait = true;
@@ -871,10 +877,11 @@ mod tests {
 	/// a raise on the notification still ends it.
 	#[test]
 	fn a_blocking_wait_works_without_the_feature() -> io::Result<()> {
-		let (mut uring, event) = Uring::new(&Config::default())?;
+		let (mut uring, event) = Uring::new(&Config::default(), false)?;
+		let park = Park::new(event.clone(), false);
 		uring.no_iowait = false;
 		let start = Instant::now();
-		let waited = uring.poll(Some(Duration::from_millis(5)));
+		let waited = uring.poll(Some(Duration::from_millis(5)), &park);
 		assert!(
 			matches!(waited, Err(ref error) if error.kind() == io::ErrorKind::WouldBlock),
 			"an empty wait reports nothing completed: {waited:?}"
@@ -890,7 +897,7 @@ mod tests {
 			raiser.notify().expect("raise the wake-up");
 		});
 		let start = Instant::now();
-		let _ = uring.poll(Some(Duration::from_secs(5)));
+		let _ = uring.poll(Some(Duration::from_secs(5)), &park);
 		assert!(
 			start.elapsed() < Duration::from_secs(4),
 			"the raise did not wake the wait"

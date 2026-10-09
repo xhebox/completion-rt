@@ -14,14 +14,14 @@ pub struct Extent {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Extents(SmallVec<[Extent; 2]>);
+pub struct Extents(SmallVec<[Extent; 2]>);
 
 impl Extents {
 	pub(crate) fn new() -> Extents {
 		Extents(SmallVec::new())
 	}
 
-	pub(crate) fn from_slice(extents: &[Extent]) -> Extents {
+	pub fn from_slice(extents: &[Extent]) -> Extents {
 		Extents(SmallVec::from_slice(extents))
 	}
 
@@ -29,7 +29,7 @@ impl Extents {
 		self.0.push(extent);
 	}
 
-	pub(crate) fn skip(&self, bytes: usize) -> Extents {
+	pub fn skip(&self, bytes: usize) -> Extents {
 		let mut remaining = bytes;
 		let mut out = Extents::new();
 		for extent in &self.0 {
@@ -46,7 +46,7 @@ impl Extents {
 		out
 	}
 
-	pub(crate) fn len_bytes(&self) -> usize {
+	pub fn len_bytes(&self) -> usize {
 		self.0
 			.iter()
 			.fold(0, |len, extent| len.saturating_add(extent.len))

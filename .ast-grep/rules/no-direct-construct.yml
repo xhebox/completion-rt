@@ -16,7 +16,7 @@ severity: error
 # (the last segment), and a deep search would match that instead of the whole
 # path.
 files:
-  - src/**
+  - crates/**/src/**
 rule:
   kind: struct_expression
   all:

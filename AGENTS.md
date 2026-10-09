@@ -6,19 +6,19 @@ Use `task build`, `task check` and `task test`. `task check` verifies formatting
 
 ## Logging
 
-The library uses only the `log` facade; embedders install the logger. Tests under `tests/` get one from `tests/common`. Diagnosis is `log::debug!` with structured fields, tracing is `log::trace!`.
+The library uses only the `log` facade; embedders install the logger. Tests under `crates/completion-async/tests/` get one from `crates/completion-async/tests/common`. Diagnosis is `log::debug!` with structured fields, tracing is `log::trace!`.
 
 ## Tests
 
-Test through the public API in `tests/`. Don't add unit tests after writing code. Test a part in isolation only when the public API cannot reach the failure, and write down how it fails before writing it. A bug fix starts with a test that fails without the fix; a test that still passes with the fix reverted is removed.
+Test through the public API in `crates/completion-async/tests/`. Don't add unit tests after writing code. Test a part in isolation only when the public API cannot reach the failure, and write down how it fails before writing it. A bug fix starts with a test that fails without the fix; a test that still passes with the fix reverted is removed.
 
 ## Test Scratch
 
-Use `common::tempdir(tag)` in `tests/`, never `tempfile` or `std::env::temp_dir()` directly.
+Use `common::tempdir(tag)` in `crates/completion-async/tests/`, never `tempfile` or `std::env::temp_dir()` directly.
 
 ## FFI
 
-`libc` is allowed only in `src/backend/uring.rs` and `src/backend/portable.rs`; everything else uses `rustix` or std.
+`libc` is allowed only in `crates/completion-rt/src/backend/uring.rs` and `crates/completion-rt/src/backend/portable.rs`; everything else uses `rustix` or std.
 
 ## Comments
 

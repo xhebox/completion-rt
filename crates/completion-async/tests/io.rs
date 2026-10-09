@@ -6,12 +6,15 @@ use common::block_on;
 
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
 
-use completion_rt::{
-	Completion, Config, Error, Extent, Facade, File, Handle, OpenOptions, Reactor, Response,
-	Transfer,
-};
+use completion_async::{Config, Error, Executor, Extent, Facade, File, Memory, OpenOptions};
+
+/// The async driver the file operations run on: it owns the reactor, so
+/// `block_on` both polls the operation and drives the backend under it.
+fn executor() -> Executor {
+	common::init_logging();
+	Executor::new(Config::default()).unwrap()
+}
 
 #[test]
 fn a_direct_open_asks_the_kernel_for_direct_io() {
@@ -43,35 +46,33 @@ fn a_direct_open_asks_the_kernel_for_direct_io() {
 	}
 }
 
-/// Polls until the operation is done, then takes the result: the reactor has no
-/// thread of its own, so the caller drives it.
-fn run(reactor: &mut Reactor, completion: Completion) -> io::Result<Response> {
-	while !reactor.is_idle() {
-		reactor.poll(Some(Duration::from_millis(1))).unwrap();
-	}
-	block_on(completion).1
-}
-
 /// A pipe is not seekable, so the vector path must not insist on an offset:
 /// the console's rotated output and its stdin are pipes.
 #[test]
 fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 	let (reader, writer) = std::io::pipe().unwrap();
-	let reader = Handle::new(reader);
-	let writer = Handle::new(writer);
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let mut executor = executor();
+	let submitter = executor.submitter();
+	let reader: Facade<std::io::PipeReader> = Facade::new(reader, &submitter);
+	let writer: Facade<std::io::PipeWriter> = Facade::new(writer, &submitter);
 
 	let payload: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
-	let completion = submitter
-		.write(&writer, 0, payload.clone(), [Extent { offset: 0, len: 5 }])
+	let memory: Arc<dyn Memory> = Arc::clone(&payload) as Arc<dyn Memory>;
+	let moved = executor
+		.block_on(writer.write_vectored_at(memory, [Extent { offset: 0, len: 5 }], 0))
+		.unwrap()
+		.into_result()
 		.unwrap();
-	assert_eq!(run(&mut reactor, completion).unwrap().count().unwrap(), 5);
+	assert_eq!(moved, 5);
 
 	let read: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
-	let completion = submitter
-		.read(&reader, 0, read.clone(), [Extent { offset: 0, len: 5 }])
+	let memory: Arc<dyn Memory> = Arc::clone(&read) as Arc<dyn Memory>;
+	let moved = executor
+		.block_on(reader.read_vectored_at(memory, [Extent { offset: 0, len: 5 }], 0))
+		.unwrap()
+		.into_result()
 		.unwrap();
-	assert_eq!(run(&mut reactor, completion).unwrap().count().unwrap(), 5);
+	assert_eq!(moved, 5);
 	assert_eq!(&read[..], b"hello");
 }
 
@@ -83,31 +84,59 @@ fn the_vector_path_goes_through_the_backing() {
 	let directory = common::tempdir("completion-vector").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
-	let file = Handle::new(
+	let mut executor = executor();
+	let submitter = executor.submitter();
+	let file: File = Facade::new(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
+		&submitter,
 	);
 	let range = [Extent { offset: 0, len: 7 }];
 
 	let source: Arc<Vec<u8>> = Arc::new(b"payload".to_vec());
-	let completion = submitter.write(&file, 0, source, range).unwrap();
-	assert_eq!(run(&mut reactor, completion).unwrap().count().unwrap(), 7);
+	let memory: Arc<dyn Memory> = Arc::clone(&source) as Arc<dyn Memory>;
+	assert_eq!(
+		executor
+			.block_on(file.write_vectored_at(memory, range, 0))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		7
+	);
 
 	let sink: Arc<Vec<u8>> = Arc::new(vec![0; 7]);
-	let completion = submitter.read(&file, 0, sink.clone(), range).unwrap();
-	assert_eq!(run(&mut reactor, completion).unwrap().count().unwrap(), 7);
+	let memory: Arc<dyn Memory> = Arc::clone(&sink) as Arc<dyn Memory>;
+	assert_eq!(
+		executor
+			.block_on(file.read_vectored_at(memory, range, 0))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		7
+	);
 
-	let completion = submitter.write(&file, 7, sink, range).unwrap();
-	assert_eq!(run(&mut reactor, completion).unwrap().count().unwrap(), 7);
+	let memory: Arc<dyn Memory> = Arc::clone(&sink) as Arc<dyn Memory>;
+	assert_eq!(
+		executor
+			.block_on(file.write_vectored_at(memory, range, 7))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		7
+	);
 	let whole: Arc<Vec<u8>> = Arc::new(vec![0; 14]);
-	let completion = submitter
-		.read(&file, 0, whole.clone(), [Extent { offset: 0, len: 14 }])
-		.unwrap();
-	assert_eq!(run(&mut reactor, completion).unwrap().count().unwrap(), 14);
+	let memory: Arc<dyn Memory> = Arc::clone(&whole) as Arc<dyn Memory>;
+	assert_eq!(
+		executor
+			.block_on(file.read_vectored_at(memory, [Extent { offset: 0, len: 14 }], 0))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		14
+	);
 	assert_eq!(&whole[..], b"payloadpayload");
 }
 
@@ -119,20 +148,17 @@ fn read_exact_at_reports_the_file_ending_first() {
 	let directory = common::tempdir("completion-read-exact").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
-	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let mut executor = executor();
+	let submitter = executor.submitter();
 	let file = File::new(std::fs::File::open(&path).unwrap(), &submitter);
-
-	let mut reactor = reactor;
-	let driven = std::thread::spawn(move || {
-		while !reactor.is_stopped() {
-			reactor.poll(None).unwrap();
-		}
-	});
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
 	// One call: five bytes are left, and that is what it reports.
+	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
 	assert_eq!(
-		block_on(file.read_at(buffer.clone(), 0))
+		executor
+			.block_on(file.read_at(memory, 0))
+			.unwrap()
 			.into_result()
 			.unwrap(),
 		5
@@ -142,7 +168,8 @@ fn read_exact_at_reports_the_file_ending_first() {
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
 	// The loop stops where the file does, and the progress it made is the
 	// bytes it did bring back, not the whole buffer.
-	let outcome = block_on(file.read_exact_at(buffer.clone(), 0));
+	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
+	let outcome = executor.block_on(file.read_exact_at(memory, 0)).unwrap();
 	assert_eq!(outcome.value, 5);
 	assert_eq!(&buffer[..5], b"hello", "what did arrive stays");
 	match outcome
@@ -152,9 +179,6 @@ fn read_exact_at_reports_the_file_ending_first() {
 		Error::Io(error) => assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof),
 		other => panic!("a loop that ran out of file reports an io error, not {other:?}"),
 	}
-
-	submitter.stop();
-	driven.join().unwrap();
 }
 
 /// `write_all_at` writes past one call's worth: a payload larger than a page
@@ -164,7 +188,8 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	let directory = common::tempdir("completion-write-all").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
-	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let mut executor = executor();
+	let submitter = executor.submitter();
 	let file = File::new(
 		OpenOptions::new()
 			.read(true)
@@ -174,28 +199,24 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 		&submitter,
 	);
 
-	let mut reactor = reactor;
-	let driven = std::thread::spawn(move || {
-		while !reactor.is_stopped() {
-			reactor.poll(None).unwrap();
-		}
-	});
-
 	let len = 4 << 20;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
-	block_on(file.write_all_at(payload.clone(), 0))
+	let memory: Arc<dyn Memory> = Arc::clone(&payload) as Arc<dyn Memory>;
+	executor
+		.block_on(file.write_all_at(memory, 0))
+		.unwrap()
 		.into_result()
 		.unwrap();
-	block_on(file.sync()).unwrap();
+	executor.block_on(file.sync()).unwrap().unwrap();
 
 	let read: Arc<Vec<u8>> = Arc::new(vec![0; len]);
-	block_on(file.read_exact_at(read.clone(), 0))
+	let memory: Arc<dyn Memory> = Arc::clone(&read) as Arc<dyn Memory>;
+	executor
+		.block_on(file.read_exact_at(memory, 0))
+		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(*read, *payload, "the payload did not come back whole");
-
-	submitter.stop();
-	driven.join().unwrap();
 }
 
 /// The facade binds the file to the submitter, so a call site names neither an
@@ -205,31 +226,33 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	let directory = common::tempdir("completion-facade").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
-	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let mut executor = executor();
+	let submitter = executor.submitter();
 	let file = OpenOptions::new()
 		.read(true)
 		.write(true)
 		.open(&path)
 		.unwrap();
-	let file = Facade::new(file, &submitter);
-
-	let mut reactor = reactor;
-	let driven = std::thread::spawn(move || {
-		while !reactor.is_stopped() {
-			reactor.poll(None).unwrap();
-		}
-	});
+	let file: File = Facade::new(file, &submitter);
 
 	let written: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
+	let memory: Arc<dyn Memory> = Arc::clone(&written) as Arc<dyn Memory>;
 	assert_eq!(
-		block_on(file.write_at(written, 0)).into_result().unwrap(),
+		executor
+			.block_on(file.write_at(memory, 0))
+			.unwrap()
+			.into_result()
+			.unwrap(),
 		5
 	);
-	block_on(file.sync()).unwrap();
+	executor.block_on(file.sync()).unwrap().unwrap();
 
 	let read: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
+	let memory: Arc<dyn Memory> = Arc::clone(&read) as Arc<dyn Memory>;
 	assert_eq!(
-		block_on(file.read_at(read.clone(), 0))
+		executor
+			.block_on(file.read_at(memory, 0))
+			.unwrap()
 			.into_result()
 			.unwrap(),
 		5
@@ -242,9 +265,6 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 		panic!("the facade still holds the file");
 	};
 	drop(plain);
-
-	submitter.stop();
-	driven.join().unwrap();
 }
 
 /// A facade nothing else names gives its file back at once: a take resolves on
@@ -254,7 +274,8 @@ fn a_facade_with_no_operations_gives_its_file_back_at_once() {
 	let directory = common::tempdir("completion-take").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"data").unwrap();
-	let (_reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let executor = executor();
+	let submitter = executor.submitter();
 	let file = File::new(std::fs::File::open(&path).unwrap(), &submitter);
 
 	let plain = block_on(file.take()).expect("nothing else names the file");
@@ -266,6 +287,8 @@ fn a_facade_with_no_operations_gives_its_file_back_at_once() {
 /// first poll, and still drive the transfer to its end.
 #[test]
 fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
+	use completion_async::Transfer;
+
 	/// What one hand-written poll loop holds across its polls.
 	struct Reading {
 		file: Option<File>,
@@ -281,18 +304,13 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	let directory = common::tempdir("completion-future-outlives").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
-	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let mut executor = executor();
+	let submitter = executor.submitter();
 	let file = File::new(std::fs::File::open(&path).unwrap(), &submitter);
 
-	let mut reactor = reactor;
-	let driven = std::thread::spawn(move || {
-		while !reactor.is_stopped() {
-			reactor.poll(None).unwrap();
-		}
-	});
-
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
-	let read = assert_static(file.read_at(buffer.clone(), 0));
+	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
+	let read = assert_static(file.read_at(memory, 0));
 	let mut reading = Reading {
 		file: Some(file),
 		read,
@@ -301,11 +319,15 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	// clone of the handle.
 	drop(reading.file.take());
 
-	assert_eq!(block_on(reading.read).into_result().unwrap(), 5);
+	assert_eq!(
+		executor
+			.block_on(reading.read)
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		5
+	);
 	assert_eq!(&buffer[..], b"hello");
-
-	submitter.stop();
-	driven.join().unwrap();
 }
 
 /// `flush` reports the file's deferred write-back errors by closing a
@@ -315,7 +337,8 @@ fn flush_leaves_the_facade_usable() {
 	let directory = common::tempdir("completion-flush").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
-	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let mut executor = executor();
+	let submitter = executor.submitter();
 	let file = File::new(
 		OpenOptions::new()
 			.read(true)
@@ -325,33 +348,33 @@ fn flush_leaves_the_facade_usable() {
 		&submitter,
 	);
 
-	let mut reactor = reactor;
-	let driven = std::thread::spawn(move || {
-		while !reactor.is_stopped() {
-			reactor.poll(None).unwrap();
-		}
-	});
-
 	let first: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
-	block_on(file.write_all_at(first, 0)).into_result().unwrap();
-	block_on(file.flush()).unwrap();
+	let memory: Arc<dyn Memory> = Arc::clone(&first) as Arc<dyn Memory>;
+	executor
+		.block_on(file.write_all_at(memory, 0))
+		.unwrap()
+		.into_result()
+		.unwrap();
+	executor.block_on(file.flush()).unwrap().unwrap();
 
 	// The duplicate the flush closed was not the facade's descriptor: the same
 	// facade still writes and reads.
 	let second: Arc<Vec<u8>> = Arc::new(b"world".to_vec());
-	block_on(file.write_all_at(second, 5))
+	let memory: Arc<dyn Memory> = Arc::clone(&second) as Arc<dyn Memory>;
+	executor
+		.block_on(file.write_all_at(memory, 5))
+		.unwrap()
 		.into_result()
 		.unwrap();
 
 	let read: Arc<Vec<u8>> = Arc::new(vec![0; 10]);
-	block_on(file.read_exact_at(read.clone(), 0))
+	let memory: Arc<dyn Memory> = Arc::clone(&read) as Arc<dyn Memory>;
+	executor
+		.block_on(file.read_exact_at(memory, 0))
+		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(&read[..], b"helloworld");
-
-	drop(file);
-	submitter.stop();
-	driven.join().unwrap();
 }
 
 /// A descriptor nothing owns anymore: `flush` must report the error rather than
@@ -361,7 +384,8 @@ fn flush_leaves_the_facade_usable() {
 fn flush_reports_a_descriptor_that_is_not_open() {
 	use std::os::fd::{AsRawFd, FromRawFd};
 
-	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let mut executor = executor();
+	let submitter = executor.submitter();
 
 	// Opened then closed, so the number is free and nothing owns it. Made after
 	// the reactor so no descriptor it built can have taken the number back.
@@ -373,15 +397,8 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 		raw
 	};
 
-	let mut reactor = reactor;
-	let driven = std::thread::spawn(move || {
-		while !reactor.is_stopped() {
-			reactor.poll(None).unwrap();
-		}
-	});
-
 	let file = File::new(unsafe { std::fs::File::from_raw_fd(dead) }, &submitter);
-	match block_on(file.flush()) {
+	match executor.block_on(file.flush()).unwrap() {
 		Err(Error::Io(error)) => assert_eq!(
 			error.raw_os_error(),
 			Some(rustix::io::Errno::BADF.raw_os_error()),
@@ -398,7 +415,4 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 		Err(_) => panic!("an operation still names the file"),
 	};
 	std::mem::forget(plain);
-
-	submitter.stop();
-	driven.join().unwrap();
 }

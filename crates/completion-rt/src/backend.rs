@@ -10,6 +10,7 @@ use crate::core::Response;
 use crate::desc::RawHandle;
 use crate::event::Event;
 use crate::memory::Extents;
+use crate::park::Park;
 use crate::{Memory, OwnedDescriptor};
 
 #[cfg(not(any(unix, windows)))]
@@ -22,15 +23,6 @@ mod portable;
 #[cfg(target_os = "linux")]
 mod uring;
 
-/// How completions are taken out of the backend.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PollMode {
-	/// The caller waits on [`crate::Reactor::poll_fd`] with its own poller.
-	Fd,
-	/// The caller calls [`crate::Reactor::poll`] itself.
-	Poll,
-}
-
 /// Configure the backend.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -39,7 +31,6 @@ pub struct Config {
 	pub iopoll: bool,
 	/// A kernel thread consumes submissions (`io_uring` SQPOLL).
 	pub sqpoll: bool,
-	pub wakeup: PollMode,
 }
 
 impl Default for Config {
@@ -48,14 +39,15 @@ impl Default for Config {
 			entries: 256,
 			iopoll: false,
 			sqpoll: false,
-			wakeup: PollMode::Poll,
 		}
 	}
 }
 
 impl Config {
-	pub(super) fn validate(&self) -> io::Result<()> {
-		if self.iopoll && self.wakeup == PollMode::Fd {
+	/// `embedded` is whether the reactor is built for an external poller; see
+	/// [`Reactor::embedded`](crate::Reactor::embedded).
+	pub(super) fn validate(&self, embedded: bool) -> io::Result<()> {
+		if self.iopoll && embedded {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
 				"IOPOLL only completes while polling, so it has no poll_fd",
@@ -136,11 +128,21 @@ pub(super) trait Backend: Send {
 	/// completion already buffered this reports it without entering again, and
 	/// only an empty buffer waits. `WouldBlock` says nothing completed — a
 	/// zero timeout means "do not wait for one".
-	fn poll(&mut self, timeout: Option<Duration>) -> io::Result<u64>;
+	///
+	/// `park` carries the reactor's wake state; a backend that spins rather than
+	/// waits (IOPOLL) uses it to see a cross-thread wake.
+	fn poll(&mut self, timeout: Option<Duration>, park: &Park) -> io::Result<u64>;
 
 	fn take(&mut self, id: u64) -> io::Result<Response>;
 
 	fn poll_fd(&self) -> io::Result<Event>;
+
+	/// Empties the notification a reactor built for an external poller wakes
+	/// on, so its level-triggered descriptor goes quiet. Only a backend that an
+	/// external poller can wait on has one to drain.
+	fn drain_notification(&mut self) -> io::Result<()> {
+		Ok(())
+	}
 }
 
 #[enum_dispatch]
@@ -153,14 +155,14 @@ pub(super) enum BackendEnum {
 	Portable(portable::Portable),
 }
 
-pub(super) fn create(config: &Config) -> io::Result<(BackendEnum, Event)> {
+pub(super) fn create(config: &Config, embedded: bool) -> io::Result<(BackendEnum, Event)> {
 	#[cfg(windows)]
 	use iocp::Iocp as BackendImpl;
 	#[cfg(all(unix, not(target_os = "linux")))]
 	use portable::Portable as BackendImpl;
 	#[cfg(target_os = "linux")]
 	use uring::Uring as BackendImpl;
-	let (backend, event) = BackendImpl::new(config)?;
+	let (backend, event) = BackendImpl::new(config, embedded)?;
 	Ok((backend.into(), event))
 }
 

@@ -7,13 +7,45 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::{Arc, Mutex, Weak as SyncWeak};
+use std::sync::{Arc, Mutex, PoisonError, Weak as SyncWeak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use crate::{Config, Reactor, Submitter};
+use completion_rt::{BorrowedDescriptor, Reactor, Submitter as LowSubmitter};
+
+use crate::Submitter;
 
 const TICK_BUDGET: usize = 64;
+
+/// Configure the executor's reactor.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+	pub entries: u32,
+	/// Completions appear only while polling (`io_uring` IOPOLL).
+	pub iopoll: bool,
+	/// A kernel thread consumes submissions (`io_uring` SQPOLL).
+	pub sqpoll: bool,
+}
+
+impl Default for Config {
+	fn default() -> Self {
+		Config {
+			entries: 256,
+			iopoll: false,
+			sqpoll: false,
+		}
+	}
+}
+
+impl Config {
+	fn into_rt(self) -> completion_rt::Config {
+		completion_rt::Config {
+			entries: self.entries,
+			iopoll: self.iopoll,
+			sqpoll: self.sqpoll,
+		}
+	}
+}
 
 /// A handle for spawning thread-local tasks while its executor exists.
 #[derive(Clone)]
@@ -134,7 +166,7 @@ impl<F: Future> Runnable for Job<F> {
 
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
 		if matches!(*self.join.borrow(), Join::Cancelled) {
-			crate::core::cancel_task_future(self.future.take());
+			completion_rt::cancel_task_future(self.future.take());
 			return Poll::Ready(());
 		}
 		let output = match self.future.as_mut().unwrap().as_mut().poll(cx) {
@@ -142,7 +174,7 @@ impl<F: Future> Runnable for Job<F> {
 			Poll::Ready(output) => output,
 		};
 		if matches!(*self.join.borrow(), Join::Cancelled) {
-			crate::core::cancel_task_future((self.future.take(), output));
+			completion_rt::cancel_task_future((self.future.take(), output));
 			return Poll::Ready(());
 		}
 		drop(self.future.take());
@@ -155,7 +187,7 @@ impl<F: Future> Runnable for Job<F> {
 				}
 			}
 			Join::Detached => drop(output),
-			Join::Cancelled => crate::core::cancel_task_future(output),
+			Join::Cancelled => completion_rt::cancel_task_future(output),
 			_ => unreachable!(),
 		}
 		Poll::Ready(())
@@ -204,6 +236,11 @@ impl Local {
 		}
 		!self.ready.state.lock().unwrap().queued.is_empty()
 	}
+
+	/// Whether a task is runnable but has not been polled this pass.
+	fn has_ready(&self) -> bool {
+		self.ready.has_ready()
+	}
 }
 
 impl Drop for Local {
@@ -228,8 +265,11 @@ struct Queue {
 }
 
 impl Ready {
+	// A waker can run while another task unwinds a panic, so a poisoned lock must
+	// not turn that wake into a second panic: take the inner queue back from the
+	// poison instead of propagating it.
 	fn enqueue(&self, id: u64) {
-		let mut queue = self.state.lock().unwrap();
+		let mut queue = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 		if queue.closed || !queue.queued.insert(id) {
 			return;
 		}
@@ -239,7 +279,7 @@ impl Ready {
 	}
 
 	fn dequeue(&self) -> Option<u64> {
-		let mut queue = self.state.lock().unwrap();
+		let mut queue = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 		while let Some(id) = queue.runnable.pop_front() {
 			if queue.queued.remove(&id) {
 				return Some(id);
@@ -248,13 +288,26 @@ impl Ready {
 		None
 	}
 
+	fn has_ready(&self) -> bool {
+		!self
+			.state
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.queued
+			.is_empty()
+	}
+
 	fn retire(&self, id: u64) {
 		// A task can wake itself and then finish; queued is authoritative over the remaining deque entry.
-		self.state.lock().unwrap().queued.remove(&id);
+		self.state
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.queued
+			.remove(&id);
 	}
 
 	fn close(&self) {
-		let mut queue = self.state.lock().unwrap();
+		let mut queue = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 		queue.closed = true;
 		queue.queued.clear();
 		queue.runnable.clear();
@@ -282,13 +335,25 @@ impl Wake for TaskWake {
 pub struct Executor {
 	// Drop the reactor first so in-flight I/O settles before task futures release their Completions.
 	reactor: Reactor,
-	submitter: Submitter,
+	submitter: LowSubmitter,
 	local: Rc<Local>,
 }
 
 impl Executor {
 	pub fn new(config: Config) -> io::Result<Executor> {
-		let (reactor, submitter) = Reactor::new(config)?;
+		let (reactor, submitter) = Reactor::new(config.into_rt())?;
+		Ok(Executor::assemble(reactor, submitter))
+	}
+
+	/// An executor for a caller that owns the poll loop: it hands out
+	/// [`Executor::poll_fd`] to wait on and [`Executor::turn`] to drive the
+	/// reactor once per wake.
+	pub fn embedded(config: Config) -> io::Result<Executor> {
+		let (reactor, submitter) = Reactor::embedded(config.into_rt())?;
+		Ok(Executor::assemble(reactor, submitter))
+	}
+
+	fn assemble(reactor: Reactor, submitter: LowSubmitter) -> Executor {
 		let driver = Waker::from(Arc::new(reactor.waker()));
 		let local = Rc::new(Local {
 			tasks: RefCell::new(HashMap::new()),
@@ -302,20 +367,53 @@ impl Executor {
 			}),
 			next_id: Cell::new(0),
 		});
-		Ok(Executor {
+		Executor {
 			reactor,
 			submitter,
 			local,
-		})
+		}
 	}
 
 	pub fn submitter(&self) -> Submitter {
-		self.submitter.clone()
+		Submitter(self.submitter.clone())
 	}
 
 	pub fn spawner(&self) -> Spawner {
 		Spawner {
 			local: Rc::downgrade(&self.local),
+		}
+	}
+
+	/// The descriptor to wait on between passes, for an executor built with
+	/// [`Executor::embedded`].
+	pub fn poll_fd(&self) -> io::Result<BorrowedDescriptor<'_>> {
+		self.reactor.poll_fd()
+	}
+
+	/// One pass of the reactor, for a caller that waits on
+	/// [`Executor::poll_fd`] with its own poller: it drains the descriptor the
+	/// poller woke on, runs the tasks spawned through [`Executor::spawner`],
+	/// then hands what they submitted to the reactor and reaps.
+	///
+	/// Returns how long the caller may wait on [`Executor::poll_fd`] before
+	/// calling this again: [`Duration::ZERO`] while tasks are still ready, so
+	/// the caller comes straight back; otherwise the time to the next timer
+	/// deadline, or `None` if there is none, meaning wait on the descriptor
+	/// alone.
+	pub fn turn(&mut self) -> io::Result<Option<Duration>> {
+		let reactor = &mut self.reactor;
+		reactor.enter_reactor();
+		// Drain first: a completion or a wake raised after this re-raises the
+		// descriptor, so the caller can wait on it again rather than spin.
+		reactor.drain_notification()?;
+		self.local.tick(TICK_BUDGET);
+		let deadline = reactor.turn()?;
+		// The pass may have readied tasks — a completion or a due timer — and
+		// they must run before the caller waits again.
+		if self.local.has_ready() {
+			Ok(Some(Duration::ZERO))
+		} else {
+			Ok(deadline)
 		}
 	}
 

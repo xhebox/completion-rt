@@ -6,9 +6,9 @@ use std::panic::Location;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::memory::Extents;
+use completion_rt::{AsDescriptor, Extent, Extents, Handle, Memory, Submitter};
+
 use crate::net::{Kind, Op, Transfer, whole};
-use crate::{AsDescriptor, Extent, Handle, Memory, Submitter};
 
 /// `std::fs::OpenOptions` plus direct I/O, and on Windows the overlapped flag
 /// the iocp backend needs.
@@ -108,7 +108,8 @@ impl OpenOptions {
 	}
 }
 
-/// An owned resource with async operations submitted through a [`Submitter`].
+/// An owned resource with async operations submitted through a
+/// [`Submitter`](crate::Submitter).
 pub struct Facade<S> {
 	handle: Handle<S>,
 	submitter: Submitter,
@@ -116,10 +117,19 @@ pub struct Facade<S> {
 
 impl<S> Facade<S> {
 	/// Wraps `resource`, its operations going to `submitter`.
-	pub fn new(resource: impl Into<S>, submitter: &Submitter) -> Facade<S> {
+	pub fn new(resource: impl Into<S>, submitter: &crate::Submitter) -> Facade<S> {
 		Self {
 			handle: Handle::new(resource.into()),
-			submitter: submitter.clone(),
+			submitter: submitter.0.clone(),
+		}
+	}
+
+	/// Wraps a `handle` the caller already holds, its operations going to
+	/// `submitter`; the facade shares the handle rather than taking it over.
+	pub fn bind(handle: Handle<S>, submitter: &crate::Submitter) -> Facade<S> {
+		Self {
+			handle,
+			submitter: submitter.0.clone(),
 		}
 	}
 
@@ -160,12 +170,12 @@ impl<S> Clone for Facade<S> {
 
 pub type File = Facade<fs::File>;
 
-impl Facade<fs::File> {
+impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	/// Reads the whole of `mem` at `fdoff`, in one call: a short count is what
 	/// the call moved, not an error. [`read_exact_at`](Self::read_exact_at)
 	/// loops.
 	#[track_caller]
-	pub fn read_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<fs::File> {
+	pub fn read_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<S> {
 		let extents = whole(&*mem);
 		Transfer::new(self, Location::caller(), Kind::Read { fdoff }, mem, extents)
 	}
@@ -176,7 +186,7 @@ impl Facade<fs::File> {
 		mem: Arc<dyn Memory>,
 		ranges: impl IntoIterator<Item = Extent>,
 		fdoff: u64,
-	) -> Transfer<fs::File> {
+	) -> Transfer<S> {
 		let extents: Extents = ranges.into_iter().collect();
 		Transfer::new(self, Location::caller(), Kind::Read { fdoff }, mem, extents)
 	}
@@ -187,7 +197,7 @@ impl Facade<fs::File> {
 	/// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) when the file ends
 	/// first.
 	#[track_caller]
-	pub fn read_exact_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<fs::File> {
+	pub fn read_exact_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<S> {
 		let extents = whole(&*mem);
 		Transfer::new(
 			self,
@@ -204,7 +214,7 @@ impl Facade<fs::File> {
 		mem: Arc<dyn Memory>,
 		ranges: impl IntoIterator<Item = Extent>,
 		fdoff: u64,
-	) -> Transfer<fs::File> {
+	) -> Transfer<S> {
 		let extents: Extents = ranges.into_iter().collect();
 		Transfer::new(
 			self,
@@ -219,7 +229,7 @@ impl Facade<fs::File> {
 	/// the call moved, not an error. [`write_all_at`](Self::write_all_at)
 	/// loops.
 	#[track_caller]
-	pub fn write_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<fs::File> {
+	pub fn write_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<S> {
 		let extents = whole(&*mem);
 		Transfer::new(
 			self,
@@ -236,7 +246,7 @@ impl Facade<fs::File> {
 		mem: Arc<dyn Memory>,
 		ranges: impl IntoIterator<Item = Extent>,
 		fdoff: u64,
-	) -> Transfer<fs::File> {
+	) -> Transfer<S> {
 		let extents: Extents = ranges.into_iter().collect();
 		Transfer::new(
 			self,
@@ -252,7 +262,7 @@ impl Facade<fs::File> {
 	///
 	/// [`WriteZero`](io::ErrorKind::WriteZero) when a call writes nothing.
 	#[track_caller]
-	pub fn write_all_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<fs::File> {
+	pub fn write_all_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<S> {
 		let extents = whole(&*mem);
 		Transfer::new(
 			self,
@@ -269,7 +279,7 @@ impl Facade<fs::File> {
 		mem: Arc<dyn Memory>,
 		ranges: impl IntoIterator<Item = Extent>,
 		fdoff: u64,
-	) -> Transfer<fs::File> {
+	) -> Transfer<S> {
 		let extents: Extents = ranges.into_iter().collect();
 		Transfer::new(
 			self,
@@ -281,19 +291,19 @@ impl Facade<fs::File> {
 	}
 
 	#[track_caller]
-	pub fn sync(&self) -> Op<fs::File> {
+	pub fn sync(&self) -> Op<S> {
 		Op::new(self, Location::caller(), Submitter::fsync_at)
 	}
 
-	/// Reports the file's pending deferred write-back errors — `ENOSPC`, `EIO`
-	/// and the like — without forcing anything to disk.
+	/// Reports the resource's pending deferred write-back errors — `ENOSPC`,
+	/// `EIO` and the like — without forcing anything to disk.
 	///
 	/// This is not [`Write::flush`](std::io::Write::flush): it names no buffer
 	/// of the caller's, and it does not make the data durable — [`sync`](Self::sync)
 	/// is what does that. What it reports is the error the filesystem had
-	/// deferred and would otherwise surface at the file's next close.
+	/// deferred and would otherwise surface at the resource's next close.
 	#[track_caller]
-	pub fn flush(&self) -> Op<fs::File> {
+	pub fn flush(&self) -> Op<S> {
 		Op::new(self, Location::caller(), Submitter::flush_at)
 	}
 }

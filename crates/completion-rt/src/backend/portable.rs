@@ -16,6 +16,7 @@ use crate::core::Response;
 use crate::desc::{RawHandle, from_raw_socket};
 use crate::event::Event as Wakeup;
 use crate::memory::Extents;
+use crate::park::Park;
 use crate::{Memory, OwnedDescriptor};
 
 use super::Backend;
@@ -84,6 +85,10 @@ struct Poll {
 	direction: Direction,
 }
 
+/// A pool job's wake rings the same doorbell the reactor's `Park` holds — the
+/// `Wakeup` `Portable::new` returns, which the reactor hands to its `Park`.
+/// It does not go through `Park::unpark`: a finished job only needs the reactor
+/// to reap it, not the executor to tick.
 struct PoolWake(Wakeup);
 
 impl Wake for PoolWake {
@@ -115,17 +120,17 @@ pub(crate) struct Portable {
 }
 
 impl Portable {
-	pub(super) fn new(config: &super::Config) -> io::Result<(Portable, Wakeup)> {
+	pub(super) fn new(config: &super::Config, embedded: bool) -> io::Result<(Portable, Wakeup)> {
 		if config.iopoll || config.sqpoll {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
 				"this backend has no IOPOLL or SQPOLL mode",
 			));
 		}
-		if config.wakeup == super::PollMode::Fd {
+		if embedded {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
-				"a poller has no descriptor a foreign poller can wait on; use PollMode::Poll",
+				"a poller has no descriptor a foreign poller can wait on",
 			));
 		}
 		let poller = Poller::new()?;
@@ -579,7 +584,7 @@ impl Backend for Portable {
 			.push_back((id, Err(rustix::io::Errno::CANCELED.into())));
 	}
 
-	fn poll(&mut self, timeout: Option<Duration>) -> io::Result<u64> {
+	fn poll(&mut self, timeout: Option<Duration>, _park: &Park) -> io::Result<u64> {
 		if let Some((id, _)) = self.done.front() {
 			return Ok(*id);
 		}
@@ -874,7 +879,7 @@ mod tests {
 	/// Closed-descriptor deregistration differs by poller: epoll may reject it, while kqueue may have removed it already. Either outcome must discard the registration.
 	#[test]
 	fn a_deregistration_of_a_closed_descriptor_leaves_no_key_behind() {
-		let (mut backend, _event) = Portable::new(&Config::default()).unwrap();
+		let (mut backend, _event) = Portable::new(&Config::default(), false).unwrap();
 		let (reader, _writer) = std::io::pipe().unwrap();
 		let token = 7;
 		let fd = RawHandle::from_descriptor(reader.as_descriptor());
@@ -896,7 +901,7 @@ mod tests {
 	/// Simulate a poller that lost the source before deregistration; stale readiness must not retain or dispatch the old key.
 	#[test]
 	fn a_refused_deregistration_leaves_no_key_behind() {
-		let (mut backend, _event) = Portable::new(&Config::default()).unwrap();
+		let (mut backend, _event) = Portable::new(&Config::default(), false).unwrap();
 		let (reader, _writer) = std::io::pipe().unwrap();
 		let token = 7;
 		let fd = RawHandle::from_descriptor(reader.as_descriptor());

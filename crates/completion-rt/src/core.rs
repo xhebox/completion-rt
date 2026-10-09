@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError, Weak};
 use std::task::{Context, Poll, Wake, Waker};
-use std::thread::{self, ThreadId};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::desc::{BorrowedDescriptor, RawDescriptor, RawHandle};
@@ -18,8 +18,8 @@ use crate::memory::Extents;
 use crate::{AsDescriptor, Extent, Memory, OwnedDescriptor, OwnedSocket};
 
 use crate::backend::{self, Backend, BackendEnum, Config, create};
-use crate::channel;
 use crate::event::Event;
+use crate::park::Park;
 
 /// Completed operation result.
 #[derive(Debug)]
@@ -222,7 +222,7 @@ impl Core {
 
 	fn wait(&mut self, shared: &Shared, timeout: Option<Duration>) -> io::Result<()> {
 		let within = shared.events.lock().unwrap().within(timeout);
-		match self.backend.poll(within) {
+		match self.backend.poll(within, &shared.park) {
 			Ok(id) => self.settle(shared, id),
 			Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
 			Err(error) => return Err(error),
@@ -262,7 +262,7 @@ impl Core {
 
 	fn reap(&mut self, shared: &Shared) -> io::Result<()> {
 		loop {
-			match self.backend.poll(Some(Duration::ZERO)) {
+			match self.backend.poll(Some(Duration::ZERO), &shared.park) {
 				Ok(id) => self.settle(shared, id),
 				Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
 				Err(error) => return Err(error),
@@ -505,35 +505,18 @@ struct Shared {
 	/// Wake outside this lock: a waker may re-enter the operation table.
 	events: Mutex<Events>,
 	event: Event,
+	park: Park,
 	stopped: AtomicBool,
-	parked: AtomicBool,
-	/// A driver-thread wake must prevent the next poll from sleeping.
-	ready: AtomicBool,
 	core: Mutex<Core>,
 	cancelled: fn(&io::Error) -> bool,
 	settled: Condvar,
-	reactor_thread: Mutex<Option<ThreadId>>,
 	poll_fd: io::Result<Event>,
+	/// Whether the reactor was built for an external poller; only then does
+	/// [`Reactor::poll_fd`] hand out a descriptor.
+	embedded: bool,
 }
 
 impl Shared {
-	fn enter_reactor(&self) {
-		*self.reactor_thread.lock().unwrap() = Some(thread::current().id());
-	}
-
-	fn on_reactor_thread(&self) -> bool {
-		*self.reactor_thread.lock().unwrap() == Some(thread::current().id())
-	}
-
-	/// Cross-thread wakes must notify unconditionally to cover the gap between draining and parking.
-	fn wake_reactor(&self) {
-		if self.on_reactor_thread() {
-			self.ready.store(true, Ordering::Release);
-		} else {
-			let _ = self.event.notify();
-		}
-	}
-
 	fn is_settled(&self, id: u64) -> bool {
 		self.is_settled_locked(&self.events.lock().unwrap(), id)
 	}
@@ -549,7 +532,8 @@ impl Shared {
 	}
 }
 
-pub(super) struct ReactorWaker {
+#[doc(hidden)]
+pub struct ReactorWaker {
 	shared: Arc<Shared>,
 }
 
@@ -565,7 +549,7 @@ impl Wake for ReactorWaker {
 	}
 
 	fn wake_by_ref(self: &Arc<Self>) {
-		self.shared.wake_reactor();
+		self.shared.park.unpark();
 	}
 }
 
@@ -575,23 +559,34 @@ pub struct Reactor {
 }
 
 impl Reactor {
+	/// A reactor that parks its own thread in the backend: [`Reactor::poll`] blocks.
 	pub fn new(config: Config) -> io::Result<(Reactor, Submitter)> {
-		config.validate()?;
-		let (backend, event) = create(&config)?;
+		Reactor::build(config, false)
+	}
+
+	/// A reactor for an external poller: it never parks, and the caller waits on
+	/// [`Reactor::poll_fd`] and calls [`Reactor::poll`] itself.
+	pub fn embedded(config: Config) -> io::Result<(Reactor, Submitter)> {
+		Reactor::build(config, true)
+	}
+
+	fn build(config: Config, embedded: bool) -> io::Result<(Reactor, Submitter)> {
+		config.validate(embedded)?;
+		let (backend, event) = create(&config, embedded)?;
 		// Cache this before polling: a blocked poll holds the core lock.
 		let poll_fd = backend.poll_fd();
+		let park = Park::new(event.clone(), embedded);
 		let shared = Arc::new(Shared {
 			next: AtomicU64::new(0),
 			events: Mutex::new(Events::new()),
 			event,
+			park,
 			stopped: AtomicBool::new(false),
-			parked: AtomicBool::new(false),
-			ready: AtomicBool::new(false),
 			core: Mutex::new(Core::new(backend)),
 			cancelled: backend::cancelled(),
 			poll_fd,
+			embedded,
 			settled: Condvar::new(),
-			reactor_thread: Mutex::new(None),
 		});
 		Ok((
 			Reactor {
@@ -601,42 +596,87 @@ impl Reactor {
 		))
 	}
 
-	pub(super) fn enter_reactor(&self) {
-		self.shared.enter_reactor();
+	#[doc(hidden)]
+	pub fn enter_reactor(&self) {
+		self.shared.park.enter_reactor();
 	}
 
-	pub(super) fn waker(&self) -> ReactorWaker {
+	#[doc(hidden)]
+	pub fn waker(&self) -> ReactorWaker {
 		ReactorWaker::new(Arc::clone(&self.shared))
 	}
 
 	/// Drives the backend.
 	pub fn poll(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-		self.shared.enter_reactor();
-		let mut core = self.shared.core.lock().unwrap();
-		core.drain(&self.shared);
+		let shared = &self.shared;
+		shared.park.enter_reactor();
+		let mut core = shared.core.lock().unwrap();
 		if timeout == Some(Duration::ZERO) {
-			core.settle_timers(&self.shared);
-			return core.reap(&self.shared);
+			// A poll that does not wait never sleeps, so it may take a wake off the
+			// state word: a submission leaves one set, and left set it would make the
+			// next waiting poll return before sleeping with nothing to settle. That
+			// path cannot clear the word itself — a wake raised after its drain must
+			// still stop the park — so its compare-exchange is what consumes a wake.
+			let _ = shared.park.park(|| Ok(()));
+			core.drain(shared);
+			core.settle_timers(shared);
+			return core.reap(shared);
 		}
-		// Mark parked before the second drain so concurrent submissions cannot be missed.
-		self.shared.parked.store(true, Ordering::Release);
-		core.drain(&self.shared);
-		let result = if self.shared.ready.swap(false, Ordering::AcqRel) {
-			core.settle_timers(&self.shared);
-			core.reap(&self.shared)
-		} else {
-			core.wait(&self.shared, timeout)
-		};
-		self.shared.parked.store(false, Ordering::Release);
-		result
+		core.drain(shared);
+		shared.park.park(|| core.wait(shared, timeout))
 	}
 
-	/// The descriptor a [`PollMode::Fd`](crate::PollMode::Fd) caller waits on.
+	/// The descriptor an external poller waits on, for a reactor built with
+	/// [`Reactor::embedded`].
 	pub fn poll_fd(&self) -> io::Result<BorrowedDescriptor<'_>> {
-		match &self.shared.poll_fd {
+		let shared = &self.shared;
+		// A self-parking reactor writes its doorbell only while PARKED, so an
+		// external poller waiting on the fd would miss cross-thread wakes.
+		if !shared.embedded {
+			return Err(io::Error::new(
+				io::ErrorKind::Unsupported,
+				"a self-parking reactor has no poll_fd; build it with Reactor::embedded",
+			));
+		}
+		match &shared.poll_fd {
 			Ok(event) => Ok(event.descriptor()),
 			Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
 		}
+	}
+
+	/// Empties the notification an external poller woke on, for a reactor built
+	/// with [`Reactor::embedded`].
+	///
+	/// Draining before driving is what keeps the level-triggered descriptor
+	/// honest: a completion or a wake raised after this re-raises it, so the
+	/// poller can wait on it again instead of reading it ready forever.
+	pub fn drain_notification(&mut self) -> io::Result<()> {
+		let shared = &self.shared;
+		if !shared.embedded {
+			return Err(not_embedded());
+		}
+		shared.core.lock().unwrap().backend.drain_notification()
+	}
+
+	/// One pass for a reactor built with [`Reactor::embedded`]: hands what is
+	/// queued to the backend, settles timers that have come due, and reaps
+	/// completions, as a zero-timeout [`Reactor::poll`] does. It does not drain
+	/// the notification — call [`Reactor::drain_notification`] first.
+	///
+	/// Returns the time until the next timer deadline, or `None` if no timer
+	/// waits: what an external poller may wait on [`Reactor::poll_fd`] before
+	/// this call again.
+	pub fn turn(&mut self) -> io::Result<Option<Duration>> {
+		let shared = &self.shared;
+		if !shared.embedded {
+			return Err(not_embedded());
+		}
+		shared.park.enter_reactor();
+		let mut core = shared.core.lock().unwrap();
+		core.drain(shared);
+		core.settle_timers(shared);
+		core.reap(shared)?;
+		Ok(shared.events.lock().unwrap().within(None))
 	}
 
 	/// The reactor's own wake-up; see [`Event`].
@@ -674,7 +714,7 @@ impl Drop for Reactor {
 				entry.give_up.ask();
 			}
 		}
-		let _ = shared.event.notify();
+		shared.park.unpark();
 		if let Ok(mut core) = shared.core.lock() {
 			while !shared.is_idle() {
 				if core.drive_to_idle(shared).is_err() {
@@ -963,14 +1003,6 @@ impl Submitter {
 		held
 	}
 
-	/// Wakes the reactor if it is parked.
-	#[doc(hidden)]
-	pub fn wake(&self) {
-		if self.shared.parked.load(Ordering::Acquire) {
-			let _ = self.shared.event.notify();
-		}
-	}
-
 	/// Reads from `fd` at `fdoff` into the named ranges of `memory`.
 	#[track_caller]
 	pub fn read<S: AsDescriptor + Send + Sync + 'static>(
@@ -983,7 +1015,8 @@ impl Submitter {
 		self.read_at(Location::caller(), fd, fdoff, memory, extents)
 	}
 
-	pub(super) fn read_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn read_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1016,7 +1049,8 @@ impl Submitter {
 		self.write_at(Location::caller(), fd, fdoff, memory, extents)
 	}
 
-	pub(super) fn write_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn write_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1046,7 +1080,8 @@ impl Submitter {
 		self.fsync_at(Location::caller(), fd)
 	}
 
-	pub(super) fn fsync_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn fsync_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1069,7 +1104,8 @@ impl Submitter {
 		self.flush_at(Location::caller(), fd)
 	}
 
-	pub(super) fn flush_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn flush_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1093,7 +1129,8 @@ impl Submitter {
 		self.recv_at(Location::caller(), fd, memory, extents)
 	}
 
-	pub(super) fn recv_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn recv_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1124,7 +1161,8 @@ impl Submitter {
 		self.recv_with_fds_at(Location::caller(), fd, memory, extents)
 	}
 
-	pub(super) fn recv_with_fds_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn recv_with_fds_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1154,7 +1192,8 @@ impl Submitter {
 		self.send_at(Location::caller(), fd, memory, extents)
 	}
 
-	pub(super) fn send_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn send_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1185,7 +1224,8 @@ impl Submitter {
 		self.send_with_fds_at(Location::caller(), fd, memory, extents, fds)
 	}
 
-	pub(super) fn send_with_fds_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn send_with_fds_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1215,7 +1255,8 @@ impl Submitter {
 		self.accept_at(Location::caller(), fd)
 	}
 
-	pub(super) fn accept_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn accept_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1237,7 +1278,8 @@ impl Submitter {
 		self.wait_readable_at(Location::caller(), fd)
 	}
 
-	pub(super) fn wait_readable_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn wait_readable_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1259,7 +1301,8 @@ impl Submitter {
 		self.wait_writable_at(Location::caller(), fd)
 	}
 
-	pub(super) fn wait_writable_at<S: AsDescriptor + Send + Sync + 'static>(
+	#[doc(hidden)]
+	pub fn wait_writable_at<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
@@ -1322,7 +1365,7 @@ impl Submitter {
 			);
 			id
 		};
-		self.wake();
+		self.shared.park.unpark();
 		Ok(Completion {
 			guard: SlotGuard {
 				id,
@@ -1335,7 +1378,7 @@ impl Submitter {
 	/// Refuses new submissions with [`BrokenPipe`](io::ErrorKind::BrokenPipe) and wakes the reactor; existing operations are left to complete.
 	pub fn stop(&self) {
 		self.shared.stopped.store(true, Ordering::Release);
-		let _ = self.shared.event.notify();
+		self.shared.park.unpark();
 	}
 
 	/// Facade call sites are captured before polling: `#[track_caller]` cannot cross `Future::poll`.
@@ -1372,7 +1415,7 @@ impl Submitter {
 			);
 			id
 		};
-		self.wake();
+		self.shared.park.unpark();
 		Ok(Completion {
 			guard: SlotGuard {
 				id,
@@ -1380,11 +1423,6 @@ impl Submitter {
 			},
 			userdata: Some(()),
 		})
-	}
-
-	/// Creates a channel bound to this reactor's wake-up.
-	pub fn channel<T>(&self) -> (channel::Sender<T>, channel::Receiver<T>) {
-		channel::Shared::split(self.shared.event.clone())
 	}
 }
 
@@ -1398,7 +1436,6 @@ struct CancelInner {
 	cancelled: AtomicBool,
 	wakers: Mutex<HashMap<u64, Waker>>,
 	next: AtomicU64,
-	events: Mutex<Vec<Event>>,
 	children: Mutex<Vec<Weak<CancelInner>>>,
 }
 
@@ -1408,7 +1445,6 @@ impl CancelInner {
 			cancelled: AtomicBool::new(false),
 			wakers: Mutex::new(HashMap::new()),
 			next: AtomicU64::new(0),
-			events: Mutex::new(Vec::new()),
 			children: Mutex::new(Vec::new()),
 		}
 	}
@@ -1418,13 +1454,9 @@ impl CancelInner {
 			return;
 		}
 		let wakers = std::mem::take(&mut *self.wakers.lock().unwrap());
-		let events = std::mem::take(&mut *self.events.lock().unwrap());
 		let children = std::mem::take(&mut *self.children.lock().unwrap());
 		for (_, waker) in wakers {
 			waker.wake();
-		}
-		for event in &events {
-			let _ = event.notify();
 		}
 		for child in &children {
 			if let Some(child) = child.upgrade() {
@@ -1481,19 +1513,6 @@ impl Cancel {
 	#[cfg(test)]
 	fn children(&self) -> usize {
 		self.inner.children.lock().unwrap().len()
-	}
-
-	fn attach(&self, event: Event) {
-		let mut events = self.inner.events.lock().unwrap();
-		if self.is_cancelled() {
-			drop(events);
-			let _ = event.notify();
-			return;
-		}
-		if events.iter().any(|held| held.same(&event)) {
-			return;
-		}
-		events.push(event);
 	}
 
 	#[cfg(test)]
@@ -1553,7 +1572,8 @@ thread_local! {
 	static TASK_CANCEL: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(super) fn cancel_task_future<F>(future: F) {
+#[doc(hidden)]
+pub fn cancel_task_future<F>(future: F) {
 	struct Restore(bool);
 
 	impl Drop for Restore {
@@ -1604,9 +1624,7 @@ impl Drop for SlotGuard {
 						entry.give_up.ask();
 					}
 					drop(events);
-					if shared.parked.load(Ordering::Acquire) {
-						let _ = shared.event.notify();
-					}
+					shared.park.unpark();
 					return;
 				}
 				Stat::InFlight => {
@@ -1653,8 +1671,7 @@ impl Drop for SlotGuard {
 }
 
 fn wait_released(shared: &Shared, id: u64) {
-	let _ = shared.event.notify();
-	if shared.on_reactor_thread() {
+	if shared.park.is_owner() {
 		match shared.core.try_lock() {
 			Ok(mut core) => {
 				let _ = core.drive_until(shared, id);
@@ -1665,9 +1682,10 @@ fn wait_released(shared: &Shared, id: u64) {
 			),
 			Err(TryLockError::Poisoned(_)) => {}
 		}
-		// The inline drive may have consumed a wake needed by the next `block_on` iteration.
-		let _ = shared.event.notify();
 	} else {
+		// The reactor has to submit the cancel this drop asked for, so a thread
+		// that is not the reactor must wake it before waiting on the condvar.
+		shared.park.unpark();
 		let mut events = shared.events.lock().unwrap();
 		while !shared.is_settled_locked(&events, id) {
 			events = shared.settled.wait(events).unwrap();
@@ -1702,6 +1720,13 @@ fn not_submitted() -> io::Error {
 
 fn stopped() -> io::Error {
 	io::Error::new(io::ErrorKind::BrokenPipe, "the reactor has been stopped")
+}
+
+fn not_embedded() -> io::Error {
+	io::Error::new(
+		io::ErrorKind::Unsupported,
+		"this is only for a reactor built with Reactor::embedded",
+	)
 }
 
 fn is_not_submitted(error: &io::Error) -> bool {
@@ -1740,9 +1765,7 @@ impl<U> Completion<U> {
 				entry.give_up.ask();
 			}
 		}
-		if shared.parked.load(Ordering::Acquire) {
-			let _ = shared.event.notify();
-		}
+		shared.park.unpark();
 	}
 
 	fn was_cancelled(&self, response: &io::Result<Response>) -> bool {
@@ -1756,7 +1779,6 @@ impl<U> Completion<U> {
 impl<U: Unpin> Completion<U> {
 	/// Races the operation against `cancel`, giving the [`Until`] future.
 	pub fn until(self, cancel: &Cancel) -> Until<U> {
-		cancel.attach(self.guard.shared.event.clone());
 		let wait = Wait::new(Arc::clone(&cancel.inner));
 		Until {
 			completion: self,
@@ -1879,24 +1901,6 @@ mod tests {
 			cancel.children() <= 1,
 			"the children outlived their holders: {}",
 			cancel.children()
-		);
-	}
-
-	/// Reactor registrations must grow with distinct reactors, not repeated waits.
-	#[test]
-	fn a_cancel_keeps_one_wake_up_per_reactor() {
-		let (_first, first) = platform();
-		let (_second, second) = platform();
-		let cancel = Cancel::new();
-		for _ in 0..16 {
-			cancel.attach(first.event());
-		}
-		cancel.attach(second.event());
-		let events = cancel.inner.events.lock().unwrap();
-		assert_eq!(events.len(), 2, "one wake-up per reactor, not per attach");
-		assert!(
-			events.iter().any(|held| held.same(&second.event())),
-			"the second reactor was kept"
 		);
 	}
 }

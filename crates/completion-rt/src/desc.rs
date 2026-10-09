@@ -71,7 +71,7 @@ mod imp {
 mod imp {
 	use std::io;
 	use std::os::windows::io::{
-		AsHandle, AsSocket, BorrowedHandle, BorrowedSocket, OwnedHandle,
+		AsHandle, AsSocket, BorrowedHandle, BorrowedSocket, FromRawSocket, OwnedHandle,
 		RawHandle as PlatformHandle,
 	};
 
@@ -155,6 +155,13 @@ mod imp {
 		}
 	}
 
+	/// # Safety
+	///
+	/// `raw` must be a live socket nobody else owns.
+	pub(crate) unsafe fn from_raw_socket(raw: RawHandle) -> OwnedSocket {
+		unsafe { OwnedSocket::from_raw_socket(raw.into_raw() as _) }
+	}
+
 	/// Borrows a descriptor without transferring ownership.
 	pub trait AsDescriptor {
 		fn as_descriptor(&self) -> BorrowedDescriptor<'_>;
@@ -223,7 +230,7 @@ mod imp {
 
 #[cfg(any(unix, windows))]
 pub(crate) use imp::RawHandle;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use imp::from_raw_socket;
 #[cfg(any(unix, windows))]
 pub use imp::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor};

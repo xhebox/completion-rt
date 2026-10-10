@@ -5,7 +5,7 @@ Completion-model async I/O for Rust: io_uring on Linux, IOCP on Windows, and a r
 ```rust
 use std::sync::Arc;
 
-use completion_rt::{Cancel, Config, Executor, Facade, Memory};
+use completion_async::{Cancel, Config, Executor, Facade, Memory};
 
 let mut executor = Executor::new(Config::default())?;
 let file = Facade::new(std::fs::File::open("data")?, &executor.submitter());

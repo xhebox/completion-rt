@@ -10,9 +10,10 @@ rule:
     - pattern: tempfile::NamedTempFile::new()
     - pattern: tempfile::Builder::new()
 ignores:
-  # Justified: the integration tests' scratch-directory helper is the only
-  # place allowed to reach for tempfile.
-  - tests/common/mod.rs
+  # Justified: each crate's integration tests get one scratch-directory helper,
+  # and that helper is the only place allowed to reach for tempfile.
+  - crates/completion-async/tests/common/mod.rs
+  - crates/completion-rt/tests/common/mod.rs
 message: >
   Do not create temporary files or directories in /tmp or TMPDIR: that
   filesystem is shared with the rest of the system and outlives the working

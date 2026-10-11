@@ -127,7 +127,6 @@ name = "completion-async"
 version = "0.1.0"
 dependencies = [
  "completion-rt",
- "enum_dispatch",
  "env_logger",
  "log",
  "rustix",

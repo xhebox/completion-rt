@@ -1,6 +1,6 @@
 //! The embedded executor: a caller that owns the poll loop waits on
-//! [`EmbeddedExecutor::poll_fd`] with its own poller and drives the reactor with
-//! [`EmbeddedExecutor::turn`] once per wake, and the tasks a spawner made run in
+//! [`Executor::poll_fd`] with its own poller and drives the reactor with
+//! [`Executor::turn`] once per wake, and the tasks a spawner made run in
 //! those passes.
 //!
 //! These are the waits a facade cannot shape — a bare descriptor to wait on,
@@ -13,13 +13,9 @@ use std::io;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 use std::time::Duration;
 
-use completion_async::{Config, ExecutorEnum};
-// Only the unix tests below reach a task through the executor; the rejection
-// test builds one and stops.
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
-use completion_async::{EmbeddedExecutor, Executor as _};
+use completion_async::{Config, Executor};
 
-/// The wait [`EmbeddedExecutor::turn`] asked for, capped at five seconds when it
+/// The wait [`Executor::turn`] asked for, capped at five seconds when it
 /// named none: a test must fail rather than hang if the descriptor never becomes
 /// ready.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
@@ -43,8 +39,7 @@ fn waiting_on_the_descriptor_drives_the_backend() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 
-	let executor = ExecutorEnum::embedded(Config::default()).unwrap();
-	let mut executor: EmbeddedExecutor = executor.try_into().unwrap();
+	let mut executor = Executor::embedded(Config::default()).unwrap();
 	assert!(
 		executor.poll_fd().unwrap().as_raw_fd() >= 0,
 		"an embedded executor hands out a descriptor to wait on"
@@ -102,8 +97,7 @@ fn a_timer_fires_within_the_timeout_turn_reports() {
 	use completion_async::Timeout;
 	use rustix::event::{PollFd, PollFlags, poll};
 
-	let executor = ExecutorEnum::embedded(Config::default()).unwrap();
-	let mut executor: EmbeddedExecutor = executor.try_into().unwrap();
+	let mut executor = Executor::embedded(Config::default()).unwrap();
 	let submitter = executor.submitter();
 	let (done, finished) = std::sync::mpsc::channel::<io::Result<()>>();
 	executor
@@ -150,8 +144,7 @@ fn an_idle_embedded_executor_leaves_the_descriptor_quiet() {
 
 	use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
-	let executor = ExecutorEnum::embedded(Config::default()).unwrap();
-	let mut executor: EmbeddedExecutor = executor.try_into().unwrap();
+	let mut executor = Executor::embedded(Config::default()).unwrap();
 	let ran = Arc::new(AtomicUsize::new(0));
 	let flag = Arc::clone(&ran);
 	executor
@@ -205,8 +198,7 @@ fn every_task_runs_past_the_tick_budget() {
 
 	use rustix::event::{PollFd, PollFlags, poll};
 
-	let executor = ExecutorEnum::embedded(Config::default()).unwrap();
-	let mut executor: EmbeddedExecutor = executor.try_into().unwrap();
+	let mut executor = Executor::embedded(Config::default()).unwrap();
 	let ran = Arc::new(AtomicUsize::new(0));
 	let spawner = executor.spawner();
 	for _ in 0..200 {
@@ -244,7 +236,7 @@ fn every_task_runs_past_the_tick_budget() {
 /// someone first waits on a descriptor that will never become ready.
 #[test]
 fn embedded_with_iopoll_is_rejected_up_front() {
-	let error = ExecutorEnum::embedded(Config {
+	let error = Executor::embedded(Config {
 		iopoll: true,
 		..Config::default()
 	})

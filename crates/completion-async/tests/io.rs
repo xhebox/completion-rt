@@ -7,15 +7,13 @@ use common::block_on;
 use std::io;
 use std::sync::Arc;
 
-use completion_async::{
-	Config, Error, Executor as _, ExecutorEnum, Extent, Facade, File, Memory, OpenOptions,
-};
+use completion_async::{Config, ErrorKind, Executor, Extent, Facade, File, Memory, OpenOptions};
 
 /// The async driver the file operations run on: it owns the reactor, so
 /// `block_on` both polls the operation and drives the backend under it.
-fn executor() -> ExecutorEnum {
+fn executor() -> Executor {
 	common::init_logging();
-	ExecutorEnum::new(Config::default()).unwrap()
+	Executor::new(Config::default()).unwrap()
 }
 
 #[test]
@@ -182,7 +180,9 @@ fn read_exact_at_reports_the_file_ending_first() {
 		.result
 		.expect_err("the file has fewer bytes than the buffer holds")
 	{
-		Error::Io(error) => assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof),
+		error if error.kind() == ErrorKind::Failed => {
+			assert_eq!(io::Error::from(error).kind(), io::ErrorKind::UnexpectedEof)
+		}
 		other => panic!("a loop that ran out of file reports an io error, not {other:?}"),
 	}
 }
@@ -298,7 +298,7 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	/// What one hand-written poll loop holds across its polls.
 	struct Reading {
 		file: Option<File>,
-		read: Transfer<std::fs::File>,
+		read: Transfer<'static, std::fs::File>,
 	}
 
 	/// A state machine boxes what it is waiting for, which needs the future to
@@ -405,11 +405,14 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 
 	let file = File::new(unsafe { std::fs::File::from_raw_fd(dead) }, &submitter);
 	match executor.block_on(file.flush()).unwrap() {
-		Err(Error::Io(error)) => assert_eq!(
-			error.raw_os_error(),
-			Some(rustix::io::Errno::BADF.raw_os_error()),
-			"a closed descriptor reports EBADF, not {error}"
-		),
+		Err(error) if error.kind() == ErrorKind::Failed => {
+			let error = io::Error::from(error);
+			assert_eq!(
+				error.raw_os_error(),
+				Some(rustix::io::Errno::BADF.raw_os_error()),
+				"a closed descriptor reports EBADF, not {error}"
+			)
+		}
 		other => panic!("flush on a closed descriptor must fail, got {other:?}"),
 	}
 

@@ -188,6 +188,8 @@ struct Entry {
 	/// The descriptor the operation names, held until the entry goes: the
 	/// backend works on the number, which must stay live until then.
 	descriptor: Option<Descriptor>,
+	/// The scope whose borrowed memory this operation names; see [`Lease`].
+	lease: Option<u64>,
 }
 
 struct Descriptor {
@@ -982,6 +984,19 @@ pub struct Submitter {
 	shared: Arc<Shared>,
 }
 
+/// Groups the operations naming memory a scope borrowed, so the scope can wait
+/// until the kernel has let go of all of them before the borrow ends.
+#[doc(hidden)]
+pub struct Lease {
+	id: u64,
+	/// Set by [`Submitter::settle`]; a submission under a closed lease is
+	/// refused, so nothing joins after the barrier has started counting.
+	closed: AtomicBool,
+	/// The reactor the lease belongs to: only its own reactor is driven by the
+	/// barrier, so a submission elsewhere could outlive it.
+	shared: Arc<Shared>,
+}
+
 impl Submitter {
 	/// The event that wakes a blocked [`Reactor::poll`].
 	pub fn event(&self) -> Event {
@@ -1009,10 +1024,17 @@ impl Submitter {
 		&self,
 		fd: &Handle<S>,
 		fdoff: u64,
-		memory: Arc<dyn Memory>,
+		memory: impl Memory + 'static,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
-		self.read_at(Location::caller(), fd, fdoff, memory, extents)
+		self.read_at(
+			Location::caller(),
+			fd,
+			fdoff,
+			Arc::new(memory),
+			None,
+			extents,
+		)
 	}
 
 	#[doc(hidden)]
@@ -1022,6 +1044,7 @@ impl Submitter {
 		fd: &Handle<S>,
 		fdoff: u64,
 		memory: Arc<dyn Memory>,
+		lease: Option<&Lease>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
@@ -1034,6 +1057,7 @@ impl Submitter {
 				extents: extents.into_iter().collect(),
 			},
 			Some(Descriptor::new(fd)),
+			lease,
 		)
 	}
 
@@ -1043,10 +1067,17 @@ impl Submitter {
 		&self,
 		fd: &Handle<S>,
 		fdoff: u64,
-		memory: Arc<dyn Memory>,
+		memory: impl Memory + 'static,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
-		self.write_at(Location::caller(), fd, fdoff, memory, extents)
+		self.write_at(
+			Location::caller(),
+			fd,
+			fdoff,
+			Arc::new(memory),
+			None,
+			extents,
+		)
 	}
 
 	#[doc(hidden)]
@@ -1056,6 +1087,7 @@ impl Submitter {
 		fd: &Handle<S>,
 		fdoff: u64,
 		memory: Arc<dyn Memory>,
+		lease: Option<&Lease>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
@@ -1068,6 +1100,7 @@ impl Submitter {
 				extents: extents.into_iter().collect(),
 			},
 			Some(Descriptor::new(fd)),
+			lease,
 		)
 	}
 
@@ -1091,6 +1124,7 @@ impl Submitter {
 			origin,
 			Request::Fsync { fd: raw },
 			Some(Descriptor::new(fd)),
+			None,
 		)
 	}
 
@@ -1115,6 +1149,7 @@ impl Submitter {
 			origin,
 			Request::Flush { fd: raw },
 			Some(Descriptor::new(fd)),
+			None,
 		)
 	}
 
@@ -1123,10 +1158,10 @@ impl Submitter {
 	pub fn recv<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		fd: &Handle<S>,
-		memory: Arc<dyn Memory>,
+		memory: impl Memory + 'static,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
-		self.recv_at(Location::caller(), fd, memory, extents)
+		self.recv_at(Location::caller(), fd, Arc::new(memory), None, extents)
 	}
 
 	#[doc(hidden)]
@@ -1135,6 +1170,7 @@ impl Submitter {
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
 		memory: Arc<dyn Memory>,
+		lease: Option<&Lease>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
@@ -1146,6 +1182,7 @@ impl Submitter {
 				extents: extents.into_iter().collect(),
 			},
 			Some(Descriptor::new(fd)),
+			lease,
 		)
 	}
 
@@ -1155,10 +1192,10 @@ impl Submitter {
 	pub fn recv_with_fds<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		fd: &Handle<S>,
-		memory: Arc<dyn Memory>,
+		memory: impl Memory + 'static,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
-		self.recv_with_fds_at(Location::caller(), fd, memory, extents)
+		self.recv_with_fds_at(Location::caller(), fd, Arc::new(memory), None, extents)
 	}
 
 	#[doc(hidden)]
@@ -1167,6 +1204,7 @@ impl Submitter {
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
 		memory: Arc<dyn Memory>,
+		lease: Option<&Lease>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
@@ -1178,6 +1216,7 @@ impl Submitter {
 				extents: extents.into_iter().collect(),
 			},
 			Some(Descriptor::new(fd)),
+			lease,
 		)
 	}
 
@@ -1186,10 +1225,10 @@ impl Submitter {
 	pub fn send<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		fd: &Handle<S>,
-		memory: Arc<dyn Memory>,
+		memory: impl Memory + 'static,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
-		self.send_at(Location::caller(), fd, memory, extents)
+		self.send_at(Location::caller(), fd, Arc::new(memory), None, extents)
 	}
 
 	#[doc(hidden)]
@@ -1198,6 +1237,7 @@ impl Submitter {
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
 		memory: Arc<dyn Memory>,
+		lease: Option<&Lease>,
 		extents: impl IntoIterator<Item = Extent>,
 	) -> io::Result<Completion> {
 		let raw = fd.raw();
@@ -1209,6 +1249,7 @@ impl Submitter {
 				extents: extents.into_iter().collect(),
 			},
 			Some(Descriptor::new(fd)),
+			lease,
 		)
 	}
 
@@ -1217,11 +1258,11 @@ impl Submitter {
 	pub fn send_with_fds<S: AsDescriptor + Send + Sync + 'static>(
 		&self,
 		fd: &Handle<S>,
-		memory: Arc<dyn Memory>,
+		memory: impl Memory + 'static,
 		extents: impl IntoIterator<Item = Extent>,
 		fds: Vec<OwnedDescriptor>,
 	) -> io::Result<Completion> {
-		self.send_with_fds_at(Location::caller(), fd, memory, extents, fds)
+		self.send_with_fds_at(Location::caller(), fd, Arc::new(memory), None, extents, fds)
 	}
 
 	#[doc(hidden)]
@@ -1230,6 +1271,7 @@ impl Submitter {
 		origin: &'static Location<'static>,
 		fd: &Handle<S>,
 		memory: Arc<dyn Memory>,
+		lease: Option<&Lease>,
 		extents: impl IntoIterator<Item = Extent>,
 		fds: Vec<OwnedDescriptor>,
 	) -> io::Result<Completion> {
@@ -1243,6 +1285,7 @@ impl Submitter {
 				fds,
 			},
 			Some(Descriptor::new(fd)),
+			lease,
 		)
 	}
 
@@ -1266,6 +1309,7 @@ impl Submitter {
 			origin,
 			Request::Accept { fd: raw },
 			Some(Descriptor::new(fd)),
+			None,
 		)
 	}
 
@@ -1289,6 +1333,7 @@ impl Submitter {
 			origin,
 			Request::Readable { fd: raw },
 			Some(Descriptor::new(fd)),
+			None,
 		)
 	}
 
@@ -1312,6 +1357,7 @@ impl Submitter {
 			origin,
 			Request::Writable { fd: raw },
 			Some(Descriptor::new(fd)),
+			None,
 		)
 	}
 
@@ -1329,6 +1375,7 @@ impl Submitter {
 			Request::Readable {
 				fd: self.shared.event.handle(),
 			},
+			None,
 			None,
 		)
 	}
@@ -1361,6 +1408,7 @@ impl Submitter {
 					waiter: false,
 					deadline: Some(deadline),
 					descriptor: None,
+					lease: None,
 				},
 			);
 			id
@@ -1381,12 +1429,52 @@ impl Submitter {
 		self.shared.park.unpark();
 	}
 
+	/// Opens a lease for operations on memory borrowed by a scope.
+	#[doc(hidden)]
+	pub fn lease(&self) -> Lease {
+		Lease {
+			id: self.shared.next.fetch_add(1, Ordering::Relaxed) + 1,
+			closed: AtomicBool::new(false),
+			shared: Arc::clone(&self.shared),
+		}
+	}
+
+	/// Closes `lease` to new submissions and asks every operation under it to
+	/// give up. Returns whether one is still pending or in the kernel; the caller
+	/// drives the reactor and asks again until it is not.
+	#[doc(hidden)]
+	pub fn settle(&self, lease: &Lease) -> bool {
+		let (busy, pending) = {
+			let mut events = self.shared.events.lock().unwrap();
+			lease.closed.store(true, Ordering::Release);
+			let (mut busy, mut pending) = (false, false);
+			for entry in events.entries.values_mut() {
+				if entry.lease != Some(lease.id) {
+					continue;
+				}
+				if matches!(entry.stat, Stat::Pending | Stat::InFlight | Stat::Abandoned) {
+					entry.give_up.ask();
+					busy = true;
+					pending |= entry.stat == Stat::Pending;
+				}
+			}
+			(busy, pending)
+		};
+		// A pending entry is settled by the drain alone, with no completion to wake
+		// the wait after it; one in the kernel is what the wait sleeps for.
+		if pending {
+			self.shared.park.unpark();
+		}
+		busy
+	}
+
 	/// Facade call sites are captured before polling: `#[track_caller]` cannot cross `Future::poll`.
 	fn enqueue(
 		&self,
 		origin: &'static Location<'static>,
 		request: Request,
 		descriptor: Option<Descriptor>,
+		lease: Option<&Lease>,
 	) -> io::Result<Completion> {
 		let names_memory = request.names_memory();
 		let kind = request.kind();
@@ -1394,6 +1482,22 @@ impl Submitter {
 			let mut events = self.shared.events.lock().unwrap();
 			if self.shared.stopped.load(Ordering::Acquire) {
 				return Err(stopped());
+			}
+			// Checked under the events lock: `settle` closes the lease under it too,
+			// so no entry can slip in after the barrier has counted.
+			if let Some(lease) = lease {
+				if !Arc::ptr_eq(&lease.shared, &self.shared) {
+					return Err(io::Error::new(
+						io::ErrorKind::InvalidInput,
+						"lent memory submitted to a reactor other than its scope's",
+					));
+				}
+				if lease.closed.load(Ordering::Acquire) {
+					return Err(io::Error::new(
+						io::ErrorKind::BrokenPipe,
+						"lent memory submitted after its scope ended",
+					));
+				}
 			}
 			let id = self.shared.next.fetch_add(1, Ordering::Relaxed) + 1;
 			events.insert(
@@ -1411,6 +1515,7 @@ impl Submitter {
 					waiter: false,
 					deadline: None,
 					descriptor,
+					lease: lease.map(|lease| lease.id),
 				},
 			);
 			id

@@ -1,6 +1,6 @@
 //! Completion-model async I/O, experimental.
 //!
-//! [`ExecutorEnum`] is the start point: use [`Executor::block_on`] to run a
+//! [`Executor`] is the start point: use [`Executor::block_on`] to run a
 //! root async task.
 //!
 //! A [`Facade`] is a set of operations over one resource: it holds the resource
@@ -25,6 +25,7 @@
 //! # }
 //! ```
 
+mod error;
 mod executor;
 mod global;
 mod io;
@@ -39,14 +40,12 @@ pub use completion_rt::{
 	AsDescriptor, BorrowedDescriptor, Cancel, Extent, Handle, Memory, OwnedDescriptor, OwnedSocket,
 	Span,
 };
-pub use executor::{
-	BlockingExecutor, Config, EmbeddedExecutor, Executor, ExecutorClosed, ExecutorEnum, Spawner,
-	Task,
-};
-pub use global::{block_on, spawn, try_spawn};
-pub use io::{Facade, File, OpenOptions};
+pub use error::{Error, ErrorKind, Status};
+pub use executor::{Config, Executor, Scope, ScopeTask, Spawner, Task};
+pub use global::{block_on, scope, spawn, try_spawn};
+pub use io::{Facade, File, IntoMemory, Lent, OpenOptions};
 pub use net::{
 	Accept, ListenerHandle, Op, Receive, Received, SocketHandle, StreamHandle, Transfer,
 };
-pub use outcome::{Error, Outcome};
+pub use outcome::Outcome;
 pub use submitter::{Submitter, Timeout};

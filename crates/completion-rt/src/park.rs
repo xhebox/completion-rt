@@ -19,8 +19,7 @@ const PARKED: u32 = 1;
 const NOTIFIED: u32 = 2;
 
 /// The reactor's single wake protocol.
-#[doc(hidden)]
-pub struct Park {
+pub(crate) struct Park {
 	state: AtomicU32,
 	doorbell: Event,
 	/// An embedded reactor never parks inside the reactor — an external poller
@@ -44,17 +43,17 @@ impl Park {
 	}
 
 	/// Records the calling thread as the reactor owner.
-	pub fn enter_reactor(&self) {
+	pub(crate) fn enter_reactor(&self) {
 		let _ = self.owner.set(thread::current().id());
 	}
 
 	/// Whether the calling thread is the reactor owner.
-	pub fn is_owner(&self) -> bool {
+	pub(crate) fn is_owner(&self) -> bool {
 		self.owner.get() == Some(&thread::current().id())
 	}
 
 	/// Raises a wake for the reactor.
-	pub fn unpark(&self) {
+	pub(crate) fn unpark(&self) {
 		if self.external {
 			let _ = self.doorbell.notify();
 			return;
@@ -67,12 +66,13 @@ impl Park {
 	}
 
 	/// Whether a wake is pending, for a backend that spins instead of waiting.
-	pub fn woke(&self) -> bool {
+	#[cfg(target_os = "linux")]
+	pub(crate) fn woke(&self) -> bool {
 		self.state.load(Ordering::Acquire) == NOTIFIED
 	}
 
 	/// Sleeps in `poll` unless a wake arrived first.
-	pub fn park(&self, poll: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+	pub(crate) fn park(&self, poll: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
 		if self
 			.state
 			.compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire)

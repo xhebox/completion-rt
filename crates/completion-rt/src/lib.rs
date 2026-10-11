@@ -34,5 +34,3 @@ pub use memory::{Extent, Memory, Span};
 pub use core::{ReactorWaker, cancel_task_future};
 #[doc(hidden)]
 pub use memory::Extents;
-#[doc(hidden)]
-pub use park::Park;

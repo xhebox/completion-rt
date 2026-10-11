@@ -17,13 +17,15 @@ use std::task::{Context, Poll, Waker};
 
 #[cfg(unix)]
 use completion_async::Facade;
-use completion_async::{Config, Error, Executor, File, Handle, Memory, Submitter};
+use completion_async::{
+	Config, Error, Executor as _, ExecutorEnum, File, Handle, Memory, Submitter,
+};
 
 /// The async driver the operations run on: it owns the reactor, and `block_on`
 /// drives both the future and the backend beneath it.
-fn executor() -> Executor {
+fn executor() -> ExecutorEnum {
 	common::init_logging();
-	Executor::new(Config::default()).unwrap()
+	ExecutorEnum::new(Config::default()).unwrap()
 }
 
 /// A file with `contents`, wrapped in a facade bound to `submitter`.
@@ -285,7 +287,7 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 #[test]
 #[cfg(target_os = "linux")]
 fn sqpoll_rings_complete_too() {
-	let mut executor = match Executor::new(Config {
+	let mut executor = match ExecutorEnum::new(Config {
 		sqpoll: true,
 		..Config::default()
 	}) {
@@ -319,7 +321,7 @@ fn sqpoll_rings_complete_too() {
 #[test]
 #[cfg(target_os = "linux")]
 fn fsync_is_refused_on_an_iopoll_ring() {
-	let mut executor = Executor::new(Config {
+	let mut executor = ExecutorEnum::new(Config {
 		iopoll: true,
 		..Config::default()
 	})

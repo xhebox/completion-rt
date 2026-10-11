@@ -9,7 +9,8 @@ repository = "https://github.com/xhebox/completion-rt"
 
 [dependencies]
 completion-rt = { path = "../completion-rt" }
-log = { version = "0.4.34", features = ["std", "kv"] }
+enum_dispatch = "0.3.13"
+log ={ version = "0.4.34", features = ["std", "kv"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["event", "fs", "net"] }

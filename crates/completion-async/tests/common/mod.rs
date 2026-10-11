@@ -96,6 +96,41 @@ pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<std::fs::File> {
 	}
 }
 
+/// Holds both of a socket's buffers to `bytes`, so a payload larger than them
+/// cannot all leave at once whatever the platform's default buffering is. A
+/// test that needs a send still in front of the kernel sets it on both ends,
+/// because either end's buffer would otherwise take the whole payload.
+pub(crate) fn cap_buffers(socket: &std::net::TcpStream, bytes: usize) {
+	#[cfg(unix)]
+	{
+		let _ = rustix::net::sockopt::set_socket_send_buffer_size(socket, bytes);
+		let _ = rustix::net::sockopt::set_socket_recv_buffer_size(socket, bytes);
+	}
+	#[cfg(windows)]
+	{
+		use std::mem::size_of;
+		use std::os::windows::io::AsRawSocket;
+		use windows_sys::Win32::Networking::WinSock::{
+			SO_RCVBUF, SO_SNDBUF, SOCKET, SOL_SOCKET, setsockopt,
+		};
+		let value = bytes as i32;
+		let socket = socket.as_raw_socket() as SOCKET;
+		for option in [SO_SNDBUF, SO_RCVBUF] {
+			// SAFETY: `value` is the `int` both options take, and its size is
+			// what the call is told to read.
+			unsafe {
+				setsockopt(
+					socket,
+					SOL_SOCKET,
+					option,
+					&value as *const i32 as *const u8,
+					size_of::<i32>() as i32,
+				);
+			}
+		}
+	}
+}
+
 /// Makes a scratch directory below `target/test-tmp`. Remove it by dropping the
 /// returned `Scratch`, so bind it for the lifetime of the test.
 pub(crate) fn tempdir(tag: &str) -> io::Result<Scratch> {

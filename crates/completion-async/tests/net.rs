@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use completion_async::{Cancel, Config, Error, Executor, Facade, Memory};
+use completion_async::{Cancel, Config, Error, Executor as _, ExecutorEnum, Facade, Memory};
 
 /// The async driver the socket operations run on.
-fn executor() -> Executor {
+fn executor() -> ExecutorEnum {
 	common::init_logging();
-	Executor::new(Config::default()).unwrap()
+	ExecutorEnum::new(Config::default()).unwrap()
 }
 
 /// The buffer in the shape the engine names memory.

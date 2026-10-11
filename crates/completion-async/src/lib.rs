@@ -1,5 +1,8 @@
 //! Completion-model async I/O, experimental.
 //!
+//! [`ExecutorEnum`] is the start point: use [`Executor::block_on`] to run a
+//! root async task.
+//!
 //! A [`Facade`] is a set of operations over one resource: it holds the resource
 //! in a [`Handle`], so an operation that is still in flight keeps it open, and
 //! it names the operation as a method. Each method returns a future — a
@@ -21,12 +24,9 @@
 //! let outcome = socket.send_all(mem).until(&cancel).await;
 //! # }
 //! ```
-//!
-//! An [`Executor`] owns the reactor, runs its ready tasks, and waits on the
-//! reactor between passes; a future resolves when the reactor completes the
-//! operation it submitted, waking the task waiting on it.
 
 mod executor;
+mod global;
 mod io;
 mod net;
 mod outcome;
@@ -39,7 +39,11 @@ pub use completion_rt::{
 	AsDescriptor, BorrowedDescriptor, Cancel, Extent, Handle, Memory, OwnedDescriptor, OwnedSocket,
 	Span,
 };
-pub use executor::{Config, Executor, Spawner, Task};
+pub use executor::{
+	BlockingExecutor, Config, EmbeddedExecutor, Executor, ExecutorClosed, ExecutorEnum, Spawner,
+	Task,
+};
+pub use global::{block_on, spawn, try_spawn};
 pub use io::{Facade, File, OpenOptions};
 pub use net::{
 	Accept, ListenerHandle, Op, Receive, Received, SocketHandle, StreamHandle, Transfer,

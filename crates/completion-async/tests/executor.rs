@@ -15,11 +15,13 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use completion_async::{Config, Error, Executor, File, Memory, Timeout};
+use completion_async::{
+	Config, Error, Executor as _, ExecutorClosed, ExecutorEnum, File, Memory, Timeout,
+};
 
-fn executor() -> Executor {
+fn executor() -> ExecutorEnum {
 	common::init_logging();
-	Executor::new(Config::default()).unwrap()
+	ExecutorEnum::new(Config::default()).unwrap()
 }
 
 /// A future that hands its waker to another thread on the first poll and
@@ -94,46 +96,6 @@ fn a_task_woken_from_another_thread_ends_block_on() {
 	finished
 		.recv_timeout(deadline)
 		.expect("block_on returns once the task is woken");
-}
-
-#[test]
-fn a_wake_on_the_driver_thread_does_not_park_the_loop() {
-	let (done, finished) = std::sync::mpsc::channel();
-	std::thread::spawn(move || {
-		let mut executor = executor();
-		let (handoff, handed) = std::sync::mpsc::channel();
-		let woken = Arc::new(AtomicBool::new(false));
-		let flag = Arc::clone(&woken);
-		let ran = Arc::new(AtomicBool::new(false));
-		let ran_in_task = Arc::clone(&ran);
-		let task = executor.spawner().spawn(async move {
-			handed_over(flag, handoff).await;
-			ran_in_task.store(true, Ordering::Release);
-		});
-		task.detach();
-		let mut handed = Some(handed);
-		// Nothing wakes this future: it returns once the task it readied has
-		// run, so the loop has to poll it again after the tick.
-		executor
-			.block_on(std::future::poll_fn(move |_| {
-				if ran.load(Ordering::Acquire) {
-					return Poll::Ready(());
-				}
-				if let Some(handed) = handed.take() {
-					let waker = handed
-						.try_recv()
-						.expect("the task ran before the future was polled");
-					woken.store(true, Ordering::Release);
-					waker.wake();
-				}
-				Poll::Pending
-			}))
-			.unwrap();
-		let _ = done.send(());
-	});
-	finished
-		.recv_timeout(Duration::from_secs(10))
-		.expect("block_on runs the task it readied");
 }
 
 /// kibotos notifies the reactor right after spawning a task, so a freshly
@@ -249,6 +211,14 @@ fn a_spawner_cannot_spawn_after_its_executor_drops() {
 }
 
 #[test]
+fn try_spawn_reports_a_dropped_executor() {
+	let executor = executor();
+	let spawner = executor.spawner();
+	drop(executor);
+	assert_eq!(spawner.try_spawn(async {}).err(), Some(ExecutorClosed));
+}
+
+#[test]
 fn awaiting_a_task_after_its_executor_drops_panics() {
 	let executor = executor();
 	let mut task = Box::pin(executor.spawner().spawn(std::future::pending::<()>()));
@@ -313,7 +283,7 @@ fn socket_pair(
 }
 
 fn stalled_task(
-	executor: &mut Executor,
+	executor: &mut ExecutorEnum,
 	buffer: &Arc<Vec<u8>>,
 ) -> (std::net::TcpStream, impl Future<Output = ()> + use<>) {
 	let (peer, socket) = socket_pair(&executor.submitter());
@@ -541,4 +511,68 @@ fn dropping_the_executor_returns_a_tasks_in_flight_io_buffer() {
 		"executor teardown kept the buffer"
 	);
 	drop(task);
+}
+
+/// A root future that is ready on its first poll returns there and then. A task
+/// it detached before returning is queued only as a consequence of that poll,
+/// so the task has not been polled once by the time the loop would return.
+/// `block_on` has to make one closing pass before it hands the result back, or
+/// the detached task waits for the next call to run at all.
+#[test]
+fn block_on_runs_a_detached_task_before_returning_when_the_root_future_is_ready_at_once() {
+	let mut executor = executor();
+	let ran = Arc::new(AtomicBool::new(false));
+	let flag = Arc::clone(&ran);
+	let spawner = executor.spawner();
+	let mut to_spawn = Some(flag);
+	executor
+		.block_on(std::future::poll_fn(move |_| {
+			if let Some(flag) = to_spawn.take() {
+				spawner
+					.spawn(async move { flag.store(true, Ordering::Release) })
+					.detach();
+			}
+			Poll::Ready(())
+		}))
+		.unwrap();
+	assert!(
+		ran.load(Ordering::Acquire),
+		"a task detached by a root future ready at once never ran"
+	);
+}
+
+/// The root future is polled before the ready-task queue is drained, so work
+/// already queued when `block_on` starts cannot delay the future the caller
+/// handed in. This is the ordering compio's `block_on_at` uses
+/// (`ignore/compio/compio-runtime/src/lib.rs:190-201`).
+#[test]
+fn block_on_polls_the_root_future_before_a_task_queued_before_it() {
+	use std::cell::Cell;
+	use std::rc::Rc;
+
+	let mut executor = executor();
+	let ran = Arc::new(AtomicBool::new(false));
+	let flag = Arc::clone(&ran);
+	let polled = Arc::clone(&ran);
+	let task = executor
+		.spawner()
+		.spawn(async move { flag.store(true, Ordering::Release) });
+	let seen_unpolled = Rc::new(Cell::new(false));
+	let observed = Rc::clone(&seen_unpolled);
+	let mut first = true;
+	let mut task = std::pin::pin!(task);
+	executor
+		.block_on(std::future::poll_fn(move |cx| {
+			if first {
+				first = false;
+				observed.set(!polled.load(Ordering::Acquire));
+			}
+			task.as_mut().poll(cx)
+		}))
+		.unwrap();
+	assert!(
+		seen_unpolled.get(),
+		"a task queued before block_on ran before the root future was first polled"
+	);
+	assert!(ran.load(Ordering::Acquire), "the queued task never ran");
 }

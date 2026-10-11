@@ -20,7 +20,7 @@ fn an_owned_buffer_and_a_shared_one_both_move_through_a_file() {
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file: File = Facade::new(
+	let file: File = Facade::with_submitter(
 		OpenOptions::new()
 			.read(true)
 			.write(true)

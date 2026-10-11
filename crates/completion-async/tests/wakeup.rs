@@ -48,7 +48,7 @@ async fn rounds(
 			.send(cancel.clone())
 			.expect("the other thread takes the cancel");
 		let mut wait = pin!(cancel.wait());
-		let mut timeout = pin!(Timeout::new(WATCHDOG, &submitter));
+		let mut timeout = pin!(Timeout::with_submitter(WATCHDOG, &submitter));
 		let mut armed_sent = false;
 		let landed = poll_fn(|cx| {
 			if wait.as_mut().poll(cx).is_ready() {

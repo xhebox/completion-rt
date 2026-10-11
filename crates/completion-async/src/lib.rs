@@ -42,7 +42,7 @@ pub use completion_rt::{
 };
 pub use error::{Error, ErrorKind, Status};
 pub use executor::{Config, Executor, Scope, ScopeTask, Spawner, Task};
-pub use global::{block_on, scope, spawn, try_spawn};
+pub use global::{block_on, scope, spawn, submitter, try_spawn};
 pub use io::{Facade, File, IntoMemory, Lent, OpenOptions};
 pub use net::{
 	Accept, ListenerHandle, Op, Receive, Received, SocketHandle, StreamHandle, Transfer,

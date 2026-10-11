@@ -8,7 +8,7 @@ use std::sync::Arc;
 use completion_async::{Cancel, Config, Executor, Facade, Memory};
 
 let mut executor = Executor::new(Config::default())?;
-let file = Facade::new(std::fs::File::open("data")?, &executor.submitter());
+let file = Facade::with_submitter(std::fs::File::open("data")?, &executor.submitter());
 let memory: Arc<dyn Memory> = Arc::new(vec![0u8; 5]);
 let cancel = Cancel::new();
 

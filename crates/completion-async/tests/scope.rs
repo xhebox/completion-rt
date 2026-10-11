@@ -46,7 +46,7 @@ fn a_scoped_task_runs_a_transfer() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file: File = Facade::new(
+	let file: File = Facade::with_submitter(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
@@ -106,7 +106,7 @@ fn a_transfer_reads_into_lent_memory() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file: File = Facade::new(common::open(&path).unwrap(), &executor.submitter());
+	let file: File = Facade::with_submitter(common::open(&path).unwrap(), &executor.submitter());
 	let guest = vec![0u8; 5];
 	let lent = &guest;
 
@@ -126,7 +126,7 @@ fn a_transfer_reads_into_lent_memory() {
 fn the_scope_waits_out_a_forgotten_transfer_on_lent_memory() {
 	let (left, mut right) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(left, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(left, &executor.submitter());
 	let guest = vec![0u8; 5];
 	let lent = &guest;
 
@@ -147,7 +147,10 @@ fn the_scope_waits_out_a_forgotten_transfer_on_lent_memory() {
 	// Drive the reactor long enough for an armed receive to complete.
 	let submitter = executor.submitter();
 	executor
-		.block_on(Timeout::new(Duration::from_millis(100), &submitter))
+		.block_on(Timeout::with_submitter(
+			Duration::from_millis(100),
+			&submitter,
+		))
 		.unwrap()
 		.unwrap();
 	assert_eq!(
@@ -166,7 +169,7 @@ fn lent_memory_is_refused_by_another_reactor() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let other = self::executor();
-	let file: File = Facade::new(common::open(&path).unwrap(), &other.submitter());
+	let file: File = Facade::with_submitter(common::open(&path).unwrap(), &other.submitter());
 	let guest = vec![0u8; 5];
 	let lent = &guest;
 

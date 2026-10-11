@@ -60,7 +60,7 @@ fn until_completes_when_the_op_lands_first() {
 	let path = dir.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file = File::new(std::fs::File::open(path).unwrap(), &executor.submitter());
+	let file = File::with_submitter(std::fs::File::open(path).unwrap(), &executor.submitter());
 
 	let buf = Arc::new(vec![0u8; 5]);
 	let cancel = Cancel::new();
@@ -209,7 +209,7 @@ fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 	let (left, right) = UnixStream::pair().unwrap();
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
-	let right: Facade<UnixStream> = Facade::new(right, &executor.submitter());
+	let right: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
 	let buf = Arc::new(vec![0u8; 8]);
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
@@ -265,7 +265,7 @@ fn a_cancel_shared_by_two_executors_wakes_both() {
 			let (left, right) = UnixStream::pair().unwrap();
 			left.set_nonblocking(true).unwrap();
 			right.set_nonblocking(true).unwrap();
-			let right: Facade<UnixStream> = Facade::new(right, &executor.submitter());
+			let right: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
 			let buf = Arc::new(vec![0u8; 8]);
 			let started = Instant::now();
 			let outcome = executor

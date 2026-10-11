@@ -87,7 +87,7 @@ fn listener(directory: &std::path::Path) -> (std::os::unix::net::UnixListener, s
 fn send_all_moves_a_payload_larger_than_one_call() {
 	let (client, mut server) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	// The peer drains, so the send buffer never holds the whole payload. The
 	// timeout is not part of the contract: it is here so a send that stops
@@ -123,7 +123,7 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 
 	let (mut client, server) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(server, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(server, &executor.submitter());
 
 	// The write timeout bounds the sender, so a receive that stops short fails
 	// this test instead of parking the sender thread.
@@ -171,7 +171,7 @@ fn a_caller_socket_type_gets_recv_and_send() {
 
 	let (client, mut server) = pair();
 	let mut executor = executor();
-	let socket: Facade<Wrapper> = Facade::new(Wrapper(client), &executor.submitter());
+	let socket: Facade<Wrapper> = Facade::with_submitter(Wrapper(client), &executor.submitter());
 
 	let payload: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
 	assert_eq!(
@@ -213,8 +213,8 @@ fn a_datagram_socket_takes_a_message_a_call() {
 	right.connect(left.local_addr().unwrap()).unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let receiver: Facade<UdpSocket> = Facade::new(left, &submitter);
-	let sender: Facade<UdpSocket> = Facade::new(right, &submitter);
+	let receiver: Facade<UdpSocket> = Facade::with_submitter(left, &submitter);
+	let sender: Facade<UdpSocket> = Facade::with_submitter(right, &submitter);
 
 	let payload: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
 	assert_eq!(
@@ -250,7 +250,7 @@ fn waits_resolve_when_the_socket_is_ready() {
 
 	let (client, mut server) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	executor.block_on(socket.wait_writable()).unwrap().unwrap();
 
@@ -271,7 +271,7 @@ fn an_accept_gives_a_stream_facade_of_its_own() {
 	let directory = common::tempdir("completion-accept-facade").unwrap();
 	let (listener, path) = listener(directory.path());
 	let mut executor = executor();
-	let listener: Facade<UnixListener> = Facade::new(listener, &executor.submitter());
+	let listener: Facade<UnixListener> = Facade::with_submitter(listener, &executor.submitter());
 
 	let mut client = UnixStream::connect(&path).unwrap();
 	let stream: Facade<UnixStream> = executor
@@ -320,7 +320,7 @@ fn a_tcp_accept_gives_a_stream_facade_of_its_own() {
 	listener.set_nonblocking(true).unwrap();
 	let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let mut executor = executor();
-	let listener: Facade<TcpListener> = Facade::new(listener, &executor.submitter());
+	let listener: Facade<TcpListener> = Facade::with_submitter(listener, &executor.submitter());
 
 	let stream: Facade<TcpStream> = executor
 		.block_on(listener.accept())
@@ -371,8 +371,8 @@ fn recv_with_fds_hands_the_descriptors_back() {
 	let (left, right) = UnixStream::pair().unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let sender: Facade<UnixStream> = Facade::new(left, &submitter);
-	let receiver: Facade<UnixStream> = Facade::new(right, &submitter);
+	let sender: Facade<UnixStream> = Facade::with_submitter(left, &submitter);
+	let receiver: Facade<UnixStream> = Facade::with_submitter(right, &submitter);
 
 	let file = std::fs::File::open(&path).unwrap();
 	let payload: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
@@ -418,7 +418,7 @@ fn take_error_takes_a_pending_error_off_the_socket() {
 	sender.send(b"x").unwrap();
 
 	let executor = executor();
-	let socket: Facade<UdpSocket> = Facade::new(sender, &executor.submitter());
+	let socket: Facade<UdpSocket> = Facade::with_submitter(sender, &executor.submitter());
 
 	let deadline = Instant::now() + Duration::from_secs(5);
 	let pending = loop {
@@ -452,7 +452,7 @@ fn a_shutdown_write_half_closes_the_connection() {
 
 	let (client, mut server) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	socket.shutdown(Shutdown::Write).unwrap();
 
@@ -487,7 +487,7 @@ fn a_shutdown_write_half_closes_the_connection() {
 fn a_given_up_receive_reports_the_cancel() {
 	let (client, _server) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 	let buffer = Arc::new(vec![0u8; 16]);
 	let cancel = Cancel::new();
 	// The cancel fired before the receive was asked for, so the first poll gives
@@ -525,7 +525,7 @@ fn a_cancel_ends_a_recv_exact_loop_mid_way() {
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
-	let socket: Facade<UnixStream> = Facade::new(right, &executor.submitter());
+	let socket: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0u8; 8]);
 	// Four bytes are one call: the loop takes them and comes back for the rest,
@@ -573,7 +573,7 @@ fn a_cancel_ends_a_send_all_loop_with_its_progress() {
 	// leave whatever the platform's defaults would buffer.
 	let (client, _server) = held_pair(64 << 10);
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	let len = 8 << 20;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
@@ -616,7 +616,7 @@ fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 	// down with the peer.
 	let (client, server) = held_pair(64 << 10);
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	let len = 8 << 20;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
@@ -651,7 +651,7 @@ fn a_shutdown_read_ends_a_receive_in_flight() {
 
 	let (client, _server) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0u8; 16]);
 	// The peer sends nothing, so the receive sits with the kernel and only a
@@ -686,7 +686,7 @@ fn a_shutdown_write_ends_a_send_in_flight() {
 
 	let (client, _server) = held_pair(64 << 10);
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	let len = 8 << 20;
 	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
@@ -722,7 +722,7 @@ fn a_take_waits_for_a_receive_in_flight() {
 
 	let (client, mut server) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0u8; 5]);
 	let mut receive = Box::pin(socket.clone().recv(memory(&buffer)));
@@ -769,7 +769,7 @@ fn a_take_without_waiting_reports_a_receive_in_flight() {
 
 	let (client, mut server) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::new(client, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_submitter(client, &executor.submitter());
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0u8; 5]);
 	let mut receive = Box::pin(socket.clone().recv(memory(&buffer)));

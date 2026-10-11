@@ -57,8 +57,8 @@ fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 	let (reader, writer) = std::io::pipe().unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let reader: Facade<std::io::PipeReader> = Facade::new(reader, &submitter);
-	let writer: Facade<std::io::PipeWriter> = Facade::new(writer, &submitter);
+	let reader: Facade<std::io::PipeReader> = Facade::with_submitter(reader, &submitter);
+	let writer: Facade<std::io::PipeWriter> = Facade::with_submitter(writer, &submitter);
 
 	let payload: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
 	let memory: Arc<dyn Memory> = Arc::clone(&payload) as Arc<dyn Memory>;
@@ -90,7 +90,7 @@ fn the_vector_path_goes_through_the_backing() {
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file: File = Facade::new(
+	let file: File = Facade::with_submitter(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
@@ -154,7 +154,7 @@ fn read_exact_at_reports_the_file_ending_first() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file = File::new(common::open(&path).unwrap(), &submitter);
+	let file = File::with_submitter(common::open(&path).unwrap(), &submitter);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
 	// One call: five bytes are left, and that is what it reports.
@@ -196,7 +196,7 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file = File::new(
+	let file = File::with_submitter(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
@@ -239,7 +239,7 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 		.write(true)
 		.open(&path)
 		.unwrap();
-	let file: File = Facade::new(file, &submitter);
+	let file: File = Facade::with_submitter(file, &submitter);
 
 	let written: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
 	let memory: Arc<dyn Memory> = Arc::clone(&written) as Arc<dyn Memory>;
@@ -282,7 +282,7 @@ fn a_facade_with_no_operations_gives_its_file_back_at_once() {
 	std::fs::write(&path, b"data").unwrap();
 	let executor = executor();
 	let submitter = executor.submitter();
-	let file = File::new(common::open(&path).unwrap(), &submitter);
+	let file = File::with_submitter(common::open(&path).unwrap(), &submitter);
 
 	let plain = block_on(file.take()).expect("nothing else names the file");
 	assert_eq!(plain.metadata().unwrap().len(), 4);
@@ -312,7 +312,7 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file = File::new(common::open(&path).unwrap(), &submitter);
+	let file = File::with_submitter(common::open(&path).unwrap(), &submitter);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
@@ -345,7 +345,7 @@ fn flush_leaves_the_facade_usable() {
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let file = File::new(
+	let file = File::with_submitter(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
@@ -403,7 +403,7 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 		raw
 	};
 
-	let file = File::new(unsafe { std::fs::File::from_raw_fd(dead) }, &submitter);
+	let file = File::with_submitter(unsafe { std::fs::File::from_raw_fd(dead) }, &submitter);
 	match executor.block_on(file.flush()).unwrap() {
 		Err(error) if error.kind() == ErrorKind::Failed => {
 			let error = io::Error::from(error);

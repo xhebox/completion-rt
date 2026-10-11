@@ -163,7 +163,7 @@ fn an_operation_after_the_executor_drops_is_refused() {
 	std::fs::write(&path, b"hello").unwrap();
 
 	let executor = executor();
-	let file = File::new(common::open(&path).unwrap(), &executor.submitter());
+	let file = File::with_submitter(common::open(&path).unwrap(), &executor.submitter());
 	drop(executor);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
@@ -194,7 +194,7 @@ fn a_local_executor_reads_a_real_file() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file = File::new(common::open(&path).unwrap(), &executor.submitter());
+	let file = File::with_submitter(common::open(&path).unwrap(), &executor.submitter());
 	let buffer = Arc::new(vec![0u8; 5]);
 	let payload: Arc<dyn Memory> = buffer.clone();
 	let outcome = executor.block_on(file.read_at(payload, 0)).unwrap();
@@ -267,13 +267,13 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 				Poll::Pending
 			}
 		}));
-		let file = File::new(common::open(&path).unwrap(), &submitter);
+		let file = File::with_submitter(common::open(&path).unwrap(), &submitter);
 		let buffer = Arc::new(vec![0u8; 5]);
 		let payload: Arc<dyn Memory> = buffer.clone();
 		executor
 			.block_on(async {
 				assert_eq!(file.read_at(payload, 0).await.into_result().unwrap(), 5);
-				Timeout::new(Duration::from_millis(1), &submitter)
+				Timeout::with_submitter(Duration::from_millis(1), &submitter)
 					.await
 					.unwrap();
 			})
@@ -298,7 +298,10 @@ fn socket_pair(
 	let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let (stream, _) = listener.accept().unwrap();
 	stream.set_nonblocking(true).unwrap();
-	(peer, completion_async::Facade::new(stream, submitter))
+	(
+		peer,
+		completion_async::Facade::with_submitter(stream, submitter),
+	)
 }
 
 fn stalled_task(
@@ -312,7 +315,10 @@ fn stalled_task(
 	});
 	let submitter = executor.submitter();
 	executor
-		.block_on(Timeout::new(Duration::from_millis(1), &submitter))
+		.block_on(Timeout::with_submitter(
+			Duration::from_millis(1),
+			&submitter,
+		))
 		.unwrap()
 		.unwrap();
 	(peer, task)
@@ -363,7 +369,10 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 		Poll::Pending
 	})));
 	executor
-		.block_on(Timeout::new(Duration::from_millis(1), &submitter))
+		.block_on(Timeout::with_submitter(
+			Duration::from_millis(1),
+			&submitter,
+		))
 		.unwrap()
 		.unwrap();
 	cancel.set(true);
@@ -399,7 +408,10 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		Poll::Pending::<()>
 	}));
 	executor
-		.block_on(Timeout::new(Duration::from_millis(1), &submitter))
+		.block_on(Timeout::with_submitter(
+			Duration::from_millis(1),
+			&submitter,
+		))
 		.unwrap()
 		.unwrap();
 	panic_next.set(true);
@@ -457,7 +469,10 @@ fn cancellation_unwinding_does_not_hide_later_unsignalled_io_drops() {
 			.is_pending()
 	);
 	executor
-		.block_on(Timeout::new(Duration::from_millis(1), &submitter))
+		.block_on(Timeout::with_submitter(
+			Duration::from_millis(1),
+			&submitter,
+		))
 		.unwrap()
 		.unwrap();
 	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(receive)));

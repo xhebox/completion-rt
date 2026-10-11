@@ -32,7 +32,7 @@ fn seeded(submitter: &Submitter, contents: &[u8]) -> File {
 	let path = dir.path().join("data");
 	std::fs::write(&path, contents).unwrap();
 	// The returned descriptor outlives the deleted directory entry.
-	File::new(common::open(path).unwrap(), submitter)
+	File::with_submitter(common::open(path).unwrap(), submitter)
 }
 
 /// The buffer in the shape the engine names memory: a second handle on it, so
@@ -79,7 +79,8 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 
 	let handle = Handle::new(std::fs::File::open(&first).unwrap());
 	let number: RawFd = handle.as_descriptor().as_raw_fd();
-	let facade: Facade<std::fs::File> = Facade::bind(handle.clone(), &executor.submitter());
+	let facade: Facade<std::fs::File> =
+		Facade::bind_with_submitter(handle.clone(), &executor.submitter());
 	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let read = facade.read_at(memory(&buf), 0);
 	// The caller's copies go before anything reaches the kernel; the read names
@@ -137,7 +138,7 @@ fn cancelling_waits_for_the_kernel() {
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
-	let right: Facade<UnixStream> = Facade::new(right, &executor.submitter());
+	let right: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
 	let buf = Arc::new(vec![0u8; 8]);
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
@@ -224,8 +225,8 @@ fn a_socket_send_lands_in_the_receive_buffer() {
 	let (left, right) = UnixStream::pair().unwrap();
 	let mut executor = executor();
 	let submitter = executor.submitter();
-	let left: Facade<UnixStream> = Facade::new(left, &submitter);
-	let right: Facade<UnixStream> = Facade::new(right, &submitter);
+	let left: Facade<UnixStream> = Facade::with_submitter(left, &submitter);
+	let right: Facade<UnixStream> = Facade::with_submitter(right, &submitter);
 
 	let sent: Arc<Vec<u8>> = Arc::new(b"over the socket".to_vec());
 	assert_eq!(
@@ -266,7 +267,7 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
-	let right: Facade<UnixStream> = Facade::new(right, &executor.submitter());
+	let right: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
 
 	// Nothing has been sent yet, so the receive stays in flight until the peer

@@ -47,7 +47,7 @@ fn waiting_on_the_descriptor_drives_the_backend() {
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
-	let file = File::new(std::fs::File::open(&path).unwrap(), &executor.submitter());
+	let file = File::with_submitter(std::fs::File::open(&path).unwrap(), &executor.submitter());
 	let (done, finished) = std::sync::mpsc::channel::<Result<usize, Error>>();
 	executor
 		.spawner()
@@ -103,7 +103,8 @@ fn a_timer_fires_within_the_timeout_turn_reports() {
 	executor
 		.spawner()
 		.spawn(async move {
-			let _ = done.send(Timeout::new(Duration::from_millis(150), &submitter).await);
+			let _ =
+				done.send(Timeout::with_submitter(Duration::from_millis(150), &submitter).await);
 		})
 		.detach();
 

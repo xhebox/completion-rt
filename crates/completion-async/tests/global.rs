@@ -3,9 +3,15 @@
 //! The harness runs each test on its own thread, so every test starts with a
 //! fresh executor.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+mod common;
 
-use completion_async::{block_on, spawn, try_spawn};
+use std::io::Read;
+use std::net::{TcpListener, TcpStream};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use completion_async::{Facade, Memory, Timeout, block_on, spawn, try_spawn};
 
 #[test]
 fn a_task_spawned_with_spawn_is_run_by_block_on() {
@@ -45,4 +51,33 @@ fn calling_block_on_inside_a_running_block_on_panics_as_nested() {
 		.or_else(|| payload.downcast_ref::<String>().cloned())
 		.unwrap_or_default();
 	assert!(message.contains("nested"), "{message}");
+}
+
+#[test]
+fn a_facade_made_inside_block_on_submits_to_the_global_executor() {
+	common::init_logging();
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+	let (mut server, _) = listener.accept().unwrap();
+
+	let payload: Arc<dyn Memory> = Arc::new(b"hello".to_vec());
+	let sent = block_on(async move {
+		let socket: Facade<TcpStream> = Facade::new(client);
+		socket.send_all(payload).await
+	})
+	.unwrap();
+	assert_eq!(sent.into_result().unwrap(), 5);
+
+	let mut got = [0u8; 5];
+	server.read_exact(&mut got).unwrap();
+	assert_eq!(&got, b"hello");
+}
+
+#[test]
+fn a_timeout_made_inside_a_spawned_task_fires_under_block_on() {
+	common::init_logging();
+	let start = Instant::now();
+	let task = spawn(async { Timeout::new(Duration::from_millis(20)).await });
+	block_on(task).unwrap().unwrap();
+	assert!(start.elapsed() >= Duration::from_millis(20));
 }

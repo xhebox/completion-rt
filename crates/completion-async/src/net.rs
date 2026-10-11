@@ -527,7 +527,7 @@ impl<S: ListenerHandle> Future for Accept<S> {
 				this.finished = true;
 				let response = this.gate.take_response();
 				match response {
-					Some(Response::Accepted(socket)) => Poll::Ready(Ok(Facade::new(
+					Some(Response::Accepted(socket)) => Poll::Ready(Ok(Facade::with_submitter(
 						socket,
 						&crate::Submitter(this.gate.submitter.clone()),
 					))),

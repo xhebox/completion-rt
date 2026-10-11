@@ -162,22 +162,37 @@ pub struct Facade<S> {
 }
 
 impl<S> Facade<S> {
+	/// Wraps `resource`, its operations going to this thread's global
+	/// executor's [`submitter`](crate::submitter).
+	///
+	/// See [`Facade::with_submitter`] for the resource's requirements.
+	pub fn new(resource: impl Into<S>) -> Facade<S> {
+		Self::with_submitter(resource, &crate::submitter())
+	}
+
 	/// Wraps `resource`, its operations going to `submitter`.
 	///
 	/// On Windows the resource must be opened for overlapped I/O: a file
 	/// through [`OpenOptions`], which asks for `FILE_FLAG_OVERLAPPED`. A handle
 	/// opened without that flag cannot be owned by a completion port, so its
 	/// operations fail with the invalid-parameter error the association gives.
-	pub fn new(resource: impl Into<S>, submitter: &crate::Submitter) -> Facade<S> {
+	pub fn with_submitter(resource: impl Into<S>, submitter: &crate::Submitter) -> Facade<S> {
 		Self {
 			handle: Handle::new(resource.into()),
 			submitter: submitter.0.clone(),
 		}
 	}
 
+	/// Wraps a `handle` the caller already holds, its operations going to this
+	/// thread's global executor's [`submitter`](crate::submitter); the facade
+	/// shares the handle rather than taking it over.
+	pub fn bind(handle: Handle<S>) -> Facade<S> {
+		Self::bind_with_submitter(handle, &crate::submitter())
+	}
+
 	/// Wraps a `handle` the caller already holds, its operations going to
 	/// `submitter`; the facade shares the handle rather than taking it over.
-	pub fn bind(handle: Handle<S>, submitter: &crate::Submitter) -> Facade<S> {
+	pub fn bind_with_submitter(handle: Handle<S>, submitter: &crate::Submitter) -> Facade<S> {
 		Self {
 			handle,
 			submitter: submitter.0.clone(),

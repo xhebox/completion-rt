@@ -151,6 +151,16 @@ unsafe impl<T: Memory + ?Sized> Memory for Arc<T> {
 	}
 }
 
+unsafe impl<T: Memory + ?Sized> Memory for &T {
+	fn span(&self, extent: Extent) -> io::Result<Span> {
+		(**self).span(extent)
+	}
+
+	fn len(&self) -> usize {
+		(**self).len()
+	}
+}
+
 unsafe impl Memory for Vec<u8> {
 	fn len(&self) -> usize {
 		Vec::len(self)

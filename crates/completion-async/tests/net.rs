@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use completion_async::{Cancel, Config, Error, Executor as _, ExecutorEnum, Facade, Memory};
+use completion_async::{Cancel, Config, ErrorKind, Executor, Facade, Memory};
 
 /// The async driver the socket operations run on.
-fn executor() -> ExecutorEnum {
+fn executor() -> Executor {
 	common::init_logging();
-	ExecutorEnum::new(Config::default()).unwrap()
+	Executor::new(Config::default()).unwrap()
 }
 
 /// The buffer in the shape the engine names memory.
@@ -498,7 +498,10 @@ fn a_given_up_receive_reports_the_cancel() {
 		.block_on(socket.recv(memory(&buffer)).until(&cancel))
 		.unwrap();
 	assert!(
-		matches!(outcome.result, Err(Error::Cancelled)),
+		outcome
+			.result
+			.as_ref()
+			.is_err_and(|error| error.kind() == ErrorKind::Cancelled),
 		"a given-up receive is not the receive's own result: {:?}",
 		outcome.result
 	);
@@ -541,7 +544,10 @@ fn a_cancel_ends_a_recv_exact_loop_mid_way() {
 	thread.join().unwrap();
 	assert_eq!(outcome.value, 4, "the loop kept the bytes it had taken");
 	assert!(
-		matches!(outcome.result, Err(Error::Cancelled)),
+		outcome
+			.result
+			.as_ref()
+			.is_err_and(|error| error.kind() == ErrorKind::Cancelled),
 		"a given-up loop is not the loop's own result: {:?}",
 		outcome.result
 	);
@@ -587,7 +593,10 @@ fn a_cancel_ends_a_send_all_loop_with_its_progress() {
 		"the cancel threw away the bytes the loop had sent"
 	);
 	assert!(
-		matches!(outcome.result, Err(Error::Cancelled)),
+		outcome
+			.result
+			.as_ref()
+			.is_err_and(|error| error.kind() == ErrorKind::Cancelled),
 		"a given-up loop is not the loop's own result: {:?}",
 		outcome.result
 	);

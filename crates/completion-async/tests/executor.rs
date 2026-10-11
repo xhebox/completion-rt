@@ -15,13 +15,11 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use completion_async::{
-	Config, Error, Executor as _, ExecutorClosed, ExecutorEnum, File, Memory, Timeout,
-};
+use completion_async::{Config, ErrorKind, Executor, File, Memory, Timeout};
 
-fn executor() -> ExecutorEnum {
+fn executor() -> Executor {
 	common::init_logging();
-	ExecutorEnum::new(Config::default()).unwrap()
+	Executor::new(Config::default()).unwrap()
 }
 
 /// A future that hands its waker to another thread on the first poll and
@@ -179,7 +177,12 @@ fn an_operation_after_the_executor_drops_is_refused() {
 		panic!("the operation submitted after the executor dropped parked forever");
 	};
 	match outcome.into_result() {
-		Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe),
+		Err(error) if error.kind() == ErrorKind::Failed => {
+			assert_eq!(
+				std::io::Error::from(error).kind(),
+				std::io::ErrorKind::BrokenPipe
+			)
+		}
 		Err(error) => panic!("the refusal was not a broken pipe: {error}"),
 		Ok(count) => panic!("a gone reactor took the operation and moved {count} bytes"),
 	}
@@ -215,7 +218,23 @@ fn try_spawn_reports_a_dropped_executor() {
 	let executor = executor();
 	let spawner = executor.spawner();
 	drop(executor);
-	assert_eq!(spawner.try_spawn(async {}).err(), Some(ExecutorClosed));
+	assert!(
+		spawner
+			.try_spawn(async {})
+			.is_err_and(|error| error.kind() == ErrorKind::ExecutorClosed)
+	);
+}
+
+#[test]
+fn a_dropped_executor_error_is_other_in_io() {
+	let executor = executor();
+	let spawner = executor.spawner();
+	drop(executor);
+	let error = spawner.try_spawn(async {}).err().unwrap();
+	assert_eq!(
+		std::io::Error::from(error).kind(),
+		std::io::ErrorKind::Other
+	);
 }
 
 #[test]
@@ -283,7 +302,7 @@ fn socket_pair(
 }
 
 fn stalled_task(
-	executor: &mut ExecutorEnum,
+	executor: &mut Executor,
 	buffer: &Arc<Vec<u8>>,
 ) -> (std::net::TcpStream, impl Future<Output = ()> + use<>) {
 	let (peer, socket) = socket_pair(&executor.submitter());

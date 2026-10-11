@@ -15,10 +15,10 @@ use std::cell::{OnceCell, RefCell};
 use std::future::Future;
 use std::io;
 
-use crate::{Config, Executor as _, ExecutorClosed, ExecutorEnum, Spawner, Task};
+use crate::{Config, Error, Executor, Scope, Spawner, Task};
 
 thread_local! {
-	static EXECUTOR: RefCell<Option<ExecutorEnum>> = const { RefCell::new(None) };
+	static EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
 	static SPAWNER: OnceCell<Spawner> = const { OnceCell::new() };
 }
 
@@ -29,7 +29,7 @@ thread_local! {
 fn initialize() {
 	SPAWNER.with(|spawner| {
 		spawner.get_or_init(|| {
-			let executor = ExecutorEnum::new(Config::default())
+			let executor = Executor::new(Config::default())
 				.expect("the thread's global executor could not be created");
 			let spawner = executor.spawner();
 			EXECUTOR.with(|slot| *slot.borrow_mut() = Some(executor));
@@ -62,14 +62,33 @@ pub fn spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Task<T> {
 	spawner.spawn(future)
 }
 
-/// Spawns `future` on this thread's global executor, or returns [`ExecutorClosed`]
+/// Spawns `future` on this thread's global executor, or returns an
+/// [`Error`](crate::Error) of kind [`ExecutorClosed`](crate::ErrorKind::ExecutorClosed)
 /// if the executor has been dropped.
 ///
 /// Safe to call from a task while a `block_on` is running.
-pub fn try_spawn<T: 'static>(
-	future: impl Future<Output = T> + 'static,
-) -> Result<Task<T>, ExecutorClosed> {
+pub fn try_spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Result<Task<T>, Error> {
 	initialize();
 	let spawner = SPAWNER.with(|spawner| spawner.get().expect("initialized above").clone());
 	spawner.try_spawn(future)
+}
+
+/// Runs `body` with a scope on this thread's global executor, so the tasks it
+/// spawns may borrow from the caller.
+///
+/// The scope returns once `body` does, dropping whatever is still in flight.
+/// Panics if the executor is already running, as it is when called from inside
+/// another [`block_on`] or `scope`.
+pub fn scope<'a, F, Fut, R>(body: F) -> io::Result<R>
+where
+	F: FnOnce(Scope<'a>) -> Fut,
+	Fut: Future<Output = R> + 'a,
+{
+	initialize();
+	EXECUTOR.with(|slot| {
+		let Ok(mut slot) = slot.try_borrow_mut() else {
+			panic!("the thread's global executor is already running; scope cannot be nested");
+		};
+		slot.as_mut().expect("initialized above").scope(body)
+	})
 }

@@ -31,6 +31,6 @@ pub use memory::{Extent, Memory, Span};
 // Plumbing the async crate reaches across the crate boundary. `pub(crate)` does
 // not cross crates, so these are public but not part of the supported surface.
 #[doc(hidden)]
-pub use core::{ReactorWaker, cancel_task_future};
+pub use core::{Lease, ReactorWaker, cancel_task_future};
 #[doc(hidden)]
 pub use memory::Extents;

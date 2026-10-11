@@ -17,15 +17,13 @@ use std::task::{Context, Poll, Waker};
 
 #[cfg(unix)]
 use completion_async::Facade;
-use completion_async::{
-	Config, Error, Executor as _, ExecutorEnum, File, Handle, Memory, Submitter,
-};
+use completion_async::{Config, ErrorKind, Executor, File, Handle, Memory, Submitter};
 
 /// The async driver the operations run on: it owns the reactor, and `block_on`
 /// drives both the future and the backend beneath it.
-fn executor() -> ExecutorEnum {
+fn executor() -> Executor {
 	common::init_logging();
-	ExecutorEnum::new(Config::default()).unwrap()
+	Executor::new(Config::default()).unwrap()
 }
 
 /// A file with `contents`, wrapped in a facade bound to `submitter`.
@@ -150,7 +148,12 @@ fn cancelling_waits_for_the_kernel() {
 	let outcome = executor
 		.block_on(right.recv(memory(&buf)).until(&cancel))
 		.unwrap();
-	assert!(matches!(outcome.result, Err(Error::Cancelled)));
+	assert!(
+		outcome
+			.result
+			.as_ref()
+			.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
+	);
 	// The kernel is done, so only the caller's handle remains.
 	assert_eq!(Arc::strong_count(&buf), 1);
 	// A write after the cancel lands nowhere: the kernel is no longer reading
@@ -287,7 +290,7 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 #[test]
 #[cfg(target_os = "linux")]
 fn sqpoll_rings_complete_too() {
-	let mut executor = match ExecutorEnum::new(Config {
+	let mut executor = match Executor::new(Config {
 		sqpoll: true,
 		..Config::default()
 	}) {
@@ -321,7 +324,7 @@ fn sqpoll_rings_complete_too() {
 #[test]
 #[cfg(target_os = "linux")]
 fn fsync_is_refused_on_an_iopoll_ring() {
-	let mut executor = ExecutorEnum::new(Config {
+	let mut executor = Executor::new(Config {
 		iopoll: true,
 		..Config::default()
 	})
@@ -331,7 +334,9 @@ fn fsync_is_refused_on_an_iopoll_ring() {
 	// first poll rather than at submit time.
 	match executor.block_on(file.sync()).unwrap() {
 		Ok(()) => panic!("fsync on an IOPOLL ring must be refused"),
-		Err(Error::Io(error)) => assert_eq!(error.kind(), io::ErrorKind::Unsupported),
+		Err(error) if error.kind() == ErrorKind::Failed => {
+			assert_eq!(io::Error::from(error).kind(), io::ErrorKind::Unsupported)
+		}
 		Err(other) => panic!("fsync on an IOPOLL ring must be refused, got {other:?}"),
 	}
 }
@@ -354,7 +359,9 @@ fn a_submission_after_the_executor_drops_is_refused() {
 		panic!("the operation submitted after the executor dropped parked forever");
 	};
 	match outcome.into_result() {
-		Err(Error::Io(error)) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
+		Err(error) if error.kind() == ErrorKind::Failed => {
+			assert_eq!(io::Error::from(error).kind(), io::ErrorKind::BrokenPipe)
+		}
 		Err(error) => panic!("the refusal was not a broken pipe: {error}"),
 		Ok(count) => panic!("a gone reactor moved {count} bytes"),
 	}

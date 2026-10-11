@@ -18,14 +18,14 @@ use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use completion_async::{
-	Accept, AsDescriptor, Cancel, Config, Error, Executor as _, ExecutorEnum, Facade, File,
-	ListenerHandle, Memory, Op, Receive, Transfer,
+	Accept, AsDescriptor, Cancel, Config, ErrorKind, Executor, Facade, File, ListenerHandle,
+	Memory, Op, Receive, Transfer,
 };
 
 /// The async driver the operations run on.
-fn executor() -> ExecutorEnum {
+fn executor() -> Executor {
 	common::init_logging();
-	ExecutorEnum::new(Config::default()).unwrap()
+	Executor::new(Config::default()).unwrap()
 }
 
 /// The buffer in the shape the engine names memory.
@@ -41,8 +41,8 @@ fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
 fn a_facade_future_is_send_when_its_singleton_is() {
 	fn assert_send<T: Send>() {}
 	fn transfer<S: AsDescriptor + Send + Sync + 'static>() {
-		assert_send::<Transfer<S>>();
-		assert_send::<Receive<S>>();
+		assert_send::<Transfer<'static, S>>();
+		assert_send::<Receive<'static, S>>();
 		assert_send::<Op<S>>();
 	}
 	fn accept<S: ListenerHandle>() {
@@ -222,7 +222,12 @@ fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 		.block_on(right.recv(memory(&buf)).until(&cancel))
 		.unwrap();
 	thread.join().unwrap();
-	assert!(matches!(outcome.result, Err(Error::Cancelled)));
+	assert!(
+		outcome
+			.result
+			.as_ref()
+			.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
+	);
 	assert!(
 		started.elapsed() < Duration::from_secs(5),
 		"the parked block_on slept through the cancel"
@@ -282,7 +287,12 @@ fn a_cancel_shared_by_two_executors_wakes_both() {
 		let (outcome, elapsed, buf) = finished
 			.recv_timeout(Duration::from_secs(5))
 			.expect("a parked block_on never woke: the shared cancel was lost");
-		assert!(matches!(outcome.result, Err(Error::Cancelled)));
+		assert!(
+			outcome
+				.result
+				.as_ref()
+				.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
+		);
 		assert!(
 			elapsed < Duration::from_secs(1),
 			"an executor parked in block_on slept through the shared cancel: {elapsed:?}"

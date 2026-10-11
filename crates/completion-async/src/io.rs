@@ -2,13 +2,59 @@
 
 use std::fs;
 use std::io;
+use std::marker::PhantomData;
 use std::panic::Location;
 use std::path::Path;
 use std::sync::Arc;
 
-use completion_rt::{AsDescriptor, Extent, Extents, Handle, Memory, Submitter};
+use completion_rt::{AsDescriptor, Extent, Extents, Handle, Lease, Memory, Submitter};
 
 use crate::net::{Kind, Op, Transfer, whole};
+
+/// Memory handed to an operation: owned by it, or lent by a
+/// [`Scope`](crate::Scope).
+pub struct Lent<'a> {
+	pub(crate) memory: Arc<dyn Memory>,
+	pub(crate) lease: Option<Arc<Lease>>,
+	borrow: PhantomData<&'a ()>,
+}
+
+impl<'a> Lent<'a> {
+	/// Memory a scope lends under `lease`; the caller vouches that `memory`
+	/// outlives every operation submitted under it.
+	pub(crate) fn lent(memory: Arc<dyn Memory>, lease: Arc<Lease>) -> Lent<'a> {
+		Lent {
+			memory,
+			lease: Some(lease),
+			borrow: PhantomData,
+		}
+	}
+}
+
+/// What an operation takes as its memory.
+///
+/// Any `'static` [`Memory`] — a `Vec<u8>`, an `Arc` of one — is moved in. A
+/// borrow goes through [`Scope::lend`](crate::Scope::lend), which ties the
+/// operation to the scope.
+pub trait IntoMemory<'a> {
+	fn into_memory(self) -> Lent<'a>;
+}
+
+impl<T: Memory + 'static> IntoMemory<'static> for T {
+	fn into_memory(self) -> Lent<'static> {
+		Lent {
+			memory: Arc::new(self),
+			lease: None,
+			borrow: PhantomData,
+		}
+	}
+}
+
+impl<'a> IntoMemory<'a> for Lent<'a> {
+	fn into_memory(self) -> Lent<'a> {
+		self
+	}
+}
 
 /// `std::fs::OpenOptions` plus direct I/O, and on Windows the overlapped flag
 /// the iocp backend needs.
@@ -180,18 +226,20 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	/// the call moved, not an error. [`read_exact_at`](Self::read_exact_at)
 	/// loops.
 	#[track_caller]
-	pub fn read_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<S> {
-		let extents = whole(&*mem);
+	pub fn read_at<'a>(&self, mem: impl IntoMemory<'a>, fdoff: u64) -> Transfer<'a, S> {
+		let mem = mem.into_memory();
+		let extents = whole(&*mem.memory);
 		Transfer::new(self, Location::caller(), Kind::Read { fdoff }, mem, extents)
 	}
 
 	#[track_caller]
-	pub fn read_vectored_at(
+	pub fn read_vectored_at<'a>(
 		&self,
-		mem: Arc<dyn Memory>,
+		mem: impl IntoMemory<'a>,
 		ranges: impl IntoIterator<Item = Extent>,
 		fdoff: u64,
-	) -> Transfer<S> {
+	) -> Transfer<'a, S> {
+		let mem = mem.into_memory();
 		let extents: Extents = ranges.into_iter().collect();
 		Transfer::new(self, Location::caller(), Kind::Read { fdoff }, mem, extents)
 	}
@@ -202,8 +250,9 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	/// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) when the file ends
 	/// first.
 	#[track_caller]
-	pub fn read_exact_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<S> {
-		let extents = whole(&*mem);
+	pub fn read_exact_at<'a>(&self, mem: impl IntoMemory<'a>, fdoff: u64) -> Transfer<'a, S> {
+		let mem = mem.into_memory();
+		let extents = whole(&*mem.memory);
 		Transfer::new(
 			self,
 			Location::caller(),
@@ -214,12 +263,13 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	}
 
 	#[track_caller]
-	pub fn read_exact_vectored_at(
+	pub fn read_exact_vectored_at<'a>(
 		&self,
-		mem: Arc<dyn Memory>,
+		mem: impl IntoMemory<'a>,
 		ranges: impl IntoIterator<Item = Extent>,
 		fdoff: u64,
-	) -> Transfer<S> {
+	) -> Transfer<'a, S> {
+		let mem = mem.into_memory();
 		let extents: Extents = ranges.into_iter().collect();
 		Transfer::new(
 			self,
@@ -234,8 +284,9 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	/// the call moved, not an error. [`write_all_at`](Self::write_all_at)
 	/// loops.
 	#[track_caller]
-	pub fn write_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<S> {
-		let extents = whole(&*mem);
+	pub fn write_at<'a>(&self, mem: impl IntoMemory<'a>, fdoff: u64) -> Transfer<'a, S> {
+		let mem = mem.into_memory();
+		let extents = whole(&*mem.memory);
 		Transfer::new(
 			self,
 			Location::caller(),
@@ -246,12 +297,13 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	}
 
 	#[track_caller]
-	pub fn write_vectored_at(
+	pub fn write_vectored_at<'a>(
 		&self,
-		mem: Arc<dyn Memory>,
+		mem: impl IntoMemory<'a>,
 		ranges: impl IntoIterator<Item = Extent>,
 		fdoff: u64,
-	) -> Transfer<S> {
+	) -> Transfer<'a, S> {
+		let mem = mem.into_memory();
 		let extents: Extents = ranges.into_iter().collect();
 		Transfer::new(
 			self,
@@ -267,8 +319,9 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	///
 	/// [`WriteZero`](io::ErrorKind::WriteZero) when a call writes nothing.
 	#[track_caller]
-	pub fn write_all_at(&self, mem: Arc<dyn Memory>, fdoff: u64) -> Transfer<S> {
-		let extents = whole(&*mem);
+	pub fn write_all_at<'a>(&self, mem: impl IntoMemory<'a>, fdoff: u64) -> Transfer<'a, S> {
+		let mem = mem.into_memory();
+		let extents = whole(&*mem.memory);
 		Transfer::new(
 			self,
 			Location::caller(),
@@ -279,12 +332,13 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	}
 
 	#[track_caller]
-	pub fn write_all_vectored_at(
+	pub fn write_all_vectored_at<'a>(
 		&self,
-		mem: Arc<dyn Memory>,
+		mem: impl IntoMemory<'a>,
 		ranges: impl IntoIterator<Item = Extent>,
 		fdoff: u64,
-	) -> Transfer<S> {
+	) -> Transfer<'a, S> {
+		let mem = mem.into_memory();
 		let extents: Extents = ranges.into_iter().collect();
 		Transfer::new(
 			self,

@@ -81,6 +81,10 @@ pub(super) trait Backend: Send {
 
 	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
 
+	fn allocate(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()>;
+
+	fn punch(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()>;
+
 	fn recv(
 		&mut self,
 		id: u64,

@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use completion_rt::{
-	AsDescriptor, Cancel, Completion, Extent, Extents, Handle, Memory, OwnedDescriptor,
-	OwnedSocket, Response, Submitter, Until,
+	AsDescriptor, Cancel, Completion, Extent, Extents, Handle, Memory, OwnedDescriptor, Response,
+	Submitter, Until,
 };
 
 use crate::io::{IntoMemory, Lent};
+use crate::kind::{self, ListenerHandle, Resource, SocketKind};
 use crate::outcome::Outcome;
 use crate::{Error, Facade};
 
@@ -108,8 +109,11 @@ pub(super) fn whole(memory: &dyn Memory) -> Extents {
 	}])
 }
 
-pub(super) type Submit<S> =
-	fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>;
+pub(super) type Submit<S> = Box<
+	dyn Fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
+		+ Send
+		+ Sync,
+>;
 
 pub(super) struct Flow<'a, S> {
 	handle: Handle<S>,
@@ -261,13 +265,16 @@ impl<S> Gate<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
 		origin: &'static Location<'static>,
-		submit: Submit<S>,
+		submit: impl Fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
+		+ Send
+		+ Sync
+		+ 'static,
 	) -> Gate<S> {
 		Self {
 			handle: facade.handle().clone(),
 			submitter: facade.submitter().clone(),
 			cancel: None,
-			submit,
+			submit: Box::new(submit),
 			origin,
 			response: None,
 			call: Call::idle(),
@@ -445,7 +452,10 @@ impl<S> Op<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
 		origin: &'static Location<'static>,
-		submit: Submit<S>,
+		submit: impl Fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
+		+ Send
+		+ Sync
+		+ 'static,
 	) -> Op<S> {
 		Self {
 			gate: Gate::new(facade, origin, submit),
@@ -492,7 +502,10 @@ impl<S> Accept<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
 		origin: &'static Location<'static>,
-		submit: Submit<S>,
+		submit: impl Fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
+		+ Send
+		+ Sync
+		+ 'static,
 	) -> Accept<S> {
 		Self {
 			gate: Gate::new(facade, origin, submit),
@@ -538,18 +551,10 @@ impl<S: ListenerHandle> Future for Accept<S> {
 	}
 }
 
-/// A socket supporting send and receive operations. Implementable by caller-owned socket types.
-pub trait SocketHandle: AsDescriptor + Send + Sync + 'static {}
-
-/// A byte-stream socket, supporting `*_exact` and `*_all` transfers.
-pub trait StreamHandle: SocketHandle {}
-
-/// A listening socket with a typed accepted stream.
-pub trait ListenerHandle: AsDescriptor + Send + Sync + 'static {
-	type Stream: StreamHandle + From<OwnedSocket>;
-}
-
-impl<S: SocketHandle> Facade<S> {
+impl<S: Resource> Facade<S>
+where
+	S::Kind: SocketKind,
+{
 	/// Receives into the whole of `mem`, in one call: a short count is what
 	/// arrived, not an error. [`recv_exact`](Facade::recv_exact) loops.
 	#[track_caller]
@@ -622,7 +627,7 @@ impl<S: SocketHandle> Facade<S> {
 	}
 }
 
-impl<S: StreamHandle> Facade<S> {
+impl<S: Resource<Kind = kind::Stream>> Facade<S> {
 	/// Receives into the whole of `mem`, over as many calls as it takes to fill
 	/// it.
 	///
@@ -702,31 +707,6 @@ impl<S: ListenerHandle> Facade<S> {
 	#[track_caller]
 	pub fn accept(&self) -> Accept<S> {
 		Accept::new(self, Location::caller(), Submitter::accept_at)
-	}
-}
-
-impl SocketHandle for std::net::TcpStream {}
-impl StreamHandle for std::net::TcpStream {}
-
-impl SocketHandle for std::net::UdpSocket {}
-
-impl ListenerHandle for std::net::TcpListener {
-	type Stream = std::net::TcpStream;
-}
-
-#[cfg(unix)]
-mod platform {
-	use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
-
-	use super::{ListenerHandle, SocketHandle, StreamHandle};
-
-	impl SocketHandle for UnixStream {}
-	impl StreamHandle for UnixStream {}
-
-	impl SocketHandle for UnixDatagram {}
-
-	impl ListenerHandle for UnixListener {
-		type Stream = UnixStream;
 	}
 }
 

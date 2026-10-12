@@ -342,6 +342,25 @@ fn fsync_is_refused_on_an_iopoll_ring() {
 	}
 }
 
+/// A fallocate has no polled form either.
+#[test]
+#[cfg(target_os = "linux")]
+fn allocate_is_refused_on_an_iopoll_ring() {
+	let mut executor = Executor::new(Config {
+		iopoll: true,
+		..Config::default()
+	})
+	.unwrap();
+	let file = seeded(&executor.submitter(), b"data");
+	match executor.block_on(file.allocate(0, 4096)).unwrap() {
+		Ok(()) => panic!("allocate on an IOPOLL ring must be refused"),
+		Err(error) if error.kind() == ErrorKind::Failed => {
+			assert_eq!(io::Error::from(error).kind(), io::ErrorKind::Unsupported)
+		}
+		Err(other) => panic!("allocate on an IOPOLL ring must be refused, got {other:?}"),
+	}
+}
+
 /// Dropping the executor stops the reactor it owns: a facade left over — every
 /// clone a caller kept is one — is refused from then on, so the caller has an
 /// error to act on instead of a completion nothing drives.

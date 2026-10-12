@@ -17,7 +17,7 @@ use std::time::Duration;
 use completion_rt::{BorrowedDescriptor, Lease, Memory, Reactor, Submitter as LowSubmitter};
 
 use crate::io::Lent;
-use crate::{Error, Submitter};
+use crate::{Error, Submitter, Timers};
 
 const TICK_BUDGET: usize = 64;
 
@@ -390,6 +390,7 @@ pub struct Executor {
 	// Drop the reactor first so in-flight I/O settles before task futures release their Completions.
 	reactor: Reactor,
 	submitter: LowSubmitter,
+	timers: Timers,
 	local: Rc<Local<'static>>,
 	driver: Waker,
 }
@@ -411,9 +412,11 @@ impl Executor {
 		let driver = Waker::from(Arc::new(reactor.waker()));
 		let local = Rc::new(Local::new());
 		local.drive(&driver);
+		let timers = Timers(reactor.timers());
 		Executor {
 			reactor,
 			submitter,
+			timers,
 			local,
 			driver,
 		}
@@ -512,6 +515,11 @@ impl Executor {
 	/// A handle for submitting operations.
 	pub fn submitter(&self) -> Submitter {
 		Submitter(self.submitter.clone())
+	}
+
+	/// The timer wheel of this executor's reactor, for [`Timeout::with_timers`](crate::Timeout::with_timers).
+	pub fn timers(&self) -> Timers {
+		self.timers.clone()
 	}
 
 	/// The descriptor to wait on between passes of an [`Executor::embedded`]

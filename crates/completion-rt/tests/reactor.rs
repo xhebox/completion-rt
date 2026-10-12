@@ -19,12 +19,11 @@ use std::time::{Duration, Instant};
 use std::future::Future;
 #[cfg(unix)]
 use std::pin::pin;
-#[cfg(unix)]
 use std::task::{Context, Waker};
 
-use completion_rt::{Cancel, Cancelled, Config, Extent, Handle, Memory, Reactor};
 #[cfg(unix)]
-use completion_rt::{Completion, Submitter};
+use completion_rt::{Cancel, Cancelled, Completion, Submitter};
+use completion_rt::{Config, Extent, Handle, Memory, Reactor};
 
 /// The buffer in the shape the engine names memory: a second handle on it, so
 /// it outlives the operation.
@@ -170,36 +169,34 @@ fn a_poll_without_a_wait_leaves_the_notification_raised() {
 	);
 }
 
-/// Several timers wait at once: each deadline is an entry in the reactor's
-/// table, so the nearest one is what the poller sleeps to and a later one
-/// stays pending behind it.
+/// Several timers wait at once: each is armed on the reactor's wheel, so the
+/// nearest one is what the poller sleeps to and a later one stays pending
+/// behind it.
 #[test]
 fn timers_wait_out_their_own_deadlines() {
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
-	let started = std::time::Instant::now();
-	let mut near = submitter.timeout(Duration::from_millis(20)).unwrap();
-	let far = submitter.timeout(Duration::from_secs(2)).unwrap();
-	let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+	let (mut reactor, _submitter) = Reactor::new(Config::default()).unwrap();
+	let timers = reactor.timers();
+	let started = Instant::now();
+	let near = timers
+		.insert(Instant::now() + Duration::from_millis(20))
+		.unwrap();
+	let far = timers
+		.insert(Instant::now() + Duration::from_secs(2))
+		.unwrap();
+	let mut cx = Context::from_waker(Waker::noop());
 
-	// Drive until the near timer lands, taking its completion in the loop:
-	// the reactor is not idle either way while the far one waits.
-	let mut landed = None;
-	while landed.is_none() {
+	while timers.poll(near, &mut cx).is_pending() {
 		reactor.poll(Some(Duration::from_millis(1))).unwrap();
-		if let std::task::Poll::Ready(((), result)) =
-			std::future::Future::poll(std::pin::Pin::new(&mut near), &mut cx)
-		{
-			landed = Some(result);
-		}
 	}
-	assert!(landed.unwrap().is_ok(), "the near timer completed");
 	assert!(
 		started.elapsed() < Duration::from_secs(1),
 		"the poller slept for the far timer's deadline"
 	);
-	// The far one is still in the table.
-	assert!(!reactor.is_idle());
-	drop(far);
+	assert!(
+		timers.poll(far, &mut cx).is_pending(),
+		"the far timer came due with the near one"
+	);
+	timers.cancel(far);
 }
 
 /// A wait is capped at the nearest deadline: a poll asked for far longer than
@@ -207,14 +204,22 @@ fn timers_wait_out_their_own_deadlines() {
 /// passes.
 #[test]
 fn a_poll_does_not_sleep_past_the_nearest_deadline() {
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
-	let timer = submitter.timeout(Duration::from_millis(50)).unwrap();
-	let started = std::time::Instant::now();
-	while !reactor.is_idle() {
-		// Far longer than the timer: only the table cuts the wait short.
-		reactor.poll(Some(Duration::from_secs(5))).unwrap();
-	}
+	let (mut reactor, _submitter) = Reactor::new(Config::default()).unwrap();
+	let timers = reactor.timers();
+	let timer = timers
+		.insert(Instant::now() + Duration::from_millis(50))
+		.unwrap();
+	let mut cx = Context::from_waker(Waker::noop());
+	let started = Instant::now();
+	let result = loop {
+		match timers.poll(timer, &mut cx) {
+			std::task::Poll::Ready(result) => break result,
+			// Far longer than the timer: only the wheel cuts the wait short.
+			std::task::Poll::Pending => reactor.poll(Some(Duration::from_secs(5))).unwrap(),
+		}
+	};
 	let elapsed = started.elapsed();
+	result.expect("the timer completed");
 	assert!(
 		elapsed >= Duration::from_millis(50),
 		"the timer fired early: {elapsed:?}"
@@ -223,8 +228,6 @@ fn a_poll_does_not_sleep_past_the_nearest_deadline() {
 		elapsed < Duration::from_secs(1),
 		"the wait slept past the nearest deadline: {elapsed:?}"
 	);
-	let ((), result) = block_on(timer);
-	result.expect("the timer completed");
 }
 
 /// A timer submitted from another thread while the reactor is parked in a wait
@@ -233,6 +236,7 @@ fn a_poll_does_not_sleep_past_the_nearest_deadline() {
 #[test]
 fn a_timer_from_another_thread_wakes_a_parked_wait() {
 	let (reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let timers = reactor.timers();
 	let stop = Arc::new(AtomicBool::new(false));
 	let event = submitter.event();
 	let driven = {
@@ -249,8 +253,10 @@ fn a_timer_from_another_thread_wakes_a_parked_wait() {
 	// Let the driver reach its wait, with nothing in the table.
 	std::thread::sleep(Duration::from_millis(50));
 	let started = std::time::Instant::now();
-	let timer = submitter.timeout(Duration::from_millis(50)).unwrap();
-	let ((), result) = block_on(timer);
+	let timer = timers
+		.insert(Instant::now() + Duration::from_millis(50))
+		.unwrap();
+	let result = block_on(std::future::poll_fn(|cx| timers.poll(timer, cx)));
 	result.expect("the timer completed");
 	let elapsed = started.elapsed();
 	stop.store(true, Ordering::SeqCst);
@@ -262,26 +268,35 @@ fn a_timer_from_another_thread_wakes_a_parked_wait() {
 	);
 }
 
-/// A dropped timer leaves nothing behind: no kernel operation to wait for, no
-/// deadline in the table, and no wait shortened by a deadline that has gone.
+/// A cancelled timer leaves nothing behind: its poll reports the cancel, and
+/// once its deadline has passed no wait is shortened by it.
 #[test]
-fn a_dropped_timer_never_fires_and_leaves_the_reactor_idle() {
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
-	let timer = submitter.timeout(Duration::from_millis(20)).unwrap();
+fn a_cancelled_timer_never_fires_and_leaves_no_deadline_behind() {
+	let (mut reactor, _submitter) = Reactor::new(Config::default()).unwrap();
+	let timers = reactor.timers();
+	let timer = timers
+		.insert(Instant::now() + Duration::from_millis(20))
+		.unwrap();
+	let mut cx = Context::from_waker(Waker::noop());
 	reactor.poll(Some(Duration::ZERO)).unwrap();
-	assert!(!reactor.is_idle(), "the timer waits in the table");
-	drop(timer);
-	assert!(reactor.is_idle(), "the dropped timer is still in the table");
+	assert!(
+		timers.poll(timer, &mut cx).is_pending(),
+		"the timer waits on the wheel"
+	);
+	timers.cancel(timer);
+	assert!(
+		matches!(timers.poll(timer, &mut cx), std::task::Poll::Ready(Err(_))),
+		"the cancelled timer still reported a fire"
+	);
 	// The deadline passes with nothing to fire.
 	std::thread::sleep(Duration::from_millis(50));
 	reactor.poll(Some(Duration::ZERO)).unwrap();
-	assert!(reactor.is_idle(), "the dropped timer was settled");
 	// A stale deadline would cut this wait to zero.
-	let started = std::time::Instant::now();
+	let started = Instant::now();
 	reactor.poll(Some(Duration::from_millis(20))).unwrap();
 	assert!(
 		started.elapsed() >= Duration::from_millis(20),
-		"the dropped timer's deadline still shortened a wait"
+		"the cancelled timer's deadline still shortened a wait"
 	);
 }
 
@@ -338,42 +353,6 @@ fn an_event_completes_a_wait_armed_on_it() {
 
 	let ((), result) = block_on(completion);
 	result.unwrap();
-}
-
-/// A timer is cancelled like any other op: `until` asks the reactor to stop it,
-/// and the entry settles as cancelled rather than waiting out its deadline.
-#[test]
-fn until_cancels_a_timer() {
-	// `Until` is the future the async layer's `until` narrows to; a driver may
-	// hand one to another thread, so it stays `Send`.
-	fn assert_send<T: Send>() {}
-	assert_send::<completion_rt::Until<()>>();
-
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
-	let cancel = Cancel::new();
-	let completion = submitter.timeout(Duration::from_secs(30)).unwrap();
-	let stop = Arc::new(AtomicBool::new(false));
-	let driven = {
-		let stop = Arc::clone(&stop);
-		std::thread::spawn(move || {
-			while !stop.load(Ordering::SeqCst) {
-				reactor.poll(Some(Duration::from_millis(1))).unwrap();
-			}
-		})
-	};
-	cancel.cancel();
-	let started = Instant::now();
-	let result = block_on(completion.until(&cancel));
-	stop.store(true, Ordering::SeqCst);
-	driven.join().unwrap();
-	assert!(
-		matches!(result, Err(Cancelled(()))),
-		"the timer was not cancelled"
-	);
-	assert!(
-		started.elapsed() < Duration::from_secs(1),
-		"the cancel waited out the timer's deadline"
-	);
 }
 
 /// Dropping a completion whose cancel already fired is the given-up path, not a
@@ -1012,9 +991,12 @@ mod uring {
 		reactor.poll(Some(Duration::ZERO)).unwrap();
 		// A wake raised through the reactor's protocol, landed while the receive is in
 		// flight: the timer is only what raises it, and it goes before the pass.
-		let timer = submitter.timeout(Duration::from_secs(2)).unwrap();
+		let timers = reactor.timers();
+		let timer = timers
+			.insert(Instant::now() + Duration::from_secs(2))
+			.unwrap();
 		drop_in_flight_on_purpose(|| drop(completion));
-		drop(timer);
+		timers.cancel(timer);
 		// The drop's inline drive must not have eaten the wake: the pass after returns
 		// at once instead of sleeping out its own timeout.
 		let started = Instant::now();

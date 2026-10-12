@@ -6,17 +6,21 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError, HANDLE, WAIT_TIMEOUT};
 use windows_sys::Win32::Networking::WinSock::{
 	AcceptEx, INVALID_SOCKET, IPPROTO_TCP, SO_UPDATE_ACCEPT_CONTEXT, SOCK_STREAM, SOCKADDR,
 	SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, WSA_FLAG_OVERLAPPED, WSABUF, WSAGetLastError, WSARecv,
 	WSASend, WSASocketW, closesocket, getsockname, setsockopt,
 };
-use windows_sys::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
-use windows_sys::Win32::System::IO::{
-	CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY,
-	PostQueuedCompletionStatus,
+use windows_sys::Win32::Storage::FileSystem::{
+	FILE_ALLOCATION_INFO, FILE_END_OF_FILE_INFO, FileAllocationInfo, FileEndOfFileInfo,
+	FlushFileBuffers, GetFileSizeEx, ReadFile, SetFileInformationByHandle, WriteFile,
 };
+use windows_sys::Win32::System::IO::{
+	CancelIoEx, CreateIoCompletionPort, DeviceIoControl, GetQueuedCompletionStatusEx, OVERLAPPED,
+	OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
+};
+use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
 
 use crate::core::Response;
 use crate::desc::{RawHandle, from_raw_socket};
@@ -165,15 +169,33 @@ impl Iocp {
 		ov_ptr
 	}
 
-	/// Reports a submission the kernel refused up front. A call that failed
-	/// posts no completion of its own, so the reactor queues one; a call that
-	/// returned success does not need one, because an associated handle gets
-	/// the kernel's packet even when the call returned synchronously.
+	/// Reports a submission the kernel refused up front, or completed: the
+	/// error is 0 and the work is done. A call that failed posts no completion
+	/// of its own, so the reactor queues one; a call that returned success does
+	/// not need one, because an associated handle gets the kernel's packet even
+	/// when the call returned synchronously.
 	fn refuse(&mut self, id: u64, error: i32) {
 		if let Some(active) = self.active.get_mut(&id) {
 			active.ov.submit_error = error;
 		}
 		self.post(id);
+	}
+
+	/// A call with no overlapped form: the reactor thread runs it and queues
+	/// the completion itself. Nonzero is a code `io::Error::from_raw_os_error`
+	/// takes; neither is a negative NTSTATUS.
+	fn in_thread(
+		&mut self,
+		id: u64,
+		fd: RawHandle,
+		work: impl FnOnce(HANDLE) -> i32,
+	) -> io::Result<()> {
+		let handle: HANDLE = fd.as_platform();
+		self.associate(handle)?;
+		let code = work(handle);
+		self.enqueue(id, handle, 0, None, None);
+		self.refuse(id, code);
+		Ok(())
 	}
 
 	fn associate(&mut self, fd: HANDLE) -> io::Result<()> {
@@ -371,6 +393,90 @@ impl Backend for Iocp {
 		let handle: HANDLE = fd.as_platform();
 		self.enqueue(id, handle, 0, None, None);
 		self.post(id);
+		Ok(())
+	}
+
+	fn allocate(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()> {
+		let end = offset.saturating_add(len);
+		self.in_thread(id, fd, move |handle| {
+			// SAFETY: standard Win32 calls on handles the facade owns; both
+			// info structs outlive their calls.
+			// Setting the end of file shrinks as readily as it grows, and a
+			// reservation below the current length is what the range is
+			// already backed by; allocate only grows, so the current length
+			// floors both.
+			let mut current = 0i64;
+			if unsafe { GetFileSizeEx(handle, &mut current) } == 0 {
+				return unsafe { GetLastError() } as i32;
+			}
+			let want = end.max(current.max(0) as u64);
+			let size = FILE_END_OF_FILE_INFO {
+				EndOfFile: want as i64,
+			};
+			if unsafe {
+				SetFileInformationByHandle(
+					handle,
+					FileEndOfFileInfo,
+					&size as *const _ as *const core::ffi::c_void,
+					size_of::<FILE_END_OF_FILE_INFO>() as u32,
+				)
+			} == 0
+			{
+				return unsafe { GetLastError() } as i32;
+			}
+			// How much is reserved, not where it is: the range's end is what
+			// has to be backed.
+			let reservation = FILE_ALLOCATION_INFO {
+				AllocationSize: want as i64,
+			};
+			if unsafe {
+				SetFileInformationByHandle(
+					handle,
+					FileAllocationInfo,
+					&reservation as *const _ as *const core::ffi::c_void,
+					size_of::<FILE_ALLOCATION_INFO>() as u32,
+				)
+			} == 0
+			{
+				return unsafe { GetLastError() } as i32;
+			}
+			0
+		})
+	}
+
+	fn punch(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()> {
+		let handle: HANDLE = fd.as_platform();
+		self.associate(handle)?;
+		let Some(last) = offset.checked_add(len) else {
+			self.refuse(id, ERROR_INVALID_PARAMETER as i32);
+			return Ok(());
+		};
+		let range = FILE_ZERO_DATA_INFORMATION {
+			FileOffset: offset as i64,
+			BeyondFinalZero: last as i64,
+		};
+		let mut done = 0u32;
+		// SAFETY: a `DeviceIoControl` on an associated handle completes through
+		// the port; the range outlives the call, which with an `OVERLAPPED`
+		// only starts the operation.
+		let ok = unsafe {
+			DeviceIoControl(
+				handle,
+				FSCTL_SET_ZERO_DATA,
+				&range as *const _ as *const core::ffi::c_void,
+				size_of::<FILE_ZERO_DATA_INFORMATION>() as u32,
+				std::ptr::null_mut(),
+				0,
+				&mut done,
+				self.enqueue(id, handle, 0, None, None),
+			)
+		};
+		if ok == 0 {
+			let error = unsafe { GetLastError() } as i32;
+			if error != IO_PENDING as i32 {
+				self.refuse(id, error);
+			}
+		}
 		Ok(())
 	}
 

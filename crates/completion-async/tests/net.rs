@@ -151,7 +151,7 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 	assert_eq!(*buffer, *payload, "the payload did not arrive whole");
 }
 
-/// A socket type of the caller's own: the socket traits are plain markers, so a
+/// A socket type of the caller's own: it names its kind once, so a
 /// wrapper this crate has never seen gets the same receive and send — and, for
 /// a stream, the loops over them.
 struct Wrapper(std::net::TcpStream);
@@ -162,8 +162,9 @@ impl completion_async::AsDescriptor for Wrapper {
 	}
 }
 
-impl completion_async::SocketHandle for Wrapper {}
-impl completion_async::StreamHandle for Wrapper {}
+impl completion_async::Resource for Wrapper {
+	type Kind = completion_async::kind::Stream;
+}
 
 #[test]
 fn a_caller_socket_type_gets_recv_and_send() {

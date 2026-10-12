@@ -14,8 +14,21 @@
 //! their like — gives what the loop moved before it stopped, so a failure or a
 //! cancel does not hide the progress behind it.
 //!
+//! Which methods a facade has follows from its resource's [`Kind`], named once
+//! through [`Resource`]:
+//!
+//! | Kind | Resources | Operations |
+//! |---|---|---|
+//! | [`kind::File`] | `File` | `read_at`, `write_at` and their loops, `sync`, `flush`, `allocate`, `punch` |
+//! | [`kind::Descriptor`] | pipes, stdio, `OwnedFd` | `read_at`, `write_at` and their loops |
+//! | [`kind::Datagram`] | `UdpSocket`, `UnixDatagram` | `recv`, `send`, with descriptors, `take_error` |
+//! | [`kind::Stream`] | `TcpStream`, `UnixStream` | a datagram's, plus `recv_exact`, `send_all`, `shutdown` |
+//! | [`kind::Listener`] | `TcpListener`, `UnixListener` | `accept` |
+//!
+//! Every kind waits with `wait_readable` and `wait_writable`.
+//!
 //! An operation is given a cancel with the [`until`](Transfer::until) on its
-//! future, which then yields [`Error::Cancelled`] if the cancel wins:
+//! future, which then yields [`ErrorKind::Cancelled`] if the cancel wins:
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -29,9 +42,11 @@ mod error;
 mod executor;
 mod global;
 mod io;
+pub mod kind;
 mod net;
 mod outcome;
 mod submitter;
+mod timer;
 
 // The low layer's data types and its descriptor trait, re-exported so a user of
 // this crate needs one name for them: the memory, the extents and spans, the
@@ -42,10 +57,10 @@ pub use completion_rt::{
 };
 pub use error::{Error, ErrorKind, Status};
 pub use executor::{Config, Executor, Scope, ScopeTask, Spawner, Task};
-pub use global::{block_on, scope, spawn, submitter, try_spawn};
+pub use global::{block_on, scope, spawn, submitter, timers, try_spawn};
 pub use io::{Facade, File, IntoMemory, Lent, OpenOptions};
-pub use net::{
-	Accept, ListenerHandle, Op, Receive, Received, SocketHandle, StreamHandle, Transfer,
-};
+pub use kind::{Kind, ListenerHandle, Positional, Resource, SocketKind};
+pub use net::{Accept, Op, Receive, Received, Transfer};
 pub use outcome::Outcome;
-pub use submitter::{Submitter, Timeout};
+pub use submitter::Submitter;
+pub use timer::{Timeout, Timers};

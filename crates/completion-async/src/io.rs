@@ -7,8 +7,9 @@ use std::panic::Location;
 use std::path::Path;
 use std::sync::Arc;
 
-use completion_rt::{AsDescriptor, Extent, Extents, Handle, Lease, Memory, Submitter};
+use completion_rt::{Extent, Extents, Handle, Lease, Memory, Submitter};
 
+use crate::kind::{self, Positional, Resource};
 use crate::net::{Kind, Op, Transfer, whole};
 
 /// Memory handed to an operation: owned by it, or lent by a
@@ -156,6 +157,33 @@ impl OpenOptions {
 
 /// An owned resource with async operations submitted through a
 /// [`Submitter`](crate::Submitter).
+///
+/// Which operations a facade has is the resource's [`Kind`](crate::Kind),
+/// declared once through [`Resource`](crate::Resource). A socket is not
+/// read at an offset or synced:
+///
+/// ```compile_fail
+/// # use completion_async::Facade;
+/// fn read(socket: &Facade<std::net::TcpStream>) {
+/// 	let _ = socket.read_at(vec![0u8; 4], 0);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use completion_async::Facade;
+/// fn sync(socket: &Facade<std::net::TcpStream>) {
+/// 	let _ = socket.sync();
+/// }
+/// ```
+///
+/// Nor is a pipe synced:
+///
+/// ```compile_fail
+/// # use completion_async::Facade;
+/// fn sync(pipe: &Facade<std::io::PipeWriter>) {
+/// 	let _ = pipe.sync();
+/// }
+/// ```
 pub struct Facade<S> {
 	handle: Handle<S>,
 	submitter: Submitter,
@@ -236,7 +264,10 @@ impl<S> Clone for Facade<S> {
 
 pub type File = Facade<fs::File>;
 
-impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
+impl<S: Resource> Facade<S>
+where
+	S::Kind: Positional,
+{
 	/// Reads the whole of `mem` at `fdoff`, in one call: a short count is what
 	/// the call moved, not an error. [`read_exact_at`](Self::read_exact_at)
 	/// loops.
@@ -363,7 +394,9 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 			extents,
 		)
 	}
+}
 
+impl<S: Resource<Kind = kind::File>> Facade<S> {
 	#[track_caller]
 	pub fn sync(&self) -> Op<S> {
 		Op::new(self, Location::caller(), Submitter::fsync_at)
@@ -380,9 +413,34 @@ impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
 	pub fn flush(&self) -> Op<S> {
 		Op::new(self, Location::caller(), Submitter::flush_at)
 	}
+
+	/// Backs `len` bytes at `offset` with storage, so a write there does not
+	/// fail for space. A range past the end grows the file to the range's end,
+	/// reading as zeros; the file never shrinks.
+	#[track_caller]
+	pub fn allocate(&self, offset: u64, len: u64) -> Op<S> {
+		Op::new(
+			self,
+			Location::caller(),
+			move |submitter, origin, handle| submitter.allocate_at(origin, handle, offset, len),
+		)
+	}
+
+	/// Zeroes `len` bytes at `offset`, freeing their storage where the
+	/// filesystem can; the length stays.
+	///
+	/// On Windows the storage is freed only in a file marked sparse.
+	#[track_caller]
+	pub fn punch(&self, offset: u64, len: u64) -> Op<S> {
+		Op::new(
+			self,
+			Location::caller(),
+			move |submitter, origin, handle| submitter.punch_at(origin, handle, offset, len),
+		)
+	}
 }
 
-impl<S: AsDescriptor + Send + Sync + 'static> Facade<S> {
+impl<S: Resource> Facade<S> {
 	#[track_caller]
 	pub fn wait_readable(&self) -> Op<S> {
 		Op::new(self, Location::caller(), Submitter::wait_readable_at)

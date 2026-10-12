@@ -18,6 +18,7 @@ mod desc;
 mod event;
 mod memory;
 mod park;
+mod timer;
 
 pub use backend::Config;
 pub use core::{
@@ -27,6 +28,7 @@ pub use core::{
 pub use desc::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor};
 pub use event::Event;
 pub use memory::{Extent, Memory, Span};
+pub use timer::{TimerKey, Timers};
 
 // Plumbing the async crate reaches across the crate boundary. `pub(crate)` does
 // not cross crates, so these are public but not part of the supported surface.

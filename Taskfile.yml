@@ -49,6 +49,13 @@ tasks:
     cmds:
       - cargo nextest run {{.CARGO_PROFILE_ARG}} --locked {{.CLI_ARGS}}
 
+  # `--no-deps` keeps it to this workspace's crates; a lint in a dependency is
+  # not ours to fix.
+  doc:
+    desc: "Build the API documentation"
+    cmds:
+      - cargo doc --no-deps {{.PROFILE_ARG}} --locked {{.CLI_ARGS}}
+
   # Every other recipe passes `--locked`; this is the one that rewrites the
   # lock file, after a manifest change (a dependency added or removed).
   lock:

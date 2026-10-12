@@ -16,11 +16,11 @@ use std::cell::{OnceCell, RefCell};
 use std::future::Future;
 use std::io;
 
-use crate::{Config, Error, Executor, Scope, Spawner, Submitter, Task};
+use crate::{Config, Error, Executor, Scope, Spawner, Submitter, Task, Timers};
 
 thread_local! {
 	static EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
-	static HANDLES: OnceCell<(Spawner, Submitter)> = const { OnceCell::new() };
+	static HANDLES: OnceCell<(Spawner, Submitter, Timers)> = const { OnceCell::new() };
 }
 
 /// Creates the executor and its handles on the first call on this thread, and
@@ -28,21 +28,21 @@ thread_local! {
 ///
 /// The handles are set only together with the executor, so once `HANDLES` is
 /// set, `EXECUTOR` is too, and `EXECUTOR` is not borrowed by this path.
-fn handles<R>(f: impl FnOnce(&Spawner, &Submitter) -> R) -> R {
+fn handles<R>(f: impl FnOnce(&Spawner, &Submitter, &Timers) -> R) -> R {
 	HANDLES.with(|handles| {
-		let (spawner, submitter) = handles.get_or_init(|| {
+		let (spawner, submitter, timers) = handles.get_or_init(|| {
 			let executor = Executor::new(Config::default())
 				.expect("the thread's global executor could not be created");
-			let handles = (executor.spawner(), executor.submitter());
+			let handles = (executor.spawner(), executor.submitter(), executor.timers());
 			EXECUTOR.with(|slot| *slot.borrow_mut() = Some(executor));
 			handles
 		});
-		f(spawner, submitter)
+		f(spawner, submitter, timers)
 	})
 }
 
 fn initialize() {
-	handles(|_, _| ());
+	handles(|_, _, _| ());
 }
 /// Runs `future` to completion on this thread's global executor.
 ///
@@ -63,7 +63,7 @@ pub fn block_on<F: Future>(future: F) -> io::Result<F::Output> {
 /// Safe to call from a task while a `block_on` is running. Panics if the executor
 /// has been dropped.
 pub fn spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Task<T> {
-	let spawner = handles(|spawner, _| spawner.clone());
+	let spawner = handles(|spawner, _, _| spawner.clone());
 	spawner.spawn(future)
 }
 
@@ -73,18 +73,27 @@ pub fn spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Task<T> {
 ///
 /// Safe to call from a task while a `block_on` is running.
 pub fn try_spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Result<Task<T>, Error> {
-	let spawner = handles(|spawner, _| spawner.clone());
+	let spawner = handles(|spawner, _, _| spawner.clone());
 	spawner.try_spawn(future)
 }
 
 /// The submitter of this thread's global executor, which
-/// [`Facade::new`](crate::Facade::new), [`Facade::bind`](crate::Facade::bind)
-/// and [`Timeout::new`](crate::Timeout::new) submit through.
+/// [`Facade::new`](crate::Facade::new) and [`Facade::bind`](crate::Facade::bind)
+/// submit through.
 ///
 /// Safe to call from a task while a `block_on` is running. An operation
 /// submitted after the executor has been dropped fails.
 pub fn submitter() -> Submitter {
-	handles(|_, submitter| submitter.clone())
+	handles(|_, submitter, _| submitter.clone())
+}
+
+/// The timer wheel of this thread's global executor, which
+/// [`Timeout::new`](crate::Timeout::new) arms on.
+///
+/// Safe to call from a task while a `block_on` is running. A timer armed after
+/// the executor has been dropped fails.
+pub fn timers() -> Timers {
+	handles(|_, _, timers| timers.clone())
 }
 
 /// Runs `body` with a scope on this thread's global executor, so the tasks it

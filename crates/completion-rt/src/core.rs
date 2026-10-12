@@ -1,7 +1,7 @@
 //! Core completion engine.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::ops::Deref;
@@ -20,6 +20,7 @@ use crate::{AsDescriptor, Extent, Memory, OwnedDescriptor, OwnedSocket};
 use crate::backend::{self, Backend, BackendEnum, Config, create};
 use crate::event::Event;
 use crate::park::Park;
+use crate::timer::Timers;
 
 /// Completed operation result.
 #[derive(Debug)]
@@ -65,6 +66,16 @@ enum Request {
 	},
 	Flush {
 		fd: RawHandle,
+	},
+	Allocate {
+		fd: RawHandle,
+		offset: u64,
+		len: u64,
+	},
+	Punch {
+		fd: RawHandle,
+		offset: u64,
+		len: u64,
 	},
 	Recv {
 		fd: RawHandle,
@@ -116,6 +127,8 @@ impl Request {
 			Request::SendWithFds { extents, .. } => extents.len_bytes() != 0,
 			Request::Fsync { .. }
 			| Request::Flush { .. }
+			| Request::Allocate { .. }
+			| Request::Punch { .. }
 			| Request::Accept { .. }
 			| Request::Readable { .. }
 			| Request::Writable { .. } => false,
@@ -128,6 +141,8 @@ impl Request {
 			Request::Write { .. } => "write",
 			Request::Fsync { .. } => "fsync",
 			Request::Flush { .. } => "flush",
+			Request::Allocate { .. } => "allocate",
+			Request::Punch { .. } => "punch",
 			Request::Recv { .. } => "recv",
 			Request::RecvWithFds { .. } => "recv_with_fds",
 			Request::Send { .. } => "send",
@@ -184,7 +199,6 @@ struct Entry {
 	origin: &'static Location<'static>,
 	submitted: Instant,
 	waiter: bool,
-	deadline: Option<Instant>,
 	/// The descriptor the operation names, held until the entry goes: the
 	/// backend works on the number, which must stay live until then.
 	descriptor: Option<Descriptor>,
@@ -223,7 +237,7 @@ impl Core {
 	}
 
 	fn wait(&mut self, shared: &Shared, timeout: Option<Duration>) -> io::Result<()> {
-		let within = shared.events.lock().unwrap().within(timeout);
+		let within = shared.timers.within(timeout);
 		match self.backend.poll(within, &shared.park) {
 			Ok(id) => self.settle(shared, id),
 			Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -234,32 +248,7 @@ impl Core {
 	}
 
 	fn settle_timers(&mut self, shared: &Shared) {
-		let now = Instant::now();
-		let mut wakers = Vec::new();
-		{
-			let mut events = shared.events.lock().unwrap();
-			while let Some((&(deadline, id), _)) = events.deadlines.first_key_value() {
-				if deadline > now {
-					break;
-				}
-				events.deadlines.remove(&(deadline, id));
-				let Some(entry) = events.entries.get_mut(&id) else {
-					continue;
-				};
-				if entry.stat != Stat::Pending {
-					continue;
-				}
-				entry.deadline = None;
-				entry.response = Some(Ok(Response::Done));
-				entry.stat = Stat::Done;
-				if let Some(waker) = entry.waker.take() {
-					wakers.push(waker);
-				}
-			}
-		}
-		for waker in wakers {
-			waker.wake();
-		}
+		shared.timers.expire(Instant::now());
 	}
 
 	fn reap(&mut self, shared: &Shared) -> io::Result<()> {
@@ -321,10 +310,9 @@ impl Core {
 		let mut wakers = Vec::new();
 		let (pending, cancels) = {
 			let mut events = shared.events.lock().unwrap();
-			let Events { entries, deadlines } = &mut *events;
 			let mut pending = Vec::new();
 			let mut cancels = Vec::new();
-			for (id, entry) in entries.iter_mut() {
+			for (id, entry) in events.entries.iter_mut() {
 				if entry.give_up == GiveUp::Asked {
 					entry.give_up.handled();
 					match entry.stat {
@@ -332,9 +320,6 @@ impl Core {
 							entry.request = None;
 							entry.response = Some(Err(not_submitted()));
 							entry.stat = Stat::Done;
-							if let Some(deadline) = entry.deadline.take() {
-								deadlines.remove(&(deadline, *id));
-							}
 							if let Some(waker) = entry.waker.take() {
 								wakers.push(waker);
 							}
@@ -376,6 +361,8 @@ impl Core {
 				} => self.backend.write(id, fd, fdoff, memory, extents),
 				Request::Fsync { fd } => self.backend.fsync(id, fd),
 				Request::Flush { fd } => self.backend.flush(id, fd),
+				Request::Allocate { fd, offset, len } => self.backend.allocate(id, fd, offset, len),
+				Request::Punch { fd, offset, len } => self.backend.punch(id, fd, offset, len),
 				Request::Recv {
 					fd,
 					memory,
@@ -454,14 +441,12 @@ impl Core {
 
 struct Events {
 	entries: HashMap<u64, Entry>,
-	deadlines: BTreeMap<(Instant, u64), ()>,
 }
 
 impl Events {
 	fn new() -> Events {
 		Events {
 			entries: HashMap::new(),
-			deadlines: BTreeMap::new(),
 		}
 	}
 
@@ -474,31 +459,11 @@ impl Events {
 	}
 
 	fn insert(&mut self, id: u64, entry: Entry) {
-		if let Some(deadline) = entry.deadline {
-			self.deadlines.insert((deadline, id), ());
-		}
 		self.entries.insert(id, entry);
 	}
 
 	fn remove(&mut self, id: u64) -> Option<Entry> {
-		let entry = self.entries.remove(&id)?;
-		if let Some(deadline) = entry.deadline {
-			self.deadlines.remove(&(deadline, id));
-		}
-		Some(entry)
-	}
-
-	fn within(&self, timeout: Option<Duration>) -> Option<Duration> {
-		let nearest = self
-			.deadlines
-			.first_key_value()
-			.map(|((deadline, _), _)| deadline.saturating_duration_since(Instant::now()));
-		match (timeout, nearest) {
-			(Some(timeout), Some(nearest)) => Some(timeout.min(nearest)),
-			(Some(timeout), None) => Some(timeout),
-			(None, Some(nearest)) => Some(nearest),
-			(None, None) => None,
-		}
+		self.entries.remove(&id)
 	}
 }
 
@@ -507,8 +472,10 @@ struct Shared {
 	/// Wake outside this lock: a waker may re-enter the operation table.
 	events: Mutex<Events>,
 	event: Event,
-	park: Park,
-	stopped: AtomicBool,
+	park: Arc<Park>,
+	/// Shared with `timers`: set once, refusing new submissions and timers.
+	stopped: Arc<AtomicBool>,
+	timers: Timers,
 	core: Mutex<Core>,
 	cancelled: fn(&io::Error) -> bool,
 	settled: Condvar,
@@ -577,13 +544,16 @@ impl Reactor {
 		let (backend, event) = create(&config, embedded)?;
 		// Cache this before polling: a blocked poll holds the core lock.
 		let poll_fd = backend.poll_fd();
-		let park = Park::new(event.clone(), embedded);
+		let park = Arc::new(Park::new(event.clone(), embedded));
+		let stopped = Arc::new(AtomicBool::new(false));
+		let timers = Timers::new(Arc::clone(&park), Arc::clone(&stopped));
 		let shared = Arc::new(Shared {
 			next: AtomicU64::new(0),
 			events: Mutex::new(Events::new()),
 			event,
 			park,
-			stopped: AtomicBool::new(false),
+			stopped,
+			timers,
 			core: Mutex::new(Core::new(backend)),
 			cancelled: backend::cancelled(),
 			poll_fd,
@@ -678,13 +648,19 @@ impl Reactor {
 		core.drain(shared);
 		core.settle_timers(shared);
 		core.reap(shared)?;
-		Ok(shared.events.lock().unwrap().within(None))
+		Ok(shared.timers.within(None))
 	}
 
 	/// The reactor's own wake-up; see [`Event`].
 	#[doc(hidden)]
 	pub fn event(&self) -> Event {
 		self.shared.event.clone()
+	}
+
+	/// This reactor's timer wheel. Timers armed on it fire from this reactor's
+	/// polls, and fail once it stops.
+	pub fn timers(&self) -> Timers {
+		self.shared.timers.clone()
 	}
 
 	/// Whether any operation is still in flight.
@@ -711,12 +687,12 @@ impl Drop for Reactor {
 			events
 				.entries
 				.retain(|_, entry| entry.stat != Stat::Pending);
-			events.deadlines.clear();
 			for entry in events.entries.values_mut() {
 				entry.give_up.ask();
 			}
 		}
 		shared.park.unpark();
+		shared.timers.settle_stopped();
 		if let Ok(mut core) = shared.core.lock() {
 			while !shared.is_idle() {
 				if core.drive_to_idle(shared).is_err() {
@@ -726,7 +702,6 @@ impl Drop for Reactor {
 		}
 		let mut events = shared.events.lock().unwrap();
 		events.entries.clear();
-		events.deadlines.clear();
 		shared.settled.notify_all();
 	}
 }
@@ -931,8 +906,6 @@ pub struct InFlight {
 	pub cancel_requested: bool,
 	/// Whether the operation reads or writes caller memory.
 	pub names_memory: bool,
-	/// A timer's deadline; `None` for an operation a backend carries.
-	pub deadline: Option<Instant>,
 }
 
 impl InFlight {
@@ -946,7 +919,6 @@ impl InFlight {
 			age: now.saturating_duration_since(entry.submitted),
 			cancel_requested: entry.give_up.asked(),
 			names_memory: entry.names_memory,
-			deadline: entry.deadline,
 		}
 	}
 }
@@ -1148,6 +1120,72 @@ impl Submitter {
 		self.enqueue(
 			origin,
 			Request::Flush { fd: raw },
+			Some(Descriptor::new(fd)),
+			None,
+		)
+	}
+
+	/// Backs `len` bytes of `fd` at `offset` with storage, growing the file to
+	/// the range's end if it ends short of it; never shrinks it.
+	#[track_caller]
+	pub fn allocate<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		fd: &Handle<S>,
+		offset: u64,
+		len: u64,
+	) -> io::Result<Completion> {
+		self.allocate_at(Location::caller(), fd, offset, len)
+	}
+
+	#[doc(hidden)]
+	pub fn allocate_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+		offset: u64,
+		len: u64,
+	) -> io::Result<Completion> {
+		let raw = fd.raw();
+		self.enqueue(
+			origin,
+			Request::Allocate {
+				fd: raw,
+				offset,
+				len,
+			},
+			Some(Descriptor::new(fd)),
+			None,
+		)
+	}
+
+	/// Zeroes `len` bytes of `fd` at `offset`, freeing their storage where the
+	/// filesystem can; the file's length stays.
+	#[track_caller]
+	pub fn punch<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		fd: &Handle<S>,
+		offset: u64,
+		len: u64,
+	) -> io::Result<Completion> {
+		self.punch_at(Location::caller(), fd, offset, len)
+	}
+
+	#[doc(hidden)]
+	pub fn punch_at<S: AsDescriptor + Send + Sync + 'static>(
+		&self,
+		origin: &'static Location<'static>,
+		fd: &Handle<S>,
+		offset: u64,
+		len: u64,
+	) -> io::Result<Completion> {
+		let raw = fd.raw();
+		self.enqueue(
+			origin,
+			Request::Punch {
+				fd: raw,
+				offset,
+				len,
+			},
 			Some(Descriptor::new(fd)),
 			None,
 		)
@@ -1380,49 +1418,6 @@ impl Submitter {
 		)
 	}
 
-	/// Completes after `duration`.
-	#[track_caller]
-	pub fn timeout(&self, duration: Duration) -> io::Result<Completion> {
-		self.arm(Location::caller(), Instant::now() + duration)
-	}
-
-	fn arm(&self, origin: &'static Location<'static>, deadline: Instant) -> io::Result<Completion> {
-		let id = {
-			let mut events = self.shared.events.lock().unwrap();
-			if self.shared.stopped.load(Ordering::Acquire) {
-				return Err(stopped());
-			}
-			let id = self.shared.next.fetch_add(1, Ordering::Relaxed) + 1;
-			events.insert(
-				id,
-				Entry {
-					request: None,
-					response: None,
-					waker: None,
-					stat: Stat::Pending,
-					give_up: GiveUp::None,
-					names_memory: false,
-					kind: "timeout",
-					origin,
-					submitted: Instant::now(),
-					waiter: false,
-					deadline: Some(deadline),
-					descriptor: None,
-					lease: None,
-				},
-			);
-			id
-		};
-		self.shared.park.unpark();
-		Ok(Completion {
-			guard: SlotGuard {
-				id,
-				shared: Arc::clone(&self.shared),
-			},
-			userdata: Some(()),
-		})
-	}
-
 	/// Refuses new submissions with [`BrokenPipe`](io::ErrorKind::BrokenPipe) and wakes the reactor; existing operations are left to complete.
 	pub fn stop(&self) {
 		self.shared.stopped.store(true, Ordering::Release);
@@ -1513,7 +1508,6 @@ impl Submitter {
 					origin,
 					submitted: Instant::now(),
 					waiter: false,
-					deadline: None,
 					descriptor,
 					lease: lease.map(|lease| lease.id),
 				},
@@ -1823,7 +1817,7 @@ fn not_submitted() -> io::Error {
 	io::Error::other(NotSubmitted)
 }
 
-fn stopped() -> io::Error {
+pub(crate) fn stopped() -> io::Error {
 	io::Error::new(io::ErrorKind::BrokenPipe, "the reactor has been stopped")
 }
 

@@ -259,6 +259,7 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 		std::fs::write(&path, b"hello").unwrap();
 		let mut executor = executor();
 		let submitter = executor.submitter();
+		let timers = executor.timers();
 		let busy = executor.spawner().spawn(std::future::poll_fn(move |cx| {
 			if flag.load(Ordering::Acquire) {
 				Poll::Ready(())
@@ -273,7 +274,7 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 		executor
 			.block_on(async {
 				assert_eq!(file.read_at(payload, 0).await.into_result().unwrap(), 5);
-				Timeout::with_submitter(Duration::from_millis(1), &submitter)
+				Timeout::with_timers(Duration::from_millis(1), &timers)
 					.await
 					.unwrap();
 			})
@@ -313,12 +314,9 @@ fn stalled_task(
 	let task = executor.spawner().spawn(async move {
 		socket.recv(payload).await.into_result().unwrap();
 	});
-	let submitter = executor.submitter();
+	let timers = executor.timers();
 	executor
-		.block_on(Timeout::with_submitter(
-			Duration::from_millis(1),
-			&submitter,
-		))
+		.block_on(Timeout::with_timers(Duration::from_millis(1), &timers))
 		.unwrap()
 		.unwrap();
 	(peer, task)
@@ -348,6 +346,7 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 	use std::rc::Rc;
 
 	let mut executor = executor();
+	let timers = executor.timers();
 	let submitter = executor.submitter();
 	let (_peer, socket) = socket_pair(&submitter);
 	let buffer = Arc::new(vec![0u8; 8]);
@@ -369,10 +368,7 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 		Poll::Pending
 	})));
 	executor
-		.block_on(Timeout::with_submitter(
-			Duration::from_millis(1),
-			&submitter,
-		))
+		.block_on(Timeout::with_timers(Duration::from_millis(1), &timers))
 		.unwrap()
 		.unwrap();
 	cancel.set(true);
@@ -391,6 +387,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	use std::rc::Rc;
 
 	let mut executor = executor();
+	let timers = executor.timers();
 	let submitter = executor.submitter();
 	let (_peer, socket) = socket_pair(&submitter);
 	let buffer = Arc::new(vec![0u8; 8]);
@@ -408,10 +405,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		Poll::Pending::<()>
 	}));
 	executor
-		.block_on(Timeout::with_submitter(
-			Duration::from_millis(1),
-			&submitter,
-		))
+		.block_on(Timeout::with_timers(Duration::from_millis(1), &timers))
 		.unwrap()
 		.unwrap();
 	panic_next.set(true);
@@ -457,6 +451,7 @@ fn cancellation_unwinding_does_not_hide_later_unsignalled_io_drops() {
 		std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.block_on(async {})));
 	assert!(caught.is_err(), "a future destructor panic was swallowed");
 
+	let timers = executor.timers();
 	let submitter = executor.submitter();
 	let (_peer, socket) = socket_pair(&submitter);
 	let buffer = Arc::new(vec![0u8; 8]);
@@ -469,10 +464,7 @@ fn cancellation_unwinding_does_not_hide_later_unsignalled_io_drops() {
 			.is_pending()
 	);
 	executor
-		.block_on(Timeout::with_submitter(
-			Duration::from_millis(1),
-			&submitter,
-		))
+		.block_on(Timeout::with_timers(Duration::from_millis(1), &timers))
 		.unwrap()
 		.unwrap();
 	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(receive)));

@@ -84,6 +84,12 @@ enum Step {
 	Flush {
 		fd: RawHandle,
 	},
+	Fallocate {
+		fd: RawHandle,
+		offset: u64,
+		len: u64,
+		mode: i32,
+	},
 	Accept {
 		fd: RawHandle,
 	},
@@ -102,6 +108,7 @@ impl Step {
 			Step::Accept { .. } => Kind::Accepted,
 			Step::Fsync { .. }
 			| Step::Flush { .. }
+			| Step::Fallocate { .. }
 			| Step::Readable { .. }
 			| Step::Writable { .. } => Kind::Done,
 			_ => Kind::Count,
@@ -470,6 +477,27 @@ impl Uring {
 					Spans::new(),
 				)
 			}
+			Step::Fallocate {
+				fd,
+				offset,
+				len,
+				mode,
+			} => {
+				if self.iopoll {
+					return Err(io::Error::new(
+						io::ErrorKind::Unsupported,
+						"fallocate cannot be submitted on an IOPOLL ring; give it a ring of its own",
+					));
+				}
+				(
+					opcode::Fallocate::new(types::Fd(fd.as_raw_fd()), *len)
+						.offset(*offset)
+						.mode(*mode)
+						.build()
+						.user_data(id),
+					Spans::new(),
+				)
+			}
 			Step::Accept { fd } => {
 				// An accept cannot be polled for, and only a ring that can be
 				// polled for has anything to wait on.
@@ -659,6 +687,30 @@ impl Backend for Uring {
 			unsafe { libc::close(dup.as_raw_fd()) };
 		}
 		result
+	}
+
+	fn allocate(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()> {
+		self.submit(
+			id,
+			Step::Fallocate {
+				fd,
+				offset,
+				len,
+				mode: 0,
+			},
+		)
+	}
+
+	fn punch(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()> {
+		self.submit(
+			id,
+			Step::Fallocate {
+				fd,
+				offset,
+				len,
+				mode: libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+			},
+		)
 	}
 
 	fn recv(

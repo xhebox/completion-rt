@@ -145,12 +145,9 @@ fn the_scope_waits_out_a_forgotten_transfer_on_lent_memory() {
 
 	right.write_all(b"late!").unwrap();
 	// Drive the reactor long enough for an armed receive to complete.
-	let submitter = executor.submitter();
+	let timers = executor.timers();
 	executor
-		.block_on(Timeout::with_submitter(
-			Duration::from_millis(100),
-			&submitter,
-		))
+		.block_on(Timeout::with_timers(Duration::from_millis(100), &timers))
 		.unwrap()
 		.unwrap();
 	assert_eq!(

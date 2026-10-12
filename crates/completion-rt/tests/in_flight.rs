@@ -42,11 +42,11 @@ fn until_entry(submitter: &Submitter, wanted: impl Fn(&InFlight) -> bool) -> InF
 	panic!("no matching in-flight entry appeared");
 }
 
-/// A read that cannot complete and a timer in the far future both show up, with
-/// their descriptor, state, deadline and a growing age; cancelling the read and
-/// letting it settle takes it out of the snapshot.
+/// A read that cannot complete shows up with its descriptor, state and a
+/// growing age; cancelling the read and letting it settle takes it out of the
+/// snapshot.
 #[test]
-fn in_flight_shows_a_stalled_read_and_a_timer() {
+fn in_flight_shows_a_stalled_read() {
 	// The write end stays open and is never written, so the read has nothing to
 	// return and waits.
 	let (reader, _writer) = std::io::pipe().unwrap();
@@ -58,9 +58,6 @@ fn in_flight_shows_a_stalled_read_and_a_timer() {
 	let read = submitter
 		.read(&reader, 0, memory(&buf), [Extent { offset: 0, len: 8 }])
 		.unwrap();
-	// Bound, not dropped: a dropped completion takes its entry out of the
-	// reactor, and the timer has to be there for the snapshot below.
-	let _timer = submitter.timeout(Duration::from_secs(3_600)).unwrap();
 
 	let stop = Arc::new(AtomicBool::new(false));
 	let driven = {
@@ -84,26 +81,6 @@ fn in_flight_shows_a_stalled_read_and_a_timer() {
 	);
 	assert!(snapshot.names_memory, "a read names the caller's memory");
 	assert!(!snapshot.cancel_requested, "nothing asked the read to stop");
-	assert!(snapshot.deadline.is_none(), "a request carries no deadline");
-
-	let timer_snapshot = submitter
-		.in_flight()
-		.into_iter()
-		.find(|entry| entry.op == "timeout")
-		.expect("the timer is in the snapshot");
-	assert_eq!(
-		timer_snapshot.descriptor, None,
-		"a timer names no descriptor"
-	);
-	assert!(
-		timer_snapshot.deadline.is_some(),
-		"a timer carries its deadline"
-	);
-	assert_eq!(
-		timer_snapshot.state,
-		InFlightState::Pending,
-		"the far-off timer has not been reached"
-	);
 
 	// The age is taken at the snapshot, so a later look is older.
 	let first_age = snapshot.age;

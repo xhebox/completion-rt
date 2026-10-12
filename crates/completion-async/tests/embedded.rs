@@ -98,13 +98,12 @@ fn a_timer_fires_within_the_timeout_turn_reports() {
 	use rustix::event::{PollFd, PollFlags, poll};
 
 	let mut executor = Executor::embedded(Config::default()).unwrap();
-	let submitter = executor.submitter();
+	let timers = executor.timers();
 	let (done, finished) = std::sync::mpsc::channel::<io::Result<()>>();
 	executor
 		.spawner()
 		.spawn(async move {
-			let _ =
-				done.send(Timeout::with_submitter(Duration::from_millis(150), &submitter).await);
+			let _ = done.send(Timeout::with_timers(Duration::from_millis(150), &timers).await);
 		})
 		.detach();
 

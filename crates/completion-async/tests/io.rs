@@ -425,3 +425,64 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 	};
 	std::mem::forget(plain);
 }
+
+fn filled(tag: &str, len: usize) -> (common::Scratch, std::path::PathBuf, Executor, File) {
+	let directory = common::tempdir(tag).unwrap();
+	let path = directory.path().join("data");
+	std::fs::write(&path, vec![0xab; len]).unwrap();
+	let executor = executor();
+	let file = File::with_submitter(
+		OpenOptions::new()
+			.read(true)
+			.write(true)
+			.open(&path)
+			.unwrap(),
+		&executor.submitter(),
+	);
+	(directory, path, executor, file)
+}
+
+/// An allocate past the end grows the file to the range's end; one inside it
+/// leaves both the length and the bytes alone.
+#[test]
+fn an_allocate_grows_the_file_and_never_shrinks_it() {
+	let (_directory, path, mut executor, file) = filled("completion-allocate", 8192);
+
+	executor.block_on(file.allocate(0, 4096)).unwrap().unwrap();
+	assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+	assert_eq!(std::fs::read(&path).unwrap(), vec![0xab; 8192]);
+
+	executor
+		.block_on(file.allocate(8192, 4096))
+		.unwrap()
+		.unwrap();
+	let metadata = std::fs::metadata(&path).unwrap();
+	assert_eq!(metadata.len(), 12288);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		assert!(
+			metadata.blocks() * 512 >= 12288,
+			"the range is not backed: {} blocks",
+			metadata.blocks()
+		);
+	}
+	let contents = std::fs::read(&path).unwrap();
+	assert_eq!(&contents[..8192], &[0xab; 8192][..]);
+	assert_eq!(&contents[8192..], &[0; 4096][..]);
+}
+
+/// A punch reads back as zeros across the range, block-aligned or not, and
+/// leaves the length alone.
+#[test]
+fn a_punch_zeroes_the_range_and_keeps_the_length() {
+	let (_directory, path, mut executor, file) = filled("completion-punch", 3 * 4096);
+
+	executor.block_on(file.punch(100, 5000)).unwrap().unwrap();
+
+	let contents = std::fs::read(&path).unwrap();
+	assert_eq!(contents.len(), 3 * 4096);
+	assert_eq!(&contents[..100], &[0xab; 100][..]);
+	assert_eq!(&contents[100..5100], &[0; 5000][..]);
+	assert_eq!(&contents[5100..], &[0xab; 3 * 4096 - 5100][..]);
+}

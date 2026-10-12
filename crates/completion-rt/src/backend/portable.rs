@@ -766,16 +766,33 @@ fn punch(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {
 	#[cfg(target_vendor = "apple")]
 	{
 		// `rustix::fs::fallocate` has no hole-punching mode here; F_PUNCHHOLE is
-		// the fcntl that does it, and it keeps the length.
-		let request = libc::fpunchhole_t {
-			fp_flags: 0,
-			reserved: 0,
-			fp_offset: offset as libc::off_t,
-			fp_length: len as libc::off_t,
-		};
-		let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_PUNCHHOLE, &request) };
-		if result == -1 {
-			return Err(io::Error::last_os_error());
+		// the fcntl that does it, and it keeps the length. It takes only a range
+		// that is a multiple of the file system block size and answers EINVAL
+		// otherwise, so the aligned middle goes to the kernel and the two
+		// partial blocks at the ends are written over: a hole the kernel will
+		// not take is still the caller's bytes.
+		let end = offset
+			.checked_add(len)
+			.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+		let block = block_size(fd)?;
+		let first = offset.next_multiple_of(block).min(end);
+		let last = (end - end % block).max(first);
+		if first > offset {
+			zero(fd, offset, first - offset)?;
+		}
+		if end > last {
+			zero(fd, last, end - last)?;
+		}
+		if last > first {
+			let request = libc::fpunchhole_t {
+				fp_flags: 0,
+				reserved: 0,
+				fp_offset: first as libc::off_t,
+				fp_length: (last - first) as libc::off_t,
+			};
+			if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_PUNCHHOLE, &request) } == -1 {
+				return Err(io::Error::last_os_error());
+			}
 		}
 		Ok(())
 	}
@@ -797,6 +814,41 @@ fn flush_handle(fd: BorrowedFd<'_>) -> io::Result<()> {
 	}
 	if unsafe { libc::close(dup) } < 0 {
 		return Err(io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+/// The granularity `F_PUNCHHOLE` accepts: the file system's own block size, at
+/// least the page size a hole is checked against.
+#[cfg(target_vendor = "apple")]
+fn block_size(fd: BorrowedFd<'_>) -> io::Result<u64> {
+	let stat = rustix::fs::fstat(fd)?;
+	let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+	let page = if page > 0 { page as u64 } else { 4096 };
+	Ok((stat.st_blksize.max(0) as u64).max(page))
+}
+
+/// Writes zeros over the range, for the ends a hole cannot take.
+#[cfg(target_vendor = "apple")]
+fn zero(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {
+	const CHUNK: [u8; 4096] = [0; 4096];
+	let mut done = 0u64;
+	while done < len {
+		let take = CHUNK.len().min((len - done) as usize);
+		// SAFETY: the buffer outlives the call, which only reads from it.
+		let moved = unsafe {
+			libc::pwrite(
+				fd.as_raw_fd(),
+				CHUNK.as_ptr().cast(),
+				take,
+				(offset + done) as libc::off_t,
+			)
+		};
+		let moved = count(moved)?;
+		if moved == 0 {
+			return Err(io::Error::from(io::ErrorKind::WriteZero));
+		}
+		done += moved as u64;
 	}
 	Ok(())
 }

@@ -14,7 +14,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
 	FILE_ALLOCATION_INFO, FILE_END_OF_FILE_INFO, FileAllocationInfo, FileEndOfFileInfo,
-	FlushFileBuffers, ReadFile, SetFileInformationByHandle, WriteFile,
+	FlushFileBuffers, GetFileSizeEx, ReadFile, SetFileInformationByHandle, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
 	CancelIoEx, CreateIoCompletionPort, DeviceIoControl, GetQueuedCompletionStatusEx, OVERLAPPED,
@@ -401,8 +401,17 @@ impl Backend for Iocp {
 		self.in_thread(id, fd, move |handle| {
 			// SAFETY: standard Win32 calls on handles the facade owns; both
 			// info structs outlive their calls.
+			// Setting the end of file shrinks as readily as it grows, and a
+			// reservation below the current length is what the range is
+			// already backed by; allocate only grows, so the current length
+			// floors both.
+			let mut current = 0i64;
+			if unsafe { GetFileSizeEx(handle, &mut current) } == 0 {
+				return unsafe { GetLastError() } as i32;
+			}
+			let want = end.max(current.max(0) as u64);
 			let size = FILE_END_OF_FILE_INFO {
-				EndOfFile: end as i64,
+				EndOfFile: want as i64,
 			};
 			if unsafe {
 				SetFileInformationByHandle(
@@ -418,7 +427,7 @@ impl Backend for Iocp {
 			// How much is reserved, not where it is: the range's end is what
 			// has to be backed.
 			let reservation = FILE_ALLOCATION_INFO {
-				AllocationSize: end as i64,
+				AllocationSize: want as i64,
 			};
 			if unsafe {
 				SetFileInformationByHandle(

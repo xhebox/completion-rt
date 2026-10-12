@@ -48,7 +48,7 @@ enum Progress {
 }
 
 struct Job {
-	task: Task<(u64, io::Result<()>)>,
+	task: Task<(u64, io::Result<Response>)>,
 }
 
 enum Work {
@@ -386,7 +386,7 @@ impl Portable {
 		}
 		for (token, result) in landed {
 			self.pool.remove(&token);
-			out.push((token, result.map(|_| Response::Done)));
+			out.push((token, result));
 		}
 	}
 }
@@ -680,18 +680,20 @@ fn run_file(
 	kind: Kind,
 	memory: Option<Arc<dyn crate::Memory>>,
 	extents: Extents,
-) -> io::Result<()> {
+) -> io::Result<Response> {
 	let fd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
 	match kind {
-		Kind::Fsync => rustix::fs::fsync(fd).map_err(io::Error::from),
-		Kind::Flush => flush_handle(fd),
-		Kind::Allocate { offset, len } => allocate(fd, offset, len),
-		Kind::Punch { offset, len } => punch(fd, offset, len),
+		Kind::Fsync => rustix::fs::fsync(fd)
+			.map(|()| Response::Done)
+			.map_err(io::Error::from),
+		Kind::Flush => flush_handle(fd).map(|()| Response::Done),
+		Kind::Allocate { offset, len } => allocate(fd, offset, len).map(|()| Response::Done),
+		Kind::Punch { offset, len } => punch(fd, offset, len).map(|()| Response::Done),
 		Kind::Read | Kind::Write => {
 			let memory = memory.expect("a transfer carries its memory");
 			let spans = crate::memory::spans(&memory, &extents)?;
 			let Some(span) = spans.first() else {
-				return Ok(());
+				return Ok(Response::Count(0));
 			};
 			// SAFETY: the job retains the memory backing this span; the syscall copies through its pointer without forming a Rust reference.
 			let offset = fdoff as libc::off_t;
@@ -706,7 +708,7 @@ fn run_file(
 					_ => unreachable!("handled above"),
 				}
 			})
-			.map(|_| ())
+			.map(Response::Count)
 		}
 	}
 }

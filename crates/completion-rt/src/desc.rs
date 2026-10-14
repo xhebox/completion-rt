@@ -36,7 +36,7 @@ mod imp {
 		}
 
 		/// The number as the cross-platform [`RawDescriptor`], for
-		/// [`Submitter::in_flight`](crate::Submitter::in_flight).
+		/// [`Reactor::in_flight`](crate::Reactor::in_flight).
 		pub(crate) const fn into_raw(self) -> RawDescriptor {
 			self.0
 		}
@@ -137,7 +137,7 @@ mod imp {
 		}
 
 		/// The number as the cross-platform [`RawDescriptor`], for
-		/// [`Submitter::in_flight`](crate::Submitter::in_flight).
+		/// [`Reactor::in_flight`](crate::Reactor::in_flight).
 		pub(crate) const fn into_raw(self) -> RawDescriptor {
 			self.0
 		}

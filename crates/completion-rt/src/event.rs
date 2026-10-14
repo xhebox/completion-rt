@@ -7,7 +7,7 @@ use crate::desc::{BorrowedDescriptor, RawHandle};
 
 use imp::Inner;
 
-/// A cloneable, thread-safe wake-up handle for [`Reactor::poll`](crate::Reactor::poll) and [`Submitter::wait`](crate::Submitter::wait).
+/// A cloneable, thread-safe wake-up handle for [`Reactor::poll`](crate::Reactor::poll) and [`Reactor::wait_event`](crate::Reactor::wait_event).
 #[derive(Clone)]
 pub struct Event(Arc<Inner>);
 

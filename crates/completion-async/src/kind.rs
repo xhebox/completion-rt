@@ -21,7 +21,8 @@ mod sealed {
 	pub trait Sealed {}
 }
 
-/// One of [`File`], [`Descriptor`], [`Datagram`], [`Stream`], [`Listener`].
+/// One of [`File`], [`Descriptor`], [`Datagram`], [`Stream`], [`Listener`],
+/// [`Signal`].
 pub trait Kind: sealed::Sealed {}
 
 /// A kind that is read and written at an offset: [`File`] and [`Descriptor`].
@@ -48,17 +49,28 @@ pub enum Stream {}
 /// A listening socket: `accept`.
 pub enum Listener {}
 
+/// A descriptor waited on for readiness, and nothing else: an eventfd, a
+/// pidfd, a signal endpoint.
+///
+/// Nothing moves through one. That is why it is a kind of its own rather than
+/// a [`Descriptor`]: a resource with a transfer has no readiness wait to
+/// offer, because the backend arms the readiness itself when a call would
+/// block and the completion says how much moved.
+pub enum Signal {}
+
 impl sealed::Sealed for File {}
 impl sealed::Sealed for Descriptor {}
 impl sealed::Sealed for Datagram {}
 impl sealed::Sealed for Stream {}
 impl sealed::Sealed for Listener {}
+impl sealed::Sealed for Signal {}
 
 impl Kind for File {}
 impl Kind for Descriptor {}
 impl Kind for Datagram {}
 impl Kind for Stream {}
 impl Kind for Listener {}
+impl Kind for Signal {}
 
 impl Positional for File {}
 impl Positional for Descriptor {}

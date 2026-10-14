@@ -3,12 +3,14 @@
 //! the origin a submission reports.
 //!
 //! These drive `Reactor::poll` themselves — a bounded pass to put an operation
-//! in flight, a `ZERO` poll to hand one to the kernel, an `is_idle` to know it
+//! in flight, a `ZERO` poll to hand one to the kernel, an `in_flight` snapshot to know it
 //! settled — none of which the async layer, whose executor owns the reactor,
 //! exposes. The tests that only move bytes through the facade live with the
 //! high crate.
 
 mod common;
+
+use common::submit;
 
 #[cfg(unix)]
 use std::io::Read;
@@ -18,7 +20,7 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use completion_rt::{Config, Extent, Handle, Memory, Reactor};
+use completion_rt::{Config, Extent, Extents, Handle, Memory, Op, Reactor};
 
 /// A connected pair over loopback: the portable way to two real sockets.
 fn pair() -> (TcpStream, TcpStream) {
@@ -33,11 +35,11 @@ fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
 	memory
 }
 
-fn whole(buf: &Arc<Vec<u8>>) -> [Extent; 1] {
-	[Extent {
+fn whole(buf: &Arc<Vec<u8>>) -> Extents {
+	Extents::from_slice(&[Extent {
 		offset: 0,
 		len: buf.len(),
-	}]
+	}])
 }
 
 /// A listener to connect to inside `directory`, and the path its socket lives
@@ -58,8 +60,8 @@ fn listener(directory: &std::path::Path) -> (std::os::unix::net::UnixListener, s
 /// Drives the reactor until the accept's response is in the entry that holds
 /// it.
 #[cfg(unix)]
-fn drive_until_settled(reactor: &mut Reactor) {
-	while !reactor.is_idle() {
+fn drive_until_settled(reactor: &Reactor) {
+	while !common::idle(reactor) {
 		reactor.poll(Some(Duration::from_millis(1))).unwrap();
 	}
 }
@@ -91,10 +93,7 @@ fn assert_the_connection_ended(client: &mut std::os::unix::net::UnixStream) {
 /// whose result was given up on no longer counts as outstanding, so nothing
 /// else reaps for it, and a socket left open keeps the peer waiting.
 #[cfg(target_os = "linux")]
-fn drive_until_the_connection_ends(
-	reactor: &mut Reactor,
-	client: &mut std::os::unix::net::UnixStream,
-) {
+fn drive_until_the_connection_ends(reactor: &Reactor, client: &mut std::os::unix::net::UnixStream) {
 	client.set_nonblocking(true).unwrap();
 	let mut byte = [0u8; 1];
 	for _ in 0..500 {
@@ -117,16 +116,16 @@ fn a_dropped_accept_closes_the_new_socket() {
 
 	let directory = common::tempdir("completion-accept-drop").unwrap();
 	let (listener, path) = listener(directory.path());
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let reactor = Reactor::new(Config::default()).unwrap();
 	let listener = Handle::new(listener);
 	let mut client;
 	{
-		let mut accept = pin!(submitter.accept(&listener).unwrap());
+		let mut accept = pin!(submit(&reactor, &listener, Op::Accept).unwrap());
 		let mut cx = Context::from_waker(Waker::noop());
 		// Hand the accept to the kernel.
 		assert!(accept.as_mut().poll(&mut cx).is_pending());
 		client = UnixStream::connect(&path).unwrap();
-		drive_until_settled(&mut reactor);
+		drive_until_settled(&reactor);
 		// The socket exists and the response holds it, so this is not a
 		// request saying nobody wanted it yet.
 	}
@@ -147,10 +146,10 @@ fn an_abandoned_accept_that_succeeds_closes_its_socket() {
 
 	let directory = common::tempdir("completion-accept-abandoned").unwrap();
 	let (listener, path) = listener(directory.path());
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let reactor = Reactor::new(Config::default()).unwrap();
 	let listener = Handle::new(listener);
 	{
-		let mut accept = pin!(submitter.accept(&listener).unwrap());
+		let mut accept = pin!(submit(&reactor, &listener, Op::Accept).unwrap());
 		let mut cx = Context::from_waker(Waker::noop());
 		// Hand the accept to the kernel with nothing to accept yet.
 		assert!(accept.as_mut().poll(&mut cx).is_pending());
@@ -160,7 +159,7 @@ fn an_abandoned_accept_that_succeeds_closes_its_socket() {
 	// The client arrives after the result was given up on, and the kernel
 	// reports the connection all the same.
 	let mut client = UnixStream::connect(&path).unwrap();
-	drive_until_the_connection_ends(&mut reactor, &mut client);
+	drive_until_the_connection_ends(&reactor, &mut client);
 }
 
 /// An until future dropped after its cancel fired, whose accept raced to
@@ -175,17 +174,14 @@ fn an_abandoned_accept_that_succeeds_closes_its_socket() {
 fn a_cancelled_accept_that_succeeded_closes_its_socket() {
 	use std::os::unix::net::UnixStream;
 
-	use completion_rt::Cancel;
-
 	let directory = common::tempdir("completion-accept-raced").unwrap();
 	let (listener, path) = listener(directory.path());
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let reactor = Reactor::new(Config::default()).unwrap();
 	let listener = Handle::new(listener);
 
-	let cancel = Cancel::new();
 	let mut client;
 	{
-		let mut accept = pin!(submitter.accept(&listener).unwrap().until(&cancel));
+		let mut accept = pin!(submit(&reactor, &listener, Op::Accept).unwrap());
 		let mut cx = Context::from_waker(Waker::noop());
 		// Hand the accept to the kernel with nothing to accept yet.
 		assert!(accept.as_mut().poll(&mut cx).is_pending());
@@ -195,7 +191,7 @@ fn a_cancelled_accept_that_succeeded_closes_its_socket() {
 		// The kernel reports the connection without the reactor being driven,
 		// so the accept is done before the cancel fires.
 		std::thread::sleep(Duration::from_millis(50));
-		cancel.cancel();
+		accept.cancel();
 		assert!(
 			accept.as_mut().poll(&mut cx).is_pending(),
 			"the caller asked for the accept to stop"
@@ -206,26 +202,32 @@ fn a_cancelled_accept_that_succeeded_closes_its_socket() {
 		// goes with the future.
 	}
 
-	drive_until_the_connection_ends(&mut reactor, &mut client);
+	drive_until_the_connection_ends(&reactor, &mut client);
 }
 
 /// The origin a reactor reports names the call that asked for the operation.
 ///
 /// A facade takes the location where the operation was asked for, because the
-/// frame that reaches the submitter through the loop is the loop's own; a
+/// frame that reaches the reactor through the loop is the loop's own; a
 /// report that points at `flow.rs` names code that cannot stop asking.
 #[test]
 fn an_operation_reports_the_line_that_asked_for_it() {
 	let (client, server) = pair();
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let reactor = Reactor::new(Config::default()).unwrap();
 	let client = Handle::new(client);
 	let buffer = Arc::new(vec![0u8; 16]);
 
 	let before = line!();
 	let mut receive = pin!(
-		submitter
-			.recv(&client, memory(&buffer), whole(&buffer))
-			.unwrap()
+		submit(
+			&reactor,
+			&client,
+			Op::Recv {
+				memory: memory(&buffer),
+				extents: whole(&buffer),
+			},
+		)
+		.unwrap()
 	);
 	let after = line!();
 	let mut cx = Context::from_waker(Waker::noop());
@@ -235,7 +237,7 @@ fn an_operation_reports_the_line_that_asked_for_it() {
 	);
 	reactor.poll(Some(Duration::ZERO)).unwrap();
 
-	let entry = submitter
+	let entry = reactor
 		.in_flight()
 		.into_iter()
 		.find(|entry| entry.op == "recv")
@@ -254,7 +256,7 @@ fn an_operation_reports_the_line_that_asked_for_it() {
 	// The peer going ends the receive, so the future is dropped with nothing in
 	// flight: the fallback is not what this test is about.
 	drop(server);
-	while !reactor.is_idle() {
+	while !common::idle(&reactor) {
 		reactor.poll(Some(Duration::from_millis(1))).unwrap();
 	}
 }

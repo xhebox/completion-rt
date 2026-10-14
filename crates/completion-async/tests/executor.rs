@@ -152,7 +152,7 @@ fn block_on_runs_the_tasks_it_finds_ready() {
 }
 
 /// The executor owns the reactor, so dropping it drops the reactor too. A
-/// facade built from that executor's submitter — the kibotos shape, where a
+/// facade built from that executor — the kibotos shape, where a
 /// mount's executor goes and a facade bound to it stays — is then left with
 /// nothing to drive its operations: the next one has to be refused at once, not
 /// accepted into a table no poller will ever reach.
@@ -163,7 +163,7 @@ fn an_operation_after_the_executor_drops_is_refused() {
 	std::fs::write(&path, b"hello").unwrap();
 
 	let executor = executor();
-	let file = File::with_submitter(common::open(&path).unwrap(), &executor.submitter());
+	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 	drop(executor);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
@@ -194,7 +194,7 @@ fn a_local_executor_reads_a_real_file() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file = File::with_submitter(common::open(&path).unwrap(), &executor.submitter());
+	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 	let buffer = Arc::new(vec![0u8; 5]);
 	let payload: Arc<dyn Memory> = buffer.clone();
 	let outcome = executor.block_on(file.read_at(payload, 0)).unwrap();
@@ -258,8 +258,6 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 		let path = directory.path().join("data");
 		std::fs::write(&path, b"hello").unwrap();
 		let mut executor = executor();
-		let submitter = executor.submitter();
-		let timers = executor.timers();
 		let busy = executor.spawner().spawn(std::future::poll_fn(move |cx| {
 			if flag.load(Ordering::Acquire) {
 				Poll::Ready(())
@@ -268,15 +266,14 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 				Poll::Pending
 			}
 		}));
-		let file = File::with_submitter(common::open(&path).unwrap(), &submitter);
+		let file = File::with_executor(common::open(&path).unwrap(), &executor);
 		let buffer = Arc::new(vec![0u8; 5]);
 		let payload: Arc<dyn Memory> = buffer.clone();
+		let timeout = Timeout::with_executor(Duration::from_millis(1), &executor);
 		executor
 			.block_on(async {
 				assert_eq!(file.read_at(payload, 0).await.into_result().unwrap(), 5);
-				Timeout::with_timers(Duration::from_millis(1), &timers)
-					.await
-					.unwrap();
+				timeout.await.unwrap();
 			})
 			.unwrap();
 		assert_eq!(&buffer[..], b"hello");
@@ -290,7 +287,7 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 }
 
 fn socket_pair(
-	submitter: &completion_async::Submitter,
+	executor: &completion_async::Executor,
 ) -> (
 	std::net::TcpStream,
 	completion_async::Facade<std::net::TcpStream>,
@@ -301,7 +298,7 @@ fn socket_pair(
 	stream.set_nonblocking(true).unwrap();
 	(
 		peer,
-		completion_async::Facade::with_submitter(stream, submitter),
+		completion_async::Facade::with_executor(stream, executor),
 	)
 }
 
@@ -309,14 +306,13 @@ fn stalled_task(
 	executor: &mut Executor,
 	buffer: &Arc<Vec<u8>>,
 ) -> (std::net::TcpStream, impl Future<Output = ()> + use<>) {
-	let (peer, socket) = socket_pair(&executor.submitter());
+	let (peer, socket) = socket_pair(&executor);
 	let payload: Arc<dyn Memory> = buffer.clone();
 	let task = executor.spawner().spawn(async move {
 		socket.recv(payload).await.into_result().unwrap();
 	});
-	let timers = executor.timers();
 	executor
-		.block_on(Timeout::with_timers(Duration::from_millis(1), &timers))
+		.block_on(Timeout::with_executor(Duration::from_millis(1), &executor))
 		.unwrap()
 		.unwrap();
 	(peer, task)
@@ -346,9 +342,7 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 	use std::rc::Rc;
 
 	let mut executor = executor();
-	let timers = executor.timers();
-	let submitter = executor.submitter();
-	let (_peer, socket) = socket_pair(&submitter);
+	let (_peer, socket) = socket_pair(&executor);
 	let buffer = Arc::new(vec![0u8; 8]);
 	let payload: Arc<dyn Memory> = buffer.clone();
 	let mut receive = Box::pin(socket.recv(payload));
@@ -368,7 +362,7 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 		Poll::Pending
 	})));
 	executor
-		.block_on(Timeout::with_timers(Duration::from_millis(1), &timers))
+		.block_on(Timeout::with_executor(Duration::from_millis(1), &executor))
 		.unwrap()
 		.unwrap();
 	cancel.set(true);
@@ -387,9 +381,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	use std::rc::Rc;
 
 	let mut executor = executor();
-	let timers = executor.timers();
-	let submitter = executor.submitter();
-	let (_peer, socket) = socket_pair(&submitter);
+	let (_peer, socket) = socket_pair(&executor);
 	let buffer = Arc::new(vec![0u8; 8]);
 	let payload: Arc<dyn Memory> = buffer.clone();
 	let mut receive = Box::pin(socket.recv(payload));
@@ -405,7 +397,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		Poll::Pending::<()>
 	}));
 	executor
-		.block_on(Timeout::with_timers(Duration::from_millis(1), &timers))
+		.block_on(Timeout::with_executor(Duration::from_millis(1), &executor))
 		.unwrap()
 		.unwrap();
 	panic_next.set(true);
@@ -451,9 +443,7 @@ fn cancellation_unwinding_does_not_hide_later_unsignalled_io_drops() {
 		std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.block_on(async {})));
 	assert!(caught.is_err(), "a future destructor panic was swallowed");
 
-	let timers = executor.timers();
-	let submitter = executor.submitter();
-	let (_peer, socket) = socket_pair(&submitter);
+	let (_peer, socket) = socket_pair(&executor);
 	let buffer = Arc::new(vec![0u8; 8]);
 	let payload: Arc<dyn Memory> = buffer.clone();
 	let mut receive = Box::pin(socket.recv(payload));
@@ -464,7 +454,7 @@ fn cancellation_unwinding_does_not_hide_later_unsignalled_io_drops() {
 			.is_pending()
 	);
 	executor
-		.block_on(Timeout::with_timers(Duration::from_millis(1), &timers))
+		.block_on(Timeout::with_executor(Duration::from_millis(1), &executor))
 		.unwrap()
 		.unwrap();
 	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(receive)));

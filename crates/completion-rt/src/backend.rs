@@ -58,7 +58,7 @@ impl Config {
 }
 
 #[enum_dispatch(BackendEnum)]
-pub(super) trait Backend: Send {
+pub(super) trait Backend {
 	fn read(
 		&mut self,
 		id: u64,

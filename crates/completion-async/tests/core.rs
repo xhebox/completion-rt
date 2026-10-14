@@ -17,7 +17,7 @@ use std::task::{Context, Poll, Waker};
 
 #[cfg(unix)]
 use completion_async::Facade;
-use completion_async::{Config, ErrorKind, Executor, File, Handle, Memory, Submitter};
+use completion_async::{Config, ErrorKind, Executor, File, Handle, Memory};
 
 /// The async driver the operations run on: it owns the reactor, and `block_on`
 /// drives both the future and the backend beneath it.
@@ -26,13 +26,13 @@ fn executor() -> Executor {
 	Executor::new(Config::default()).unwrap()
 }
 
-/// A file with `contents`, wrapped in a facade bound to `submitter`.
-fn seeded(submitter: &Submitter, contents: &[u8]) -> File {
+/// A file with `contents`, wrapped in a facade bound to `executor`.
+fn seeded(executor: &Executor, contents: &[u8]) -> File {
 	let dir = common::tempdir("completion-seed").unwrap();
 	let path = dir.path().join("data");
 	std::fs::write(&path, contents).unwrap();
 	// The returned descriptor outlives the deleted directory entry.
-	File::with_submitter(common::open(path).unwrap(), submitter)
+	File::with_executor(common::open(path).unwrap(), executor)
 }
 
 /// The buffer in the shape the engine names memory: a second handle on it, so
@@ -48,7 +48,7 @@ fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
 #[test]
 fn a_read_short_of_the_buffer_completes_with_its_count() {
 	let mut executor = executor();
-	let file = seeded(&executor.submitter(), b"hello");
+	let file = seeded(&executor, b"hello");
 	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
 	let n = executor
 		.block_on(file.read_at(memory(&buf), 0))
@@ -79,8 +79,7 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 
 	let handle = Handle::new(std::fs::File::open(&first).unwrap());
 	let number: RawFd = handle.as_descriptor().as_raw_fd();
-	let facade: Facade<std::fs::File> =
-		Facade::bind_with_submitter(handle.clone(), &executor.submitter());
+	let facade: Facade<std::fs::File> = Facade::bind_with_executor(handle.clone(), &executor);
 	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let read = facade.read_at(memory(&buf), 0);
 	// The caller's copies go before anything reaches the kernel; the read names
@@ -111,7 +110,7 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 #[test]
 fn a_dropped_operation_releases_an_unsubmitted_request() {
 	let mut executor = executor();
-	let file = seeded(&executor.submitter(), b"data");
+	let file = seeded(&executor, b"data");
 	let buf = Arc::new(vec![0u8; 4]);
 	let read = file.read_at(memory(&buf), 0);
 	assert_eq!(Arc::strong_count(&buf), 2, "the request holds the buffer");
@@ -138,7 +137,7 @@ fn cancelling_waits_for_the_kernel() {
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
-	let right: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
+	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
 	let buf = Arc::new(vec![0u8; 8]);
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
@@ -167,10 +166,9 @@ fn cancelling_waits_for_the_kernel() {
 #[test]
 fn concurrent_submits_all_complete() {
 	let mut executor = executor();
-	let submitter = executor.submitter();
 	let mut tasks = Vec::new();
 	for i in 0..8u8 {
-		let file = seeded(&submitter, &[i; 64]);
+		let file = seeded(&executor, &[i; 64]);
 		let buf: Arc<Vec<u8>> = Arc::new(vec![0; 64]);
 		let read = Arc::clone(&buf);
 		tasks.push(executor.spawner().spawn(async move {
@@ -194,8 +192,7 @@ fn concurrent_submits_all_complete() {
 #[test]
 fn many_transfers_all_complete() {
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let file = seeded(&submitter, &[7u8; 4096]);
+	let file = seeded(&executor, &[7u8; 4096]);
 	let mut tasks = Vec::new();
 	for _ in 0..4096 {
 		let buf: Arc<Vec<u8>> = Arc::new(vec![0u8; 4096]);
@@ -224,9 +221,8 @@ fn a_socket_send_lands_in_the_receive_buffer() {
 
 	let (left, right) = UnixStream::pair().unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let left: Facade<UnixStream> = Facade::with_submitter(left, &submitter);
-	let right: Facade<UnixStream> = Facade::with_submitter(right, &submitter);
+	let left: Facade<UnixStream> = Facade::with_executor(left, &executor);
+	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
 
 	let sent: Arc<Vec<u8>> = Arc::new(b"over the socket".to_vec());
 	assert_eq!(
@@ -267,7 +263,7 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
-	let right: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
+	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
 
 	// Nothing has been sent yet, so the receive stays in flight until the peer
@@ -309,7 +305,7 @@ fn sqpoll_rings_complete_too() {
 			return;
 		}
 	};
-	let file = seeded(&executor.submitter(), b"hello");
+	let file = seeded(&executor, b"hello");
 	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let n = executor
 		.block_on(file.read_at(memory(&buf), 0))
@@ -330,7 +326,7 @@ fn fsync_is_refused_on_an_iopoll_ring() {
 		..Config::default()
 	})
 	.unwrap();
-	let file = seeded(&executor.submitter(), b"data");
+	let file = seeded(&executor, b"data");
 	// The reactor is the backend's only caller, so the refusal lands on the
 	// first poll rather than at submit time.
 	match executor.block_on(file.sync()).unwrap() {
@@ -351,7 +347,7 @@ fn allocate_is_refused_on_an_iopoll_ring() {
 		..Config::default()
 	})
 	.unwrap();
-	let file = seeded(&executor.submitter(), b"data");
+	let file = seeded(&executor, b"data");
 	match executor.block_on(file.allocate(0, 4096)).unwrap() {
 		Ok(()) => panic!("allocate on an IOPOLL ring must be refused"),
 		Err(error) if error.kind() == ErrorKind::Failed => {
@@ -367,8 +363,7 @@ fn allocate_is_refused_on_an_iopoll_ring() {
 #[test]
 fn a_submission_after_the_executor_drops_is_refused() {
 	let executor = executor();
-	let submitter = executor.submitter();
-	let file = seeded(&submitter, b"hello");
+	let file = seeded(&executor, b"hello");
 	drop(executor);
 	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let mut read = pin!(file.read_at(memory(&buf), 0));

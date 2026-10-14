@@ -1,4 +1,4 @@
-//! The timer future and the handle it arms through.
+//! The timer future.
 
 use std::future::Future;
 use std::io;
@@ -6,13 +6,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use completion_rt::TimerKey;
+use completion_rt::{Reactor, TimerKey};
 
-/// The timer wheel of an [`Executor`](crate::Executor), or of this thread's
-/// global one through [`timers`](crate::timers). Cloning it is cheap; every
-/// clone arms timers on the same reactor.
-#[derive(Clone)]
-pub struct Timers(pub(crate) completion_rt::Timers);
+use crate::Executor;
 
 /// Resolves to `Ok(())` once `duration` has elapsed.
 ///
@@ -20,22 +16,26 @@ pub struct Timers(pub(crate) completion_rt::Timers);
 /// stopped, say — is returned there rather than from the constructor.
 pub struct Timeout {
 	duration: Duration,
-	timers: Timers,
+	reactor: Reactor,
 	key: Option<TimerKey>,
 }
 
 impl Timeout {
 	/// A timer that fires `duration` after its first poll, armed on this
-	/// thread's global executor's [`timers`](crate::timers).
+	/// thread's global executor.
 	pub fn new(duration: Duration) -> Timeout {
-		Timeout::with_timers(duration, &crate::timers())
-	}
-
-	/// A timer that fires `duration` after its first poll, armed on `timers`.
-	pub fn with_timers(duration: Duration, timers: &Timers) -> Timeout {
 		Timeout {
 			duration,
-			timers: timers.clone(),
+			reactor: crate::global::reactor(),
+			key: None,
+		}
+	}
+
+	/// A timer that fires `duration` after its first poll, armed on `executor`.
+	pub fn with_executor(duration: Duration, executor: &Executor) -> Timeout {
+		Timeout {
+			duration,
+			reactor: executor.reactor().clone(),
 			key: None,
 		}
 	}
@@ -48,12 +48,12 @@ impl Future for Timeout {
 		let this = self.get_mut();
 		let key = match this.key {
 			Some(key) => key,
-			None => match this.timers.0.insert(Instant::now() + this.duration) {
+			None => match this.reactor.insert_timer(Instant::now() + this.duration) {
 				Ok(key) => *this.key.insert(key),
 				Err(error) => return Poll::Ready(Err(error)),
 			},
 		};
-		match this.timers.0.poll(key, cx) {
+		match this.reactor.poll_timer(key, cx) {
 			Poll::Ready(result) => {
 				this.key = None;
 				Poll::Ready(result)
@@ -66,7 +66,7 @@ impl Future for Timeout {
 impl Drop for Timeout {
 	fn drop(&mut self) {
 		if let Some(key) = self.key.take() {
-			self.timers.0.cancel(key);
+			self.reactor.cancel_timer(key);
 		}
 	}
 }

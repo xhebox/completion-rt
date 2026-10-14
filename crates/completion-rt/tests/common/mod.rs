@@ -7,36 +7,27 @@
 
 use std::future::Future;
 use std::io;
+use std::panic::Location;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
-use std::sync::{Arc, Once};
-use std::task::{Context, Poll, Wake, Waker};
-use std::thread::{self, Thread};
+use std::pin::{Pin, pin};
+use std::sync::Once;
+use std::task::{Context, Poll, Waker};
 
-/// Runs a future to completion on this thread, woken by whoever completes it.
+use completion_rt::{AsDescriptor, Handle, InFlightState, Op, Reactor, Response, Token};
+
+/// Runs a future to completion on this thread, driving `reactor` while it waits.
 ///
-/// These tests drive their reactor on a thread of its own, so the reactor's
-/// task loop — which owns one — is not what can wait for them: this parks until
-/// the completion's waker unparks it.
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+/// The completions the future waits on land through `reactor`, so `poll(None)`
+/// returns once one does, and the future is polled again.
+pub(crate) fn block_on<F: Future>(reactor: &Reactor, future: F) -> F::Output {
 	init_logging();
-
-	struct Unpark(Thread);
-
-	impl Wake for Unpark {
-		fn wake(self: Arc<Self>) {
-			self.0.unpark();
-		}
-	}
-
-	let waker = Waker::from(Arc::new(Unpark(thread::current())));
-	let mut context = Context::from_waker(&waker);
+	let mut context = Context::from_waker(Waker::noop());
 	let mut future = pin!(future);
 	loop {
 		if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
 			return value;
 		}
-		thread::park();
+		reactor.poll(None).unwrap();
 	}
 }
 
@@ -112,4 +103,71 @@ pub(crate) fn tempdir(tag: &str) -> io::Result<Scratch> {
 		path: base.join(name),
 		dir,
 	})
+}
+
+/// A submitted operation, as the tests hold it: resolves to its userdata and
+/// its response.
+pub(crate) struct Completion<U = ()> {
+	token: Token,
+	userdata: Option<U>,
+}
+
+impl<U> Completion<U> {
+	pub(crate) fn tag<V>(self, userdata: V) -> Completion<V> {
+		Completion {
+			token: self.token,
+			userdata: Some(userdata),
+		}
+	}
+
+	pub(crate) fn cancel(&self) {
+		self.token.cancel();
+	}
+}
+
+impl<U: Unpin> Future for Completion<U> {
+	type Output = (U, io::Result<Response>);
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = self.get_mut();
+		this.token.poll(cx.waker()).map(|response| {
+			let userdata = this
+				.userdata
+				.take()
+				.expect("a completion is not polled after it resolved");
+			(userdata, response)
+		})
+	}
+}
+
+/// Submits `op` on `handle`; the completion is attributed to the caller's line.
+#[track_caller]
+pub(crate) fn submit<S: AsDescriptor + Send + Sync + 'static>(
+	reactor: &Reactor,
+	handle: &Handle<S>,
+	op: Op,
+) -> io::Result<Completion> {
+	let token = reactor.submit(handle, op, Location::caller(), None)?;
+	Ok(Completion {
+		token,
+		userdata: Some(()),
+	})
+}
+
+/// Waits on the reactor's event; the completion is attributed to the caller's line.
+#[track_caller]
+pub(crate) fn wait_event(reactor: &Reactor) -> io::Result<Completion> {
+	let token = reactor.wait_event(Location::caller())?;
+	Ok(Completion {
+		token,
+		userdata: Some(()),
+	})
+}
+
+/// Whether the backend holds nothing: every operation the reactor retains has landed.
+pub(crate) fn idle(reactor: &Reactor) -> bool {
+	reactor
+		.in_flight()
+		.iter()
+		.all(|entry| entry.state == InFlightState::Done)
 }

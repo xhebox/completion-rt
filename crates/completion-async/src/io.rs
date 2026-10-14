@@ -5,10 +5,13 @@ use std::io;
 use std::marker::PhantomData;
 use std::panic::Location;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use completion_rt::{Extent, Extents, Handle, Lease, Memory, Submitter};
+use completion_rt::{Extent, Extents, Handle, Lease, Memory, Op as LowOp, Reactor};
 
+use crate::Executor;
+use crate::completion::submit;
 use crate::kind::{self, Positional, Resource};
 use crate::net::{Kind, Op, Transfer, whole};
 
@@ -16,14 +19,14 @@ use crate::net::{Kind, Op, Transfer, whole};
 /// [`Scope`](crate::Scope).
 pub struct Lent<'a> {
 	pub(crate) memory: Arc<dyn Memory>,
-	pub(crate) lease: Option<Arc<Lease>>,
+	pub(crate) lease: Option<Rc<Lease>>,
 	borrow: PhantomData<&'a ()>,
 }
 
 impl<'a> Lent<'a> {
 	/// Memory a scope lends under `lease`; the caller vouches that `memory`
 	/// outlives every operation submitted under it.
-	pub(crate) fn lent(memory: Arc<dyn Memory>, lease: Arc<Lease>) -> Lent<'a> {
+	pub(crate) fn lent(memory: Arc<dyn Memory>, lease: Rc<Lease>) -> Lent<'a> {
 		Lent {
 			memory,
 			lease: Some(lease),
@@ -155,8 +158,8 @@ impl OpenOptions {
 	}
 }
 
-/// An owned resource with async operations submitted through a
-/// [`Submitter`](crate::Submitter).
+/// An owned resource with async operations submitted through its
+/// [`Executor`](crate::Executor).
 ///
 /// Which operations a facade has is the resource's [`Kind`](crate::Kind),
 /// declared once through [`Resource`](crate::Resource). A socket is not
@@ -184,51 +187,60 @@ impl OpenOptions {
 /// 	let _ = pipe.sync();
 /// }
 /// ```
+///
+/// Nor does a resource with a transfer have a readiness wait: the backend arms
+/// the readiness itself when a call would block. Only [`Signal`](crate::Signal)
+/// waits.
+///
+/// ```compile_fail
+/// # use completion_async::Facade;
+/// fn wait(socket: &Facade<std::net::TcpStream>) {
+/// 	let _ = socket.wait_readable();
+/// }
+/// ```
 pub struct Facade<S> {
 	handle: Handle<S>,
-	submitter: Submitter,
+	reactor: Reactor,
 }
 
 impl<S> Facade<S> {
 	/// Wraps `resource`, its operations going to this thread's global
-	/// executor's [`submitter`](crate::submitter).
+	/// executor.
 	///
-	/// See [`Facade::with_submitter`] for the resource's requirements.
+	/// See [`Facade::with_executor`] for the resource's requirements.
 	pub fn new(resource: impl Into<S>) -> Facade<S> {
-		Self::with_submitter(resource, &crate::submitter())
+		Self::from_parts(Handle::new(resource.into()), crate::global::reactor())
 	}
 
-	/// Wraps `resource`, its operations going to `submitter`.
+	/// Wraps `resource`, its operations going to `executor`.
 	///
 	/// On Windows the resource must be opened for overlapped I/O: a file
 	/// through [`OpenOptions`], which asks for `FILE_FLAG_OVERLAPPED`. A handle
 	/// opened without that flag cannot be owned by a completion port, so its
 	/// operations fail with the invalid-parameter error the association gives.
-	pub fn with_submitter(resource: impl Into<S>, submitter: &crate::Submitter) -> Facade<S> {
-		Self {
-			handle: Handle::new(resource.into()),
-			submitter: submitter.0.clone(),
-		}
+	pub fn with_executor(resource: impl Into<S>, executor: &Executor) -> Facade<S> {
+		Self::from_parts(Handle::new(resource.into()), executor.reactor().clone())
 	}
 
 	/// Wraps a `handle` the caller already holds, its operations going to this
-	/// thread's global executor's [`submitter`](crate::submitter); the facade
-	/// shares the handle rather than taking it over.
+	/// thread's global executor; the facade shares the handle rather than taking
+	/// it over.
 	pub fn bind(handle: Handle<S>) -> Facade<S> {
-		Self::bind_with_submitter(handle, &crate::submitter())
+		Self::from_parts(handle, crate::global::reactor())
 	}
 
 	/// Wraps a `handle` the caller already holds, its operations going to
-	/// `submitter`; the facade shares the handle rather than taking it over.
-	pub fn bind_with_submitter(handle: Handle<S>, submitter: &crate::Submitter) -> Facade<S> {
-		Self {
-			handle,
-			submitter: submitter.0.clone(),
-		}
+	/// `executor`; the facade shares the handle rather than taking it over.
+	pub fn bind_with_executor(handle: Handle<S>, executor: &Executor) -> Facade<S> {
+		Self::from_parts(handle, executor.reactor().clone())
 	}
 
-	pub(super) fn submitter(&self) -> &Submitter {
-		&self.submitter
+	pub(super) fn from_parts(handle: Handle<S>, reactor: Reactor) -> Facade<S> {
+		Self { handle, reactor }
+	}
+
+	pub(super) fn reactor(&self) -> &Reactor {
+		&self.reactor
 	}
 
 	pub(super) fn handle(&self) -> &Handle<S> {
@@ -247,7 +259,7 @@ impl<S> Facade<S> {
 			Ok(resource) => Ok(resource),
 			Err(handle) => Err(Self {
 				handle,
-				submitter: self.submitter,
+				reactor: self.reactor,
 			}),
 		}
 	}
@@ -257,7 +269,7 @@ impl<S> Clone for Facade<S> {
 	fn clone(&self) -> Facade<S> {
 		Self {
 			handle: self.handle.clone(),
-			submitter: self.submitter.clone(),
+			reactor: self.reactor.clone(),
 		}
 	}
 }
@@ -399,7 +411,9 @@ where
 impl<S: Resource<Kind = kind::File>> Facade<S> {
 	#[track_caller]
 	pub fn sync(&self) -> Op<S> {
-		Op::new(self, Location::caller(), Submitter::fsync_at)
+		Op::new(self, Location::caller(), |reactor, origin, handle| {
+			submit(reactor, handle, LowOp::Fsync, origin, None)
+		})
 	}
 
 	/// Reports the resource's pending deferred write-back errors — `ENOSPC`,
@@ -411,7 +425,9 @@ impl<S: Resource<Kind = kind::File>> Facade<S> {
 	/// deferred and would otherwise surface at the resource's next close.
 	#[track_caller]
 	pub fn flush(&self) -> Op<S> {
-		Op::new(self, Location::caller(), Submitter::flush_at)
+		Op::new(self, Location::caller(), |reactor, origin, handle| {
+			submit(reactor, handle, LowOp::Flush, origin, None)
+		})
 	}
 
 	/// Backs `len` bytes at `offset` with storage, so a write there does not
@@ -419,11 +435,15 @@ impl<S: Resource<Kind = kind::File>> Facade<S> {
 	/// reading as zeros; the file never shrinks.
 	#[track_caller]
 	pub fn allocate(&self, offset: u64, len: u64) -> Op<S> {
-		Op::new(
-			self,
-			Location::caller(),
-			move |submitter, origin, handle| submitter.allocate_at(origin, handle, offset, len),
-		)
+		Op::new(self, Location::caller(), move |reactor, origin, handle| {
+			submit(
+				reactor,
+				handle,
+				LowOp::Allocate { offset, len },
+				origin,
+				None,
+			)
+		})
 	}
 
 	/// Zeroes `len` bytes at `offset`, freeing their storage where the
@@ -432,22 +452,8 @@ impl<S: Resource<Kind = kind::File>> Facade<S> {
 	/// On Windows the storage is freed only in a file marked sparse.
 	#[track_caller]
 	pub fn punch(&self, offset: u64, len: u64) -> Op<S> {
-		Op::new(
-			self,
-			Location::caller(),
-			move |submitter, origin, handle| submitter.punch_at(origin, handle, offset, len),
-		)
-	}
-}
-
-impl<S: Resource> Facade<S> {
-	#[track_caller]
-	pub fn wait_readable(&self) -> Op<S> {
-		Op::new(self, Location::caller(), Submitter::wait_readable_at)
-	}
-
-	#[track_caller]
-	pub fn wait_writable(&self) -> Op<S> {
-		Op::new(self, Location::caller(), Submitter::wait_writable_at)
+		Op::new(self, Location::caller(), move |reactor, origin, handle| {
+			submit(reactor, handle, LowOp::Punch { offset, len }, origin, None)
+		})
 	}
 }

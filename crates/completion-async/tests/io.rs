@@ -56,9 +56,8 @@ fn a_direct_open_asks_the_kernel_for_direct_io() {
 fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 	let (reader, writer) = std::io::pipe().unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let reader: Facade<std::io::PipeReader> = Facade::with_submitter(reader, &submitter);
-	let writer: Facade<std::io::PipeWriter> = Facade::with_submitter(writer, &submitter);
+	let reader: Facade<std::io::PipeReader> = Facade::with_executor(reader, &executor);
+	let writer: Facade<std::io::PipeWriter> = Facade::with_executor(writer, &executor);
 
 	let payload: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
 	let memory: Arc<dyn Memory> = Arc::clone(&payload) as Arc<dyn Memory>;
@@ -89,14 +88,13 @@ fn the_vector_path_goes_through_the_backing() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let file: File = Facade::with_submitter(
+	let file: File = Facade::with_executor(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&submitter,
+		&executor,
 	);
 	let range = [Extent { offset: 0, len: 7 }];
 
@@ -153,8 +151,7 @@ fn read_exact_at_reports_the_file_ending_first() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let file = File::with_submitter(common::open(&path).unwrap(), &submitter);
+	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
 	// One call: five bytes are left, and that is what it reports.
@@ -195,14 +192,13 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let file = File::with_submitter(
+	let file = File::with_executor(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&submitter,
+		&executor,
 	);
 
 	let len = 4 << 20;
@@ -225,7 +221,7 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	assert_eq!(*read, *payload, "the payload did not come back whole");
 }
 
-/// The facade binds the file to the submitter, so a call site names neither an
+/// The facade binds the file to the executor, so a call site names neither an
 /// offset of a whole-buffer transfer nor the extents behind one.
 #[test]
 fn the_facade_reads_and_writes_a_whole_buffer() {
@@ -233,13 +229,12 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
 	let file = OpenOptions::new()
 		.read(true)
 		.write(true)
 		.open(&path)
 		.unwrap();
-	let file: File = Facade::with_submitter(file, &submitter);
+	let file: File = Facade::with_executor(file, &executor);
 
 	let written: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
 	let memory: Arc<dyn Memory> = Arc::clone(&written) as Arc<dyn Memory>;
@@ -266,7 +261,7 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	assert_eq!(&read[..], b"hello");
 
 	// Back to the plain file: nothing names it any more, so the facade gives it
-	// up; the submitter binding is dropped.
+	// up; the executor binding is dropped.
 	let Some(plain) = block_on(file.take()) else {
 		panic!("the facade still holds the file");
 	};
@@ -281,14 +276,13 @@ fn a_facade_with_no_operations_gives_its_file_back_at_once() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"data").unwrap();
 	let executor = executor();
-	let submitter = executor.submitter();
-	let file = File::with_submitter(common::open(&path).unwrap(), &submitter);
+	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 
 	let plain = block_on(file.take()).expect("nothing else names the file");
 	assert_eq!(plain.metadata().unwrap().len(), 4);
 }
 
-/// A transfer owns the facade's handle and submitter, so a poll-driven state
+/// A transfer owns the facade's handle and executor, so a poll-driven state
 /// machine can keep it beside the facade, let the facade binding go before the
 /// first poll, and still drive the transfer to its end.
 #[test]
@@ -311,8 +305,7 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let file = File::with_submitter(common::open(&path).unwrap(), &submitter);
+	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
@@ -344,14 +337,13 @@ fn flush_leaves_the_facade_usable() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let file = File::with_submitter(
+	let file = File::with_executor(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&submitter,
+		&executor,
 	);
 
 	let first: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
@@ -391,7 +383,6 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 	use std::os::fd::{AsRawFd, FromRawFd};
 
 	let mut executor = executor();
-	let submitter = executor.submitter();
 
 	// Opened then closed, so the number is free and nothing owns it. Made after
 	// the reactor so no descriptor it built can have taken the number back.
@@ -403,7 +394,7 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 		raw
 	};
 
-	let file = File::with_submitter(unsafe { std::fs::File::from_raw_fd(dead) }, &submitter);
+	let file = File::with_executor(unsafe { std::fs::File::from_raw_fd(dead) }, &executor);
 	match executor.block_on(file.flush()).unwrap() {
 		Err(error) if error.kind() == ErrorKind::Failed => {
 			let error = io::Error::from(error);
@@ -431,13 +422,13 @@ fn filled(tag: &str, len: usize) -> (common::Scratch, std::path::PathBuf, Execut
 	let path = directory.path().join("data");
 	std::fs::write(&path, vec![0xab; len]).unwrap();
 	let executor = executor();
-	let file = File::with_submitter(
+	let file = File::with_executor(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&executor.submitter(),
+		&executor,
 	);
 	(directory, path, executor, file)
 }

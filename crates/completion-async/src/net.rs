@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use completion_rt::{
-	AsDescriptor, Cancel, Completion, Extent, Extents, Handle, Memory, OwnedDescriptor, Response,
-	Submitter, Until,
+	AsDescriptor, Extent, Extents, Handle, Memory, Op as LowOp, OwnedDescriptor, Reactor, Response,
 };
 
+use crate::completion::{Cancel, Completion, Until, submit};
 use crate::io::{IntoMemory, Lent};
 use crate::kind::{self, ListenerHandle, Resource, SocketKind};
 use crate::outcome::Outcome;
@@ -55,7 +55,7 @@ pub(super) enum Control {
 enum Call {
 	Idle,
 	Plain(Completion),
-	Armed(Until<()>),
+	Armed(Until),
 }
 
 impl Call {
@@ -78,14 +78,14 @@ impl Call {
 					*self = Call::Plain(completion);
 					Poll::Pending
 				}
-				Poll::Ready(((), result)) => Poll::Ready(Some(result)),
+				Poll::Ready(result) => Poll::Ready(Some(result)),
 			},
 			Call::Armed(mut until) => match Pin::new(&mut until).poll(cx) {
 				Poll::Pending => {
 					*self = Call::Armed(until);
 					Poll::Pending
 				}
-				Poll::Ready(Ok(((), result))) => Poll::Ready(Some(result)),
+				Poll::Ready(Ok(result)) => Poll::Ready(Some(result)),
 				Poll::Ready(Err(_)) => Poll::Ready(None),
 			},
 		}
@@ -110,14 +110,14 @@ pub(super) fn whole(memory: &dyn Memory) -> Extents {
 }
 
 pub(super) type Submit<S> = Box<
-	dyn Fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
+	dyn Fn(&Reactor, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
 		+ Send
 		+ Sync,
 >;
 
 pub(super) struct Flow<'a, S> {
 	handle: Handle<S>,
-	submitter: Submitter,
+	reactor: Reactor,
 	cancel: Option<Cancel>,
 	kind: Kind,
 	memory: Lent<'a>,
@@ -139,7 +139,7 @@ impl<'a, S> Flow<'a, S> {
 	) -> Flow<'a, S> {
 		Self {
 			handle: facade.handle().clone(),
-			submitter: facade.submitter().clone(),
+			reactor: facade.reactor().clone(),
 			cancel: None,
 			kind,
 			memory,
@@ -200,34 +200,34 @@ impl<S: AsDescriptor + Send + Sync + 'static> Flow<'_, S> {
 		let shift = self.done as u64;
 		let memory = Arc::clone(&self.memory.memory);
 		let lease = self.memory.lease.as_deref();
-		let submitter = &self.submitter;
+		let reactor = &self.reactor;
 		let handle = &self.handle;
 		let origin = self.origin;
-		match self.kind {
-			Kind::Read { fdoff } | Kind::ReadAll { fdoff } => {
-				submitter.read_at(origin, handle, fdoff + shift, memory, lease, extents)
-			}
-			Kind::Write { fdoff } | Kind::WriteAll { fdoff } => {
-				submitter.write_at(origin, handle, fdoff + shift, memory, lease, extents)
-			}
+		let op = match self.kind {
+			Kind::Read { fdoff } | Kind::ReadAll { fdoff } => LowOp::Read {
+				offset: fdoff + shift,
+				memory,
+				extents,
+			},
+			Kind::Write { fdoff } | Kind::WriteAll { fdoff } => LowOp::Write {
+				offset: fdoff + shift,
+				memory,
+				extents,
+			},
 			Kind::Recv | Kind::RecvAll => match &mut self.control {
-				Control::In(_) => {
-					submitter.recv_with_fds_at(origin, handle, memory, lease, extents)
-				}
-				_ => submitter.recv_at(origin, handle, memory, lease, extents),
+				Control::In(_) => LowOp::RecvWithFds { memory, extents },
+				_ => LowOp::Recv { memory, extents },
 			},
 			Kind::Send | Kind::SendAll => match (&mut self.control, self.done) {
-				(Control::Out(fds), 0) => submitter.send_with_fds_at(
-					origin,
-					handle,
+				(Control::Out(fds), 0) => LowOp::SendWithFds {
 					memory,
-					lease,
 					extents,
-					std::mem::take(fds),
-				),
-				_ => submitter.send_at(origin, handle, memory, lease, extents),
+					fds: std::mem::take(fds),
+				},
+				_ => LowOp::Send { memory, extents },
 			},
-		}
+		};
+		submit(reactor, handle, op, origin, lease)
 	}
 
 	fn landed(&mut self, result: io::Result<Response>) -> Result<bool, Error> {
@@ -253,7 +253,7 @@ impl<S: AsDescriptor + Send + Sync + 'static> Flow<'_, S> {
 
 pub(super) struct Gate<S> {
 	handle: Handle<S>,
-	submitter: Submitter,
+	reactor: Reactor,
 	cancel: Option<Cancel>,
 	submit: Submit<S>,
 	origin: &'static Location<'static>,
@@ -265,14 +265,14 @@ impl<S> Gate<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
 		origin: &'static Location<'static>,
-		submit: impl Fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
+		submit: impl Fn(&Reactor, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
 		+ Send
 		+ Sync
 		+ 'static,
 	) -> Gate<S> {
 		Self {
 			handle: facade.handle().clone(),
-			submitter: facade.submitter().clone(),
+			reactor: facade.reactor().clone(),
 			cancel: None,
 			submit: Box::new(submit),
 			origin,
@@ -298,7 +298,7 @@ impl<S: AsDescriptor + Send + Sync + 'static> Gate<S> {
 				if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
 					return Poll::Ready(Err(Error::cancelled()));
 				}
-				match (self.submit)(&self.submitter, self.origin, &self.handle) {
+				match (self.submit)(&self.reactor, self.origin, &self.handle) {
 					Ok(completion) => self.call.arm(completion, self.cancel.as_ref()),
 					Err(error) => return Poll::Ready(Err(Error::from(error))),
 				}
@@ -452,7 +452,7 @@ impl<S> Op<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
 		origin: &'static Location<'static>,
-		submit: impl Fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
+		submit: impl Fn(&Reactor, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
 		+ Send
 		+ Sync
 		+ 'static,
@@ -502,7 +502,7 @@ impl<S> Accept<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
 		origin: &'static Location<'static>,
-		submit: impl Fn(&Submitter, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
+		submit: impl Fn(&Reactor, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
 		+ Send
 		+ Sync
 		+ 'static,
@@ -540,9 +540,9 @@ impl<S: ListenerHandle> Future for Accept<S> {
 				this.finished = true;
 				let response = this.gate.take_response();
 				match response {
-					Some(Response::Accepted(socket)) => Poll::Ready(Ok(Facade::with_submitter(
-						socket,
-						&crate::Submitter(this.gate.submitter.clone()),
+					Some(Response::Accepted(socket)) => Poll::Ready(Ok(Facade::from_parts(
+						Handle::new(socket.into()),
+						this.gate.reactor.clone(),
 					))),
 					other => unreachable!("an accept's round reports a socket, not {other:?}"),
 				}
@@ -706,7 +706,9 @@ impl<S: ListenerHandle> Facade<S> {
 	/// Takes the next connection in: the stream it made, in a facade of its own.
 	#[track_caller]
 	pub fn accept(&self) -> Accept<S> {
-		Accept::new(self, Location::caller(), Submitter::accept_at)
+		Accept::new(self, Location::caller(), |reactor, origin, handle| {
+			submit(reactor, handle, LowOp::Accept, origin, None)
+		})
 	}
 }
 

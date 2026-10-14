@@ -19,14 +19,13 @@ fn an_owned_buffer_and_a_shared_one_both_move_through_a_file() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let file: File = Facade::with_submitter(
+	let file: File = Facade::with_executor(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&submitter,
+		&executor,
 	);
 
 	// The operation takes the Vec itself: nothing to wrap, nothing to clone.

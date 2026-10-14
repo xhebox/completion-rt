@@ -47,7 +47,7 @@ fn waiting_on_the_descriptor_drives_the_backend() {
 
 	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
 	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
-	let file = File::with_submitter(std::fs::File::open(&path).unwrap(), &executor.submitter());
+	let file = File::with_executor(std::fs::File::open(&path).unwrap(), &executor);
 	let (done, finished) = std::sync::mpsc::channel::<Result<usize, Error>>();
 	executor
 		.spawner()
@@ -98,12 +98,12 @@ fn a_timer_fires_within_the_timeout_turn_reports() {
 	use rustix::event::{PollFd, PollFlags, poll};
 
 	let mut executor = Executor::embedded(Config::default()).unwrap();
-	let timers = executor.timers();
 	let (done, finished) = std::sync::mpsc::channel::<io::Result<()>>();
+	let timeout = Timeout::with_executor(Duration::from_millis(150), &executor);
 	executor
 		.spawner()
 		.spawn(async move {
-			let _ = done.send(Timeout::with_timers(Duration::from_millis(150), &timers).await);
+			let _ = done.send(timeout.await);
 		})
 		.detach();
 

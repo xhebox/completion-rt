@@ -12,12 +12,10 @@ use common::block_on;
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::Duration;
 
 use completion_rt::{
-	Cancel, Cancelled, Config, Extent, Handle, InFlight, InFlightState, Memory, Reactor, Submitter,
+	Config, Extent, Extents, Handle, InFlight, InFlightState, Memory, Op, Reactor,
 };
 
 /// The buffer in the shape the engine names memory.
@@ -26,18 +24,14 @@ fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
 	memory
 }
 
-/// Polls the snapshot until an entry matches, so the test does not race the
+/// Drives the reactor until an entry matches, so the test does not race the
 /// reactor's first pass over the submission.
-fn until_entry(submitter: &Submitter, wanted: impl Fn(&InFlight) -> bool) -> InFlight {
+fn until_entry(reactor: &Reactor, wanted: impl Fn(&InFlight) -> bool) -> InFlight {
 	for _ in 0..2_000 {
-		if let Some(entry) = submitter
-			.in_flight()
-			.into_iter()
-			.find(|entry| wanted(entry))
-		{
+		if let Some(entry) = reactor.in_flight().into_iter().find(|entry| wanted(entry)) {
 			return entry;
 		}
-		thread::sleep(Duration::from_millis(1));
+		reactor.poll(Some(Duration::from_millis(1))).unwrap();
 	}
 	panic!("no matching in-flight entry appeared");
 }
@@ -53,25 +47,22 @@ fn in_flight_shows_a_stalled_read() {
 	let read_fd = reader.as_raw_fd();
 	let reader = Handle::new(reader);
 
-	let (mut reactor, submitter) = Reactor::new(Config::default()).unwrap();
+	let reactor = Reactor::new(Config::default()).unwrap();
 	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
-	let read = submitter
-		.read(&reader, 0, memory(&buf), [Extent { offset: 0, len: 8 }])
-		.unwrap();
-
-	let stop = Arc::new(AtomicBool::new(false));
-	let driven = {
-		let stop = Arc::clone(&stop);
-		thread::spawn(move || {
-			while !stop.load(Ordering::SeqCst) {
-				reactor.poll(Some(Duration::from_millis(1))).unwrap();
-			}
-		})
-	};
+	let read = common::submit(
+		&reactor,
+		&reader,
+		Op::Read {
+			offset: 0,
+			memory: memory(&buf),
+			extents: Extents::from_slice(&[Extent { offset: 0, len: 8 }]),
+		},
+	)
+	.unwrap();
 
 	// The read leaves Pending once the reactor has handed it to the backend,
 	// where it waits on the pipe.
-	let snapshot = until_entry(&submitter, |entry| {
+	let snapshot = until_entry(&reactor, |entry| {
 		entry.op == "read" && entry.state == InFlightState::InFlight
 	});
 	assert_eq!(
@@ -84,8 +75,8 @@ fn in_flight_shows_a_stalled_read() {
 
 	// The age is taken at the snapshot, so a later look is older.
 	let first_age = snapshot.age;
-	thread::sleep(Duration::from_millis(50));
-	let later = until_entry(&submitter, |entry| {
+	reactor.poll(Some(Duration::from_millis(50))).unwrap();
+	let later = until_entry(&reactor, |entry| {
 		entry.op == "read" && entry.state == InFlightState::InFlight
 	});
 	assert!(
@@ -96,18 +87,15 @@ fn in_flight_shows_a_stalled_read() {
 
 	// Cancelled through the cooperative path, so the read settles without the
 	// drop fallback, and the snapshot no longer holds it.
-	let cancel = Cancel::new();
-	cancel.cancel();
-	let result = block_on(read.until(&cancel));
+	read.cancel();
+	let (_, result) = block_on(&reactor, read);
+	let error = result.expect_err("the read was not cancelled");
 	assert!(
-		matches!(result, Err(Cancelled(()))),
-		"the read was not cancelled: {result:?}"
+		reactor.is_cancelled(&error),
+		"the read was not cancelled: {error:?}"
 	);
 	assert!(
-		submitter.in_flight().iter().all(|entry| entry.op != "read"),
+		reactor.in_flight().iter().all(|entry| entry.op != "read"),
 		"the cancelled read is still in the snapshot"
 	);
-
-	stop.store(true, Ordering::SeqCst);
-	driven.join().unwrap();
 }

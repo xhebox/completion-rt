@@ -5,9 +5,7 @@
 //! when the reactor has already gone to sleep in the backend.
 
 use std::io;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::thread::{self, ThreadId};
 
 use crate::event::Event;
 
@@ -26,10 +24,6 @@ pub(crate) struct Park {
 	/// waits on `poll_fd` — so the state never reaches `PARKED` and every
 	/// unpark has to ring the doorbell.
 	external: bool,
-	/// The thread the reactor runs on. An operation dropped off that thread must
-	/// drive the reactor inline instead of waiting for a wake it will never get;
-	/// this replaces the `Mutex<Option<ThreadId>>` of the same purpose.
-	owner: OnceLock<ThreadId>,
 }
 
 impl Park {
@@ -38,18 +32,7 @@ impl Park {
 			state: AtomicU32::new(EMPTY),
 			doorbell,
 			external,
-			owner: OnceLock::new(),
 		}
-	}
-
-	/// Records the calling thread as the reactor owner.
-	pub(crate) fn enter_reactor(&self) {
-		let _ = self.owner.set(thread::current().id());
-	}
-
-	/// Whether the calling thread is the reactor owner.
-	pub(crate) fn is_owner(&self) -> bool {
-		self.owner.get() == Some(&thread::current().id())
 	}
 
 	/// Raises a wake for the reactor.

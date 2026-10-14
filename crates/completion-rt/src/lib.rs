@@ -1,12 +1,13 @@
 //! The completion reactor: the backend, the operations in flight, and the
 //! cancellable completions they resolve to.
 //!
-//! This is the low layer. A [`Reactor`] owns one completion backend and hands
-//! out a [`Submitter`] that any thread submits an operation through — `read`,
-//! `send`, `accept`, and the rest — and the returned [`Completion`] resolves
-//! when the completion arrives, yielding what that operation produces. Dropping
-//! a `Completion` without awaiting cancels the operation and returns only once
-//! the backend has let go of the memory it was given.
+//! This is the low layer. A [`Reactor`] owns one completion backend and is
+//! driven and submitted to from the thread that built it; only its waker and
+//! its [`Event`] cross threads. An operation — `read`, `send`, `accept`, and the
+//! rest, each named as an [`Op`] — returns a [`Token`] that names it until its
+//! result is taken or it is released. Releasing a token whose operation is still
+//! in flight cancels it and returns only once the backend has let go of the
+//! memory it was given.
 //!
 //! The async surface over it — the executor, the facade, and the transfer
 //! futures — lives in the `completion-async` crate, which re-exports the data
@@ -21,18 +22,8 @@ mod park;
 mod timer;
 
 pub use backend::Config;
-pub use core::{
-	Cancel, Cancelled, Completion, Handle, InFlight, InFlightState, Reactor, Response, Submitter,
-	Until,
-};
+pub use core::{Handle, InFlight, InFlightState, Lease, Op, Reactor, Response, Token};
 pub use desc::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor};
 pub use event::Event;
-pub use memory::{Extent, Memory, Span};
-pub use timer::{TimerKey, Timers};
-
-// Plumbing the async crate reaches across the crate boundary. `pub(crate)` does
-// not cross crates, so these are public but not part of the supported surface.
-#[doc(hidden)]
-pub use core::{Lease, ReactorWaker, cancel_task_future};
-#[doc(hidden)]
-pub use memory::Extents;
+pub use memory::{Extent, Extents, Memory, Span};
+pub use timer::TimerKey;

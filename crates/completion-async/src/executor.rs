@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex, PoisonError, Weak as SyncWeak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use completion_rt::{BorrowedDescriptor, Lease, Memory, Reactor, Submitter as LowSubmitter};
+use completion_rt::{BorrowedDescriptor, Lease, Memory, Reactor};
 
+use crate::Error;
+use crate::completion::cancel_task_future;
 use crate::io::Lent;
-use crate::{Error, Submitter, Timers};
 
 const TICK_BUDGET: usize = 64;
 
@@ -172,7 +173,7 @@ impl<F: Future> Runnable for Job<F> {
 		// publishes them.
 		self.scheduled.swap(false, Ordering::AcqRel);
 		if matches!(*self.join.borrow(), Join::Cancelled) {
-			completion_rt::cancel_task_future(self.future.take());
+			cancel_task_future(self.future.take());
 			return Poll::Ready(());
 		}
 		let output = match self.future.as_mut().unwrap().as_mut().poll(cx) {
@@ -180,7 +181,7 @@ impl<F: Future> Runnable for Job<F> {
 			Poll::Ready(output) => output,
 		};
 		if matches!(*self.join.borrow(), Join::Cancelled) {
-			completion_rt::cancel_task_future((self.future.take(), output));
+			cancel_task_future((self.future.take(), output));
 			return Poll::Ready(());
 		}
 		drop(self.future.take());
@@ -193,7 +194,7 @@ impl<F: Future> Runnable for Job<F> {
 				}
 			}
 			Join::Detached => drop(output),
-			Join::Cancelled => completion_rt::cancel_task_future(output),
+			Join::Cancelled => cancel_task_future(output),
 			_ => unreachable!(),
 		}
 		Poll::Ready(())
@@ -275,7 +276,7 @@ impl<'a> Local<'a> {
 	/// given up, not abandoned.
 	pub(crate) fn cancel_all(&self) {
 		let tasks = std::mem::take(&mut *self.tasks.borrow_mut());
-		completion_rt::cancel_task_future(tasks);
+		cancel_task_future(tasks);
 	}
 
 	pub(crate) fn tick(&self, budget: usize) -> bool {
@@ -380,43 +381,35 @@ impl Wake for TaskWake {
 	}
 }
 
-/// A reactor, its submitter, and the task set they drive.
+/// A reactor and the task set it drives.
 ///
 /// Built by [`Executor::new`], it parks the thread calling
 /// [`Executor::block_on`] in its own reactor. Built by [`Executor::embedded`],
 /// it also serves a caller that owns the poll loop, through
 /// [`Executor::poll_fd`] and [`Executor::turn`].
 pub struct Executor {
-	// Drop the reactor first so in-flight I/O settles before task futures release their Completions.
 	reactor: Reactor,
-	submitter: LowSubmitter,
-	timers: Timers,
 	local: Rc<Local<'static>>,
 	driver: Waker,
 }
 
 impl Executor {
 	pub fn new(config: Config) -> io::Result<Executor> {
-		let (reactor, submitter) = Reactor::new(config.into_rt())?;
-		Ok(Executor::assemble(reactor, submitter))
+		Ok(Executor::assemble(Reactor::new(config.into_rt())?))
 	}
 
 	/// An executor whose reactor never parks, for a caller that waits on
 	/// [`Executor::poll_fd`] and calls [`Executor::turn`] itself.
 	pub fn embedded(config: Config) -> io::Result<Executor> {
-		let (reactor, submitter) = Reactor::embedded(config.into_rt())?;
-		Ok(Executor::assemble(reactor, submitter))
+		Ok(Executor::assemble(Reactor::embedded(config.into_rt())?))
 	}
 
-	fn assemble(reactor: Reactor, submitter: LowSubmitter) -> Executor {
-		let driver = Waker::from(Arc::new(reactor.waker()));
+	fn assemble(reactor: Reactor) -> Executor {
+		let driver = reactor.waker();
 		let local = Rc::new(Local::new());
 		local.drive(&driver);
-		let timers = Timers(reactor.timers());
 		Executor {
 			reactor,
-			submitter,
-			timers,
 			local,
 			driver,
 		}
@@ -424,16 +417,15 @@ impl Executor {
 
 	/// Runs the root future, with bounded passes over ready tasks so I/O and timers keep advancing.
 	pub fn block_on<F: Future>(&mut self, fut: F) -> io::Result<F::Output> {
-		Executor::run(&mut self.reactor, &self.local, &self.driver, fut)
+		Executor::run(&self.reactor, &self.local, &self.driver, fut)
 	}
 
 	fn run<F: Future>(
-		reactor: &mut Reactor,
+		reactor: &Reactor,
 		local: &Local<'static>,
 		driver: &Waker,
 		fut: F,
 	) -> io::Result<F::Output> {
-		reactor.enter_reactor();
 		let mut fut = std::pin::pin!(fut);
 		let mut cx = Context::from_waker(driver);
 		loop {
@@ -474,14 +466,13 @@ impl Executor {
 		/// The barrier: on the way out, normal or unwinding, waits until no
 		/// operation under the lease is left in the kernel.
 		struct Settle<'c> {
-			reactor: &'c mut Reactor,
-			submitter: &'c LowSubmitter,
-			lease: Arc<Lease>,
+			reactor: &'c Reactor,
+			lease: Rc<Lease>,
 		}
 
 		impl Drop for Settle<'_> {
 			fn drop(&mut self) {
-				while self.submitter.settle(&self.lease) {
+				while self.reactor.settle(&self.lease) {
 					if let Err(error) = self.reactor.poll(None) {
 						// Returning would end the borrow while the kernel may still
 						// write through it.
@@ -492,19 +483,18 @@ impl Executor {
 			}
 		}
 
-		let lease = Arc::new(self.submitter.lease());
+		let lease = Rc::new(self.reactor.lease());
 		let local = Rc::new(Local::new());
 		let body = body(Scope {
 			local: Rc::clone(&local),
-			lease: Arc::clone(&lease),
+			lease: Rc::clone(&lease),
 		});
 		let future = ScopeFuture {
 			local,
 			body: Some(Box::pin(body)),
 		};
 		let settle = Settle {
-			reactor: &mut self.reactor,
-			submitter: &self.submitter,
+			reactor: &self.reactor,
 			lease,
 		};
 		let result = Executor::run(settle.reactor, &self.local, &self.driver, future);
@@ -512,14 +502,8 @@ impl Executor {
 		result
 	}
 
-	/// A handle for submitting operations.
-	pub fn submitter(&self) -> Submitter {
-		Submitter(self.submitter.clone())
-	}
-
-	/// The timer wheel of this executor's reactor, for [`Timeout::with_timers`](crate::Timeout::with_timers).
-	pub fn timers(&self) -> Timers {
-		self.timers.clone()
+	pub(crate) fn reactor(&self) -> &Reactor {
+		&self.reactor
 	}
 
 	/// The descriptor to wait on between passes of an [`Executor::embedded`]
@@ -540,8 +524,7 @@ impl Executor {
 	/// deadline, or `None` if there is none, meaning wait on the descriptor
 	/// alone.
 	pub fn turn(&mut self) -> io::Result<Option<Duration>> {
-		let reactor = &mut self.reactor;
-		reactor.enter_reactor();
+		let reactor = &self.reactor;
 		// Drain first: a completion or a wake raised after this re-raises the
 		// descriptor, so the caller can wait on it again rather than spin.
 		reactor.drain_notification()?;
@@ -554,6 +537,13 @@ impl Executor {
 		} else {
 			Ok(deadline)
 		}
+	}
+}
+
+impl Drop for Executor {
+	fn drop(&mut self) {
+		// Shut the reactor down first so in-flight I/O settles before task futures release their Completions.
+		self.reactor.shutdown(true);
 	}
 }
 
@@ -582,7 +572,7 @@ impl Executor {
 #[derive(Clone)]
 pub struct Scope<'a> {
 	local: Rc<Local<'a>>,
-	lease: Arc<Lease>,
+	lease: Rc<Lease>,
 }
 
 impl<'a> Scope<'a> {
@@ -600,7 +590,7 @@ impl<'a> Scope<'a> {
 		// while `'a` still holds. Every other clone is typed `Lent<'a>` or sits in
 		// a `Transfer<'a, _>`, both bounded by `'a`.
 		let memory: Arc<dyn Memory> = unsafe { std::mem::transmute(memory) };
-		Lent::lent(memory, Arc::clone(&self.lease))
+		Lent::lent(memory, Rc::clone(&self.lease))
 	}
 
 	/// Spawns `future` on this scope.

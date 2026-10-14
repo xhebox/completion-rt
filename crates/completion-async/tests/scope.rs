@@ -45,14 +45,13 @@ fn a_scoped_task_runs_a_transfer() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let submitter = executor.submitter();
-	let file: File = Facade::with_submitter(
+	let file: File = Facade::with_executor(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&submitter,
+		&executor,
 	);
 	let buffer = Arc::new(vec![0u8; 5]);
 	let into = Arc::clone(&buffer);
@@ -106,7 +105,7 @@ fn a_transfer_reads_into_lent_memory() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file: File = Facade::with_submitter(common::open(&path).unwrap(), &executor.submitter());
+	let file: File = Facade::with_executor(common::open(&path).unwrap(), &executor);
 	let guest = vec![0u8; 5];
 	let lent = &guest;
 
@@ -126,7 +125,7 @@ fn a_transfer_reads_into_lent_memory() {
 fn the_scope_waits_out_a_forgotten_transfer_on_lent_memory() {
 	let (left, mut right) = pair();
 	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::with_submitter(left, &executor.submitter());
+	let socket: Facade<TcpStream> = Facade::with_executor(left, &executor);
 	let guest = vec![0u8; 5];
 	let lent = &guest;
 
@@ -145,9 +144,11 @@ fn the_scope_waits_out_a_forgotten_transfer_on_lent_memory() {
 
 	right.write_all(b"late!").unwrap();
 	// Drive the reactor long enough for an armed receive to complete.
-	let timers = executor.timers();
 	executor
-		.block_on(Timeout::with_timers(Duration::from_millis(100), &timers))
+		.block_on(Timeout::with_executor(
+			Duration::from_millis(100),
+			&executor,
+		))
 		.unwrap()
 		.unwrap();
 	assert_eq!(
@@ -166,7 +167,7 @@ fn lent_memory_is_refused_by_another_reactor() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let other = self::executor();
-	let file: File = Facade::with_submitter(common::open(&path).unwrap(), &other.submitter());
+	let file: File = Facade::with_executor(common::open(&path).unwrap(), &other);
 	let guest = vec![0u8; 5];
 	let lent = &guest;
 

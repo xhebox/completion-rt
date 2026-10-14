@@ -18,7 +18,7 @@ use std::sync::mpsc::Sender;
 use std::task::Poll;
 use std::time::Duration;
 
-use completion_async::{Cancel, Config, Executor, Timeout, Timers};
+use completion_async::{Cancel, Config, Executor, Timeout};
 
 /// Rounds the other thread fires and the root future has to observe.
 const ROUNDS: usize = 2_000;
@@ -37,7 +37,7 @@ const WATCHDOG: Duration = Duration::from_secs(5);
 ///
 /// Returns the round a watchdog fired in, or `None` once every round landed.
 async fn rounds(
-	timers: Timers,
+	mut watchdogs: std::vec::IntoIter<Timeout>,
 	cancels: Sender<Cancel>,
 	armed: Sender<()>,
 	consumed: Sender<()>,
@@ -48,7 +48,7 @@ async fn rounds(
 			.send(cancel.clone())
 			.expect("the other thread takes the cancel");
 		let mut wait = pin!(cancel.wait());
-		let mut timeout = pin!(Timeout::with_timers(WATCHDOG, &timers));
+		let mut timeout = pin!(watchdogs.next().expect("one watchdog per round"));
 		let mut armed_sent = false;
 		let landed = poll_fn(|cx| {
 			if wait.as_mut().poll(cx).is_ready() {
@@ -82,7 +82,10 @@ async fn rounds(
 fn a_parked_block_on_is_woken_from_another_thread_every_round() {
 	common::init_logging();
 	let mut executor = Executor::new(Config::default()).unwrap();
-	let timers = executor.timers();
+	let watchdogs = (0..ROUNDS)
+		.map(|_| Timeout::with_executor(WATCHDOG, &executor))
+		.collect::<Vec<_>>()
+		.into_iter();
 
 	let (cancels_tx, cancels) = std::sync::mpsc::channel::<Cancel>();
 	let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
@@ -104,7 +107,7 @@ fn a_parked_block_on_is_woken_from_another_thread_every_round() {
 	});
 
 	let outcome = executor
-		.block_on(rounds(timers, cancels_tx, armed_tx, consumed_tx))
+		.block_on(rounds(watchdogs, cancels_tx, armed_tx, consumed_tx))
 		.unwrap();
 	// `block_on` returned, so the root future dropped its senders; the other
 	// thread unblocks and exits whether the rounds landed or a watchdog fired.

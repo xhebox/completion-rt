@@ -17,10 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use completion_async::{
-	Accept, AsDescriptor, Cancel, Config, ErrorKind, Executor, Facade, File, ListenerHandle,
-	Memory, Op, Receive, Transfer,
-};
+use completion_async::{Cancel, Config, ErrorKind, Executor, Facade, File, Memory};
 
 /// The async driver the operations run on.
 fn executor() -> Executor {
@@ -34,24 +31,6 @@ fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
 	memory
 }
 
-/// The facade futures keep their state in named fields, not a boxed
-/// `dyn Future`, so they are `Send` wherever the singleton they name is: a
-/// driver may hand one to another thread.
-#[test]
-fn a_facade_future_is_send_when_its_singleton_is() {
-	fn assert_send<T: Send>() {}
-	fn transfer<S: AsDescriptor + Send + Sync + 'static>() {
-		assert_send::<Transfer<'static, S>>();
-		assert_send::<Receive<'static, S>>();
-		assert_send::<Op<S>>();
-	}
-	fn accept<S: ListenerHandle>() {
-		assert_send::<Accept<S>>();
-	}
-	transfer::<UnixStream>();
-	accept::<std::net::TcpListener>();
-}
-
 /// `until` returns `Ok` when the operation completes first, even with a cancel
 /// that has not fired.
 #[test]
@@ -60,7 +39,7 @@ fn until_completes_when_the_op_lands_first() {
 	let path = dir.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file = File::with_submitter(std::fs::File::open(path).unwrap(), &executor.submitter());
+	let file = File::with_executor(std::fs::File::open(path).unwrap(), &executor);
 
 	let buf = Arc::new(vec![0u8; 5]);
 	let cancel = Cancel::new();
@@ -209,7 +188,7 @@ fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 	let (left, right) = UnixStream::pair().unwrap();
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
-	let right: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
+	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
 	let buf = Arc::new(vec![0u8; 8]);
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
@@ -265,7 +244,7 @@ fn a_cancel_shared_by_two_executors_wakes_both() {
 			let (left, right) = UnixStream::pair().unwrap();
 			left.set_nonblocking(true).unwrap();
 			right.set_nonblocking(true).unwrap();
-			let right: Facade<UnixStream> = Facade::with_submitter(right, &executor.submitter());
+			let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
 			let buf = Arc::new(vec![0u8; 8]);
 			let started = Instant::now();
 			let outcome = executor
@@ -303,4 +282,57 @@ fn a_cancel_shared_by_two_executors_wakes_both() {
 			"the kernel let go of the buffer"
 		);
 	}
+}
+
+/// A cancel fired on another thread has to reach a reactor asleep in its
+/// backend, not one spinning on a short poll: the reactor is driven with
+/// `poll(None)`, so after the cancel's own raise is spent the only thing that can
+/// bring it back is the wake the cancel raises for the `until` it races. The
+/// future then resolves cancelled and the kernel lets go of the buffer.
+///
+/// A wake lost on the way to a park that waits forever is a hang, so the
+/// resolver is watched by a deadline rather than left to time out.
+#[test]
+fn a_cancel_from_another_thread_wakes_a_parked_reactor() {
+	let (done, finished) = std::sync::mpsc::channel();
+	let resolving = std::thread::spawn(move || {
+		let mut executor = executor();
+		let (left, right) = UnixStream::pair().unwrap();
+		left.set_nonblocking(true).unwrap();
+		right.set_nonblocking(true).unwrap();
+		let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
+		let buf = Arc::new(vec![0u8; 8]);
+		let cancel = Cancel::new();
+		let raiser = cancel.clone();
+		let raising = std::thread::spawn(move || {
+			// Let the reactor reach the park, so the cancel lands on a reactor that is
+			// genuinely asleep rather than one about to poll and find the give-up itself.
+			std::thread::sleep(Duration::from_millis(200));
+			raiser.cancel();
+		});
+		let outcome = executor
+			.block_on(right.recv(memory(&buf)).until(&cancel))
+			.unwrap();
+		raising.join().unwrap();
+		assert!(
+			outcome
+				.result
+				.as_ref()
+				.is_err_and(|error| error.kind() == ErrorKind::Cancelled),
+			"the receive completed instead of cancelling"
+		);
+		assert_eq!(
+			Arc::strong_count(&buf),
+			1,
+			"the cancelled receive kept its buffer"
+		);
+		done.send(()).unwrap();
+	});
+	let finished = finished.recv_timeout(Duration::from_secs(5));
+	assert!(
+		!matches!(finished, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+		"a cancel from another thread did not reach the parked reactor, so the \
+		 receive it gave up on never settled"
+	);
+	resolving.join().unwrap();
 }

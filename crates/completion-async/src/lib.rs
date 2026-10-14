@@ -1,31 +1,31 @@
 //! Completion-model async I/O, experimental.
 //!
-//! [`Executor`] is the start point: use [`Executor::block_on`] to run a
-//! root async task.
+//! [`Executor`] is the start point: use [`block_on`] from the global executor to
+//! run a root async task.
 //!
-//! A [`Facade`] is a set of operations over one resource: it holds the resource
-//! in a [`Handle`], so an operation that is still in flight keeps it open, and
-//! it names the operation as a method. Each method returns a future — a
-//! [`Transfer`], a [`Receive`], an [`Op`], or an [`Accept`] — which resolves to
-//! what the operation got through, and whether it finished: an [`Outcome`] for a
-//! transfer, a [`Received`] for a receive that asked for control data, a plain
-//! `Result` for the rest. Awaiting a `Transfer` that the kernel answered short
-//! gives the count; the loop over the calls — `read_exact_at`, `send_all` and
-//! their like — gives what the loop moved before it stopped, so a failure or a
-//! cancel does not hide the progress behind it.
+//! A [`Facade`] provides a set of methods over owned resource in a [`Handle`].
+//! Each method returns a future: [`Transfer`], [`Receive`], [`Op`], or [`Accept`],
+//!  which resolves to [`Outcome`], [`Received`], plain `Result`, whatever.
 //!
-//! Which methods a facade has follows from its resource's [`Kind`], named once
-//! through [`Resource`]:
+//! Which methods a facade has follows from its resource's [`Kind`]:
 //!
 //! | Kind | Resources | Operations |
 //! |---|---|---|
-//! | [`kind::File`] | `File` | `read_at`, `write_at` and their loops, `sync`, `flush`, `allocate`, `punch` |
-//! | [`kind::Descriptor`] | pipes, stdio, `OwnedFd` | `read_at`, `write_at` and their loops |
-//! | [`kind::Datagram`] | `UdpSocket`, `UnixDatagram` | `recv`, `send`, with descriptors, `take_error` |
-//! | [`kind::Stream`] | `TcpStream`, `UnixStream` | a datagram's, plus `recv_exact`, `send_all`, `shutdown` |
+//! | [`kind::File`] | `File` | `read_at`, `read_vectored_at`, `read_exact_at`, `read_exact_vectored_at`, `write_at`, `write_vectored_at`, `write_all_at`, `write_all_vectored_at`, `sync`, `flush`, `allocate`, `punch` |
+//! | [`kind::Descriptor`] | pipes, stdio, `OwnedFd` | the eight read and write methods of a file |
+//! | [`kind::Datagram`] | `UdpSocket`, `UnixDatagram` | `recv`, `recv_vectored`, `recv_with_fds`, `send`, `send_vectored`, `send_with_fds`, `take_error` |
+//! | [`kind::Stream`] | `TcpStream`, `UnixStream` | a datagram's seven, plus `recv_exact`, `recv_exact_vectored`, `recv_exact_with_fds`, `send_all`, `send_all_vectored`, `send_all_with_fds`, `shutdown` |
 //! | [`kind::Listener`] | `TcpListener`, `UnixListener` | `accept` |
+//! | [`kind::Signal`] | [`Signal`] | `wait_readable`, `wait_writable` |
 //!
-//! Every kind waits with `wait_readable` and `wait_writable`.
+//! The eight a file and a descriptor share are the four reads — `read_at`,
+//! `read_vectored_at`, `read_exact_at`, `read_exact_vectored_at` — and the four
+//! writes, `write_at`, `write_vectored_at`, `write_all_at`,
+//! `write_all_vectored_at`.
+//!
+//! A wait is only [`Signal`]'s. A resource with a transfer has none to offer:
+//! the backend arms the readiness itself when a call would block, and the
+//! completion reports how much moved.
 //!
 //! An operation is given a cancel with the [`until`](Transfer::until) on its
 //! future, which then yields [`ErrorKind::Cancelled`] if the cancel wins:
@@ -38,6 +38,7 @@
 //! # }
 //! ```
 
+mod completion;
 mod error;
 mod executor;
 mod global;
@@ -45,22 +46,22 @@ mod io;
 pub mod kind;
 mod net;
 mod outcome;
-mod submitter;
+mod signal;
 mod timer;
 
 // The low layer's data types and its descriptor trait, re-exported so a user of
 // this crate needs one name for them: the memory, the extents and spans, the
 // descriptors, and the cancellation.
+pub use completion::Cancel;
 pub use completion_rt::{
-	AsDescriptor, BorrowedDescriptor, Cancel, Extent, Handle, Memory, OwnedDescriptor, OwnedSocket,
-	Span,
+	AsDescriptor, BorrowedDescriptor, Extent, Handle, Memory, OwnedDescriptor, OwnedSocket, Span,
 };
 pub use error::{Error, ErrorKind, Status};
 pub use executor::{Config, Executor, Scope, ScopeTask, Spawner, Task};
-pub use global::{block_on, scope, spawn, submitter, timers, try_spawn};
+pub use global::{block_on, scope, spawn, try_spawn};
 pub use io::{Facade, File, IntoMemory, Lent, OpenOptions};
 pub use kind::{Kind, ListenerHandle, Positional, Resource, SocketKind};
 pub use net::{Accept, Op, Receive, Received, Transfer};
 pub use outcome::Outcome;
-pub use submitter::Submitter;
-pub use timer::{Timeout, Timers};
+pub use signal::Signal;
+pub use timer::Timeout;

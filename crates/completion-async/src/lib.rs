@@ -67,7 +67,9 @@ pub use completion_rt::{
 pub use executor::{Config, Executor, Scope, ScopeTask, Spawner, Task};
 pub use global::{bind, block_on, scope, spawn, try_spawn};
 pub use io::{Facade, File, OpenOptions};
-pub use net::{Accept, ListenerHandle, Op, Receive, Received, Transfer};
+pub use net::{
+	Accept, ListenerHandle, Op, Receive, Received, SocketHandle, StreamHandle, Transfer,
+};
 pub use outcome::Outcome;
 pub use signal::Signal;
 pub use space::{Space, Span};

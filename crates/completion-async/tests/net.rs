@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use completion_async::{Cancel, Config, ErrorKind, Executor, Facade, Span};
+use completion_async::{
+	AsDescriptor, BorrowedDescriptor, Cancel, Config, ErrorKind, Executor, Facade, ListenerHandle,
+	OwnedSocket, SocketHandle, Span, StreamHandle,
+};
 
 /// The async driver the socket operations run on.
 fn executor() -> Executor {
@@ -153,46 +156,73 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 	assert_eq!(buffer.to_vec(), bytes, "the payload did not arrive whole");
 }
 
-/// A socket type of the caller's own: it converts into one this crate knows, so
-/// a wrapper the crate has never seen gets the same receive and send — and, for
-/// a stream, the loops over them.
-struct Wrapper(std::net::TcpStream);
+/// A stream type of the caller's own, which this crate has never seen: it opts
+/// into the socket operations by implementing the traits, without converting
+/// into a std type.
+struct Stream(TcpStream);
 
-impl From<Wrapper> for std::net::TcpStream {
-	fn from(wrapper: Wrapper) -> std::net::TcpStream {
-		wrapper.0
+impl AsDescriptor for Stream {
+	fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
+		self.0.as_descriptor()
 	}
 }
 
+impl SocketHandle for Stream {}
+impl StreamHandle for Stream {}
+
+impl From<OwnedSocket> for Stream {
+	fn from(socket: OwnedSocket) -> Stream {
+		Stream(TcpStream::from(socket))
+	}
+}
+
+/// The listener whose connections are [`Stream`]s.
+struct Listener(TcpListener);
+
+impl AsDescriptor for Listener {
+	fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
+		self.0.as_descriptor()
+	}
+}
+
+impl ListenerHandle for Listener {
+	type Stream = Stream;
+}
+
+/// The caller's listener accepts into the caller's stream type, and that stream
+/// gets the sends, the receives, and the loops over them.
 #[test]
-fn a_caller_socket_type_gets_recv_and_send() {
+fn a_caller_socket_type_gets_the_socket_operations() {
 	use std::io::Write;
 
-	let (client, mut server) = pair();
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let mut executor = executor();
-	let socket: Facade<std::net::TcpStream> = Facade::with_executor(Wrapper(client), &executor);
+	let listener: Facade<Listener> = Facade::with_executor(Listener(listener), &executor);
+	let socket: Facade<Stream> = executor
+		.block_on(listener.accept())
+		.unwrap()
+		.expect("the accept landed");
 
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
 	assert_eq!(
 		executor
-			.block_on(socket.send(span(&executor, &payload)))
+			.block_on(socket.send_all(span(&executor, &payload)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
 		5
 	);
-	server
-		.set_read_timeout(Some(Duration::from_secs(5)))
-		.unwrap();
+	peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 	let mut got = [0u8; 5];
-	server.read_exact(&mut got).unwrap();
+	peer.read_exact(&mut got).unwrap();
 	assert_eq!(&got, b"hello");
 
-	server.write_all(b"world").unwrap();
+	peer.write_all(b"world").unwrap();
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
 	assert_eq!(
 		executor
-			.block_on(socket.recv(span(&executor, &buffer)))
+			.block_on(socket.recv_exact(span(&executor, &buffer)))
 			.unwrap()
 			.into_result()
 			.unwrap(),

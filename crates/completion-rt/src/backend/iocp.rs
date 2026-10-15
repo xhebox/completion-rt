@@ -256,21 +256,34 @@ impl Iocp {
 	fn transfer(&mut self, id: u64, fd: RawHandle, buffers: IoVecs, send: bool) -> io::Result<()> {
 		let socket = fd.into_raw() as SOCKET;
 		self.associate(socket as HANDLE)?;
-		let (buf, len) = Self::buffer(&buffers)?;
 		let ov_ptr = self.enqueue(id, socket as HANDLE, 0, None);
-		let buffer = WSABUF {
-			len: len as u32,
-			buf: buf,
-		};
+		// The array only has to outlive the call: an overlapped `WSASend` or
+		// `WSARecv` copies it, and keeps only the buffers it names.
+		let wsabufs: Vec<WSABUF> = buffers
+			.iter()
+			.map(|buf| WSABUF {
+				len: buf.len() as u32,
+				buf: buf.as_ptr(),
+			})
+			.collect();
+		let count = wsabufs.len() as u32;
 		let mut moved: u32 = 0;
 		let mut flags: u32 = 0;
-		// SAFETY: standard Winsock calls; `buffer`, `flags` and `ov_ptr` outlive
+		// SAFETY: standard Winsock calls; `wsabufs`, `flags` and `ov_ptr` outlive
 		// the call, and the kernel writes into them only until the completion.
 		let failed = unsafe {
 			if send {
-				WSASend(socket, &buffer, 1, &mut moved, 0, ov_ptr, None)
+				WSASend(socket, wsabufs.as_ptr(), count, &mut moved, 0, ov_ptr, None)
 			} else {
-				WSARecv(socket, &buffer, 1, &mut moved, &mut flags, ov_ptr, None)
+				WSARecv(
+					socket,
+					wsabufs.as_ptr(),
+					count,
+					&mut moved,
+					&mut flags,
+					ov_ptr,
+					None,
+				)
 			}
 		};
 		if failed != 0 {
@@ -282,14 +295,13 @@ impl Iocp {
 		Ok(())
 	}
 
-	fn buffer(buffers: &IoVecs) -> io::Result<(*mut u8, usize)> {
-		let [buf] = buffers.as_slice() else {
-			return Err(io::Error::new(
-				io::ErrorKind::Unsupported,
-				"iocp backend needs exactly one buffer per operation",
-			));
-		};
-		Ok((buf.as_ptr(), buf.len()))
+	/// The first of `buffers`: `ReadFile` and `WriteFile` take one, and their
+	/// scatter forms want page-aligned unbuffered I/O. A gathered span moves
+	/// short, and a caller after all of it repeats the call.
+	fn first(buffers: &IoVecs) -> (*mut u8, usize) {
+		buffers
+			.first()
+			.map_or((std::ptr::null_mut(), 0), |buf| (buf.as_ptr(), buf.len()))
 	}
 
 	fn unsupported() -> io::Error {
@@ -351,14 +363,14 @@ impl Backend for Iocp {
 	fn read(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
 		let handle: HANDLE = fd.as_platform();
 		self.associate(handle)?;
-		let (buf, len) = Self::buffer(&buffers)?;
+		let (buf, len) = Self::first(&buffers);
 		self.issue(id, handle, true, buf, len, fdoff)
 	}
 
 	fn write(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
 		let handle: HANDLE = fd.as_platform();
 		self.associate(handle)?;
-		let (buf, len) = Self::buffer(&buffers)?;
+		let (buf, len) = Self::first(&buffers);
 		self.issue(id, handle, false, buf, len, fdoff)
 	}
 

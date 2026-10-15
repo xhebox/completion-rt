@@ -53,12 +53,6 @@ mod imp {
 		}
 	}
 
-	impl<S: AsFd> AsFd for crate::core::Handle<S> {
-		fn as_fd(&self) -> BorrowedFd<'_> {
-			(**self).as_fd()
-		}
-	}
-
 	/// # Safety
 	///
 	/// `raw` must be a live socket nobody else owns.
@@ -218,12 +212,6 @@ mod imp {
 				OwnedDescriptor::Handle(handle) => BorrowedDescriptor::Handle(handle.as_handle()),
 				OwnedDescriptor::Socket(socket) => BorrowedDescriptor::Socket(socket.as_socket()),
 			}
-		}
-	}
-
-	impl<S: AsDescriptor> AsDescriptor for crate::core::Handle<S> {
-		fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
-			(**self).as_descriptor()
 		}
 	}
 }

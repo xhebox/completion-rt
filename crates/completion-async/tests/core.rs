@@ -3,13 +3,15 @@
 //!
 //! The async surface drives the reactor through the executor: `Executor::block_on`
 //! owns the reactor, so one call both polls the operation and drives the backend
-//! under it. The reactor's own mechanics — the poll timeout, the descriptor a
-//! caller waits on, the event a caller raises — live in the low crate's tests.
+//! under it. The reactor's own mechanics, such as the poll timeout, live in the
+//! low crate's tests.
 mod common;
+use common::Buffer;
 
 use common::block_on;
 
 use std::future::Future;
+#[cfg(target_os = "linux")]
 use std::io;
 use std::pin::pin;
 use std::sync::Arc;
@@ -17,7 +19,7 @@ use std::task::{Context, Poll, Waker};
 
 #[cfg(unix)]
 use completion_async::Facade;
-use completion_async::{Config, ErrorKind, Executor, File, Handle, Memory};
+use completion_async::{Config, ErrorKind, Executor, File, Handle, Span};
 
 /// The async driver the operations run on: it owns the reactor, and `block_on`
 /// drives both the future and the backend beneath it.
@@ -35,11 +37,10 @@ fn seeded(executor: &Executor, contents: &[u8]) -> File {
 	File::with_executor(common::open(path).unwrap(), executor)
 }
 
-/// The buffer in the shape the engine names memory: a second handle on it, so
-/// it outlives the operation.
-fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
-	let memory: Arc<dyn Memory> = buf.clone();
-	memory
+/// The whole of `buf`, bound to `executor`: the space holds a second handle on
+/// it, so it outlives the operation.
+fn span(executor: &Executor, buf: &Arc<Buffer>) -> Span<'static> {
+	executor.bind(buf.clone()).whole()
 }
 
 /// A read completes with the bytes its one call moved: the file has five, the
@@ -49,14 +50,14 @@ fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
 fn a_read_short_of_the_buffer_completes_with_its_count() {
 	let mut executor = executor();
 	let file = seeded(&executor, b"hello");
-	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
+	let buf: Arc<Buffer> = Arc::new(Buffer::new(8));
 	let n = executor
-		.block_on(file.read_at(memory(&buf), 0))
+		.block_on(file.read_at(span(&executor, &buf), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(n, 5, "the completion is one call's bytes");
-	assert_eq!(&buf[..5], b"hello");
+	assert_eq!(&buf.to_vec()[..5], b"hello");
 }
 
 /// An operation holds the descriptor it was submitted for. The caller's copy
@@ -80,8 +81,8 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 	let handle = Handle::new(std::fs::File::open(&first).unwrap());
 	let number: RawFd = handle.as_descriptor().as_raw_fd();
 	let facade: Facade<std::fs::File> = Facade::bind_with_executor(handle.clone(), &executor);
-	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
-	let read = facade.read_at(memory(&buf), 0);
+	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let read = facade.read_at(span(&executor, &buf), 0);
 	// The caller's copies go before anything reaches the kernel; the read names
 	// the file through its own clone of the handle.
 	drop(facade);
@@ -102,7 +103,7 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 	}
 
 	assert_eq!(executor.block_on(read).unwrap().into_result().unwrap(), 5);
-	assert_eq!(&buf[..], b"first", "the read landed on another file");
+	assert_eq!(buf.to_vec(), b"first", "the read landed on another file");
 }
 
 /// A dropped operation whose request never reached a `poll` still releases the
@@ -111,8 +112,8 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 fn a_dropped_operation_releases_an_unsubmitted_request() {
 	let mut executor = executor();
 	let file = seeded(&executor, b"data");
-	let buf = Arc::new(vec![0u8; 4]);
-	let read = file.read_at(memory(&buf), 0);
+	let buf = Arc::new(Buffer::new(4));
+	let read = file.read_at(span(&executor, &buf), 0);
 	assert_eq!(Arc::strong_count(&buf), 2, "the request holds the buffer");
 	// Nothing polled: the request is still unsubmitted, so it goes with the drop.
 	drop(read);
@@ -138,7 +139,7 @@ fn cancelling_waits_for_the_kernel() {
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
 	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-	let buf = Arc::new(vec![0u8; 8]);
+	let buf = Arc::new(Buffer::new(8));
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
 	std::thread::spawn(move || {
@@ -146,7 +147,7 @@ fn cancelling_waits_for_the_kernel() {
 		raiser.cancel();
 	});
 	let outcome = executor
-		.block_on(right.recv(memory(&buf)).until(&cancel))
+		.block_on(right.recv(span(&executor, &buf)).until(&cancel))
 		.unwrap();
 	assert!(
 		outcome
@@ -160,7 +161,7 @@ fn cancelling_waits_for_the_kernel() {
 	// into the buffer.
 	(&left).write_all(b"late data").unwrap();
 	std::thread::sleep(Duration::from_millis(20));
-	assert_eq!(&buf[..], &[0u8; 8], "a byte arrived after the cancel");
+	assert_eq!(buf.to_vec(), &[0u8; 8], "a byte arrived after the cancel");
 }
 
 #[test]
@@ -169,12 +170,13 @@ fn concurrent_submits_all_complete() {
 	let mut tasks = Vec::new();
 	for i in 0..8u8 {
 		let file = seeded(&executor, &[i; 64]);
-		let buf: Arc<Vec<u8>> = Arc::new(vec![0; 64]);
+		let buf: Arc<Buffer> = Arc::new(Buffer::new(64));
 		let read = Arc::clone(&buf);
+		let span = span(&executor, &read);
 		tasks.push(executor.spawner().spawn(async move {
-			let n = file.read_at(memory(&read), 0).await.into_result().unwrap();
+			let n = file.read_at(span, 0).await.into_result().unwrap();
 			assert_eq!(n, 64);
-			assert!(read.iter().all(|&b| b == i));
+			assert!(read.to_vec().iter().all(|&b| b == i));
 		}));
 	}
 	executor
@@ -195,13 +197,14 @@ fn many_transfers_all_complete() {
 	let file = seeded(&executor, &[7u8; 4096]);
 	let mut tasks = Vec::new();
 	for _ in 0..4096 {
-		let buf: Arc<Vec<u8>> = Arc::new(vec![0u8; 4096]);
+		let buf: Arc<Buffer> = Arc::new(Buffer::new(4096));
 		let read = Arc::clone(&buf);
+		let span = span(&executor, &read);
 		let file = file.clone();
 		tasks.push(executor.spawner().spawn(async move {
-			let n = file.read_at(memory(&read), 0).await.into_result().unwrap();
+			let n = file.read_at(span, 0).await.into_result().unwrap();
 			assert_eq!(n, 4096);
-			assert!(read.iter().all(|&byte| byte == 7));
+			assert!(read.to_vec().iter().all(|&byte| byte == 7));
 		}));
 	}
 	executor
@@ -224,26 +227,26 @@ fn a_socket_send_lands_in_the_receive_buffer() {
 	let left: Facade<UnixStream> = Facade::with_executor(left, &executor);
 	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
 
-	let sent: Arc<Vec<u8>> = Arc::new(b"over the socket".to_vec());
+	let sent: Arc<Buffer> = Arc::new(Buffer::from_slice(b"over the socket"));
 	assert_eq!(
 		executor
-			.block_on(left.send(memory(&sent)))
+			.block_on(left.send(span(&executor, &sent)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
 		15
 	);
 
-	let received: Arc<Vec<u8>> = Arc::new(vec![0; 15]);
+	let received: Arc<Buffer> = Arc::new(Buffer::new(15));
 	assert_eq!(
 		executor
-			.block_on(right.recv(memory(&received)))
+			.block_on(right.recv(span(&executor, &received)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
 		15
 	);
-	assert_eq!(&received[..], b"over the socket");
+	assert_eq!(received.to_vec(), b"over the socket");
 }
 
 /// A socket op waits for data even when the descriptor says not to block:
@@ -264,7 +267,7 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
 	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
+	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
 
 	// Nothing has been sent yet, so the receive stays in flight until the peer
 	// writes: the non-blocking descriptor does not turn it into a short count.
@@ -273,13 +276,13 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 		(&left).write_all(b"data").unwrap();
 	});
 	let n = executor
-		.block_on(right.recv(memory(&buffer)))
+		.block_on(right.recv(span(&executor, &buffer)))
 		.unwrap()
 		.into_result()
 		.unwrap();
 	sender.join().unwrap();
 	assert_eq!(n, 4, "the completion is one call's bytes");
-	assert_eq!(&buffer[..4], b"data");
+	assert_eq!(&buffer.to_vec()[..4], b"data");
 }
 
 /// SQPOLL hands submissions to a kernel thread; the completions come back the
@@ -295,6 +298,7 @@ fn sqpoll_rings_complete_too() {
 		// Without a kernel that grants SQPOLL there is nothing to exercise;
 		// that is the host's answer, not a result to paper over.
 		Err(error) => {
+			let error = io::Error::from(error);
 			assert!(
 				matches!(
 					error.kind(),
@@ -306,14 +310,14 @@ fn sqpoll_rings_complete_too() {
 		}
 	};
 	let file = seeded(&executor, b"hello");
-	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
+	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
 	let n = executor
-		.block_on(file.read_at(memory(&buf), 0))
+		.block_on(file.read_at(span(&executor, &buf), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(n, 5);
-	assert_eq!(&buf[..], b"hello");
+	assert_eq!(buf.to_vec(), b"hello");
 }
 
 /// A fsync has no overlapped form, so an IOPOLL ring refuses it instead of
@@ -364,9 +368,10 @@ fn allocate_is_refused_on_an_iopoll_ring() {
 fn a_submission_after_the_executor_drops_is_refused() {
 	let executor = executor();
 	let file = seeded(&executor, b"hello");
+	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let span = span(&executor, &buf);
 	drop(executor);
-	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
-	let mut read = pin!(file.read_at(memory(&buf), 0));
+	let mut read = pin!(file.read_at(span, 0));
 	let mut cx = Context::from_waker(Waker::noop());
 	// Nothing drives this submission, so it either lands on this poll or never
 	// does.
@@ -374,10 +379,7 @@ fn a_submission_after_the_executor_drops_is_refused() {
 		panic!("the operation submitted after the executor dropped parked forever");
 	};
 	match outcome.into_result() {
-		Err(error) if error.kind() == ErrorKind::Failed => {
-			assert_eq!(io::Error::from(error).kind(), io::ErrorKind::BrokenPipe)
-		}
-		Err(error) => panic!("the refusal was not a broken pipe: {error}"),
+		Err(error) => assert_eq!(error.kind(), ErrorKind::Stopped, "{error}"),
 		Ok(count) => panic!("a gone reactor moved {count} bytes"),
 	}
 }

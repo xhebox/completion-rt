@@ -1,15 +1,17 @@
 //! Reactor mechanics, driven the way the low layer exposes them: the poll
-//! timeout, the readiness waits a facade cannot shape, the event a caller waits
-//! on, the drop fallback, and the backend's own I/O.
+//! timeout, the readiness waits a facade cannot shape, the drop fallback, and
+//! the backend's own I/O.
 //!
-//! These need a reactor the caller polls itself — a timeout, an `Event` to
-//! raise, the `in_flight`/`stop` state — none of which the async
+//! These need a reactor the caller polls itself — a timeout, the
+//! `in_flight`/`stop` state — none of which the async
 //! layer, which owns its reactor inside an `Executor`, can name or reach.
 
 mod common;
+use common::Buffer;
 
 use common::block_on;
 
+#[cfg(unix)]
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,20 +22,20 @@ use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Waker};
 
-use common::submit;
 #[cfg(unix)]
-use common::{Completion, wait_event};
-use completion_rt::{Config, Extent, Extents, Handle, Memory, Op, Reactor};
+use common::Completion;
+use common::submit;
+use completion_rt::{Config, ErrorKind, Extent, Extents, Handle, Memory, Op, Reactor};
 
 /// The buffer in the shape the engine names memory: a second handle on it, so
 /// it outlives the operation.
-fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
+fn memory(buf: &Arc<Buffer>) -> Arc<dyn Memory> {
 	let memory: Arc<dyn Memory> = buf.clone();
 	memory
 }
 
 /// The whole of a buffer, as one extent.
-fn whole(buf: &Arc<Vec<u8>>) -> Extents {
+fn whole(buf: &Arc<Buffer>) -> Extents {
 	Extents::from_slice(&[Extent {
 		offset: 0,
 		len: buf.len(),
@@ -70,14 +72,14 @@ fn socket_pair() -> (
 fn stalled_recv(
 	reactor: &Reactor,
 	right: &Handle<std::os::unix::net::UnixStream>,
-	buf: &Arc<Vec<u8>>,
+	buf: &Arc<Buffer>,
 ) -> Completion {
 	submit(
 		reactor,
 		right,
 		Op::Read {
 			offset: 0,
-			memory: memory(buf),
+			space: reactor.bind(memory(buf)),
 			extents: whole(buf),
 		},
 	)
@@ -117,13 +119,13 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 fn a_landed_file_operation_does_not_wait_out_the_timeout() {
 	let reactor = Reactor::new(Config::default()).unwrap();
 	let file = seeded_file(b"hello");
-	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
+	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
 	let completion = submit(
 		&reactor,
 		&file,
 		Op::Read {
 			offset: 0,
-			memory: memory(&buf),
+			space: reactor.bind(memory(&buf)),
 			extents: whole(&buf),
 		},
 	)
@@ -142,26 +144,6 @@ fn a_landed_file_operation_does_not_wait_out_the_timeout() {
 	assert!(
 		started.elapsed() < Duration::from_secs(1),
 		"the poll slept on a completion it already had"
-	);
-}
-
-/// A poll that does not wait has not used the notification, so it must leave
-/// it raised: a wake raised before it has to still stop the next waiting poll
-/// from sleeping, or that poll sleeps with news waiting for it.
-///
-/// Windows: the notification is a completion packet, which a poll takes off
-/// the port to see at all; there is no level-triggered state to leave raised.
-#[cfg(unix)]
-#[test]
-fn a_poll_without_a_wait_leaves_the_notification_raised() {
-	let reactor = Reactor::new(Config::default()).unwrap();
-	reactor.event().notify().unwrap();
-	reactor.poll(Some(Duration::ZERO)).unwrap();
-	let start = std::time::Instant::now();
-	reactor.poll(Some(Duration::from_secs(5))).unwrap();
-	assert!(
-		start.elapsed() < Duration::from_secs(1),
-		"the wake-up raised before the poll that did not wait was dropped"
 	);
 }
 
@@ -258,19 +240,47 @@ fn a_cancelled_timer_never_fires_and_leaves_no_deadline_behind() {
 	);
 }
 
+/// A cancelled timer's poll reports the cancel itself, not a failed call.
+#[test]
+fn a_cancelled_timer_reports_a_cancel() {
+	let reactor = Reactor::new(Config::default()).unwrap();
+	let timer = reactor
+		.insert_timer(Instant::now() + Duration::from_secs(60))
+		.unwrap();
+	reactor.cancel_timer(timer);
+	let mut cx = Context::from_waker(Waker::noop());
+	match reactor.poll_timer(timer, &mut cx) {
+		std::task::Poll::Ready(Err(error)) => {
+			assert_eq!(error.kind(), ErrorKind::Cancelled, "{error}");
+		}
+		other => panic!("the cancelled timer reported {other:?}"),
+	}
+}
+
+/// A stopped reactor refuses a new timer as stopped, not as a failed call.
+#[test]
+fn a_stopped_reactor_refuses_a_timer_as_stopped() {
+	let reactor = Reactor::new(Config::default()).unwrap();
+	reactor.stop();
+	let error = reactor
+		.insert_timer(Instant::now() + Duration::from_secs(60))
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::Stopped, "{error}");
+}
+
 /// `Reactor::stop` refuses new work, but the operations already in flight are
 /// still driven to their end.
 #[test]
 fn stopping_the_reactor_drains_what_is_in_flight() {
 	let file = seeded_file(b"hello");
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
+	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
 	let completion = submit(
 		&reactor,
 		&file,
 		Op::Read {
 			offset: 0,
-			memory: memory(&buf),
+			space: reactor.bind(memory(&buf)),
 			extents: whole(&buf),
 		},
 	)
@@ -281,47 +291,23 @@ fn stopping_the_reactor_drains_what_is_in_flight() {
 		block_on(&reactor, completion).1.unwrap().count().unwrap(),
 		5
 	);
-	assert_eq!(&buf[..], b"hello");
+	assert_eq!(buf.to_vec(), b"hello");
 	assert!(common::idle(&reactor));
 
 	// A stopped reactor takes no more work.
-	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
+	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
 	let error = submit(
 		&reactor,
 		&file,
 		Op::Read {
 			offset: 0,
-			memory: memory(&buf),
+			space: reactor.bind(memory(&buf)),
 			extents: whole(&buf),
 		},
 	)
 	.err()
 	.expect("a stopped reactor refuses submissions");
-	assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-}
-
-/// The reactor's own wake-up is a descriptor a caller can wait on
-/// (`Reactor::wait`): a raise from another thread must complete that wait,
-/// not only make `poll` return — otherwise the task waiting on it never runs
-/// again.
-///
-/// Windows: a completion port is not a descriptor, so `Reactor::wait` has
-/// nothing to arm.
-#[cfg(unix)]
-#[test]
-fn an_event_completes_a_wait_armed_on_it() {
-	let reactor = Reactor::new(Config::default()).unwrap();
-	let completion = wait_event(&reactor).unwrap();
-	// The first pass hands the submission to the backend.
-	reactor.poll(Some(Duration::ZERO)).unwrap();
-	assert!(!common::idle(&reactor), "the wait is in flight");
-
-	reactor.event().notify().unwrap();
-	reactor.poll(Some(Duration::from_millis(100))).unwrap();
-	assert!(common::idle(&reactor), "a raise left the wait armed");
-
-	let ((), result) = block_on(&reactor, completion);
-	result.unwrap();
+	assert_eq!(error.kind(), ErrorKind::Stopped);
 }
 
 /// Dropping a completion whose cancel already fired is the given-up path, not a
@@ -340,7 +326,7 @@ fn a_drop_after_the_cancel_fired_is_not_an_unsignalled_one() {
 
 	let (_left, right) = socket_pair();
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(vec![0u8; 8]);
+	let buf = Arc::new(Buffer::new(8));
 	let completion = stalled_recv(&reactor, &right, &buf);
 	let mut receive = Box::pin(completion);
 	let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -380,7 +366,7 @@ fn a_dropped_in_flight_read_panics_after_the_kernel_let_go() {
 
 	let (mut peer, right) = socket_pair();
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(vec![0u8; 8]);
+	let buf = Arc::new(Buffer::new(8));
 	let completion = stalled_recv(&reactor, &right, &buf);
 	reactor.poll(Some(Duration::ZERO)).unwrap();
 	assert!(!common::idle(&reactor), "the receive has to be in flight");
@@ -390,10 +376,6 @@ fn a_dropped_in_flight_read_panics_after_the_kernel_let_go() {
 		assert!(
 			message.contains("read"),
 			"the message names the op: {message}"
-		);
-		assert!(
-			message.contains("reactor.rs"),
-			"the message names where it was submitted: {message}"
 		);
 	} else {
 		assert!(caught.is_ok(), "a release build only reports the drop");
@@ -410,7 +392,7 @@ fn a_dropped_in_flight_read_panics_after_the_kernel_let_go() {
 	peer.write_all(b"later").unwrap();
 	reactor.poll(Some(Duration::from_millis(1))).unwrap();
 	assert_eq!(
-		&buf[..],
+		buf.to_vec(),
 		&[0u8; 8],
 		"nothing was left to write the buffer after the drop"
 	);
@@ -425,7 +407,7 @@ fn an_in_flight_drop_during_unwinding_only_reports() {
 
 	let (_left, right) = socket_pair();
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(vec![0u8; 8]);
+	let buf = Arc::new(Buffer::new(8));
 	let completion = stalled_recv(&reactor, &right, &buf);
 	reactor.poll(Some(Duration::ZERO)).unwrap();
 	assert!(!common::idle(&reactor), "the receive has to be in flight");
@@ -480,7 +462,7 @@ fn a_dropped_readiness_wait_does_not_block() {
 fn a_reactor_drop_settles_what_is_in_flight() {
 	let (_left, right) = socket_pair();
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(vec![0u8; 8]);
+	let buf = Arc::new(Buffer::new(8));
 	let completion = stalled_recv(&reactor, &right, &buf);
 	reactor.poll(Some(Duration::ZERO)).unwrap();
 	assert!(!common::idle(&reactor), "the receive is in flight");
@@ -503,7 +485,7 @@ fn a_graceful_shutdown_lets_an_operation_land_on_its_own() {
 
 	let (mut left, right) = socket_pair();
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(vec![0u8; 8]);
+	let buf = Arc::new(Buffer::new(8));
 	let mut completion = pin!(stalled_recv(&reactor, &right, &buf));
 	reactor.poll(Some(Duration::ZERO)).unwrap();
 	let peer = std::thread::spawn(move || {
@@ -518,7 +500,7 @@ fn a_graceful_shutdown_lets_an_operation_land_on_its_own() {
 		panic!("the shutdown returned with the receive still out");
 	};
 	assert_eq!(result.unwrap().count().unwrap(), 4);
-	assert_eq!(&buf[..4], b"late");
+	assert_eq!(&buf.to_vec()[..4], b"late");
 }
 
 /// A shutdown ends the operations still out, but a completion that outlives it
@@ -540,7 +522,7 @@ fn a_completion_polled_after_shutdown_resolves_to_stopped() {
 	let std::task::Poll::Ready(((), result)) = wait.as_mut().poll(&mut cx) else {
 		panic!("a completion after shutdown stayed pending");
 	};
-	assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+	assert_eq!(result.unwrap_err().kind(), ErrorKind::Stopped);
 }
 
 /// A cancel its holder asked for before a shutdown keeps reading as a cancel,
@@ -559,7 +541,11 @@ fn a_cancel_before_shutdown_still_reads_as_a_cancel() {
 		panic!("a completion after shutdown stayed pending");
 	};
 	let error = result.unwrap_err();
-	assert!(reactor.is_cancelled(&error), "the cancel became {error}");
+	assert_eq!(
+		error.kind(),
+		ErrorKind::Cancelled,
+		"the cancel became {error}"
+	);
 }
 
 /// The userdata comes back with a cancelled op, and a byte written to the peer
@@ -575,7 +561,7 @@ fn a_cancelled_receive_hands_back_only_the_userdata() {
 	right.set_nonblocking(true).unwrap();
 	let right = Handle::new(right);
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(vec![0u8; 8]);
+	let buf = Arc::new(Buffer::new(8));
 	let completion = stalled_recv(&reactor, &right, &buf).tag("frame");
 	// One pass puts the receive in flight, so the cancel reaches the kernel's op.
 	reactor.poll(Some(Duration::ZERO)).unwrap();
@@ -584,13 +570,13 @@ fn a_cancelled_receive_hands_back_only_the_userdata() {
 	let (tag, result) = block_on(&reactor, completion);
 	let error = result.expect_err("the receive completed after the cancel");
 	assert!(
-		reactor.is_cancelled(&error),
+		error.kind() == ErrorKind::Cancelled,
 		"the receive was not cancelled: {error:?}"
 	);
 	assert_eq!(tag, "frame", "the userdata came back");
 	(&left).write_all(b"late").unwrap();
 	reactor.poll(Some(Duration::from_millis(20))).unwrap();
-	assert_eq!(&buf[..], &[0u8; 8], "a byte arrived after the cancel");
+	assert_eq!(buf.to_vec(), &[0u8; 8], "a byte arrived after the cancel");
 }
 
 /// A readiness wait names nothing of the caller's, so dropping one is not a
@@ -656,14 +642,14 @@ fn a_send_is_memory_free_only_without_data() {
 	let socket = Handle::new(stream);
 	let mut cx = Context::from_waker(Waker::noop());
 
-	let bytes: Arc<Vec<u8>> = Arc::new(vec![1u8; 5]);
+	let bytes: Arc<Buffer> = Arc::new(Buffer::from_slice(&[1u8; 5]));
 	let payload: Arc<dyn Memory> = Arc::clone(&bytes) as Arc<dyn Memory>;
 	let mut send = Box::pin(
 		submit(
 			&reactor,
 			&socket,
 			Op::SendWithFds {
-				memory: payload,
+				space: reactor.bind(payload),
 				extents: whole(&bytes),
 				fds: Vec::new(),
 			},
@@ -682,14 +668,14 @@ fn a_send_is_memory_free_only_without_data() {
 		reactor.poll(Some(Duration::from_millis(1))).unwrap();
 	}
 
-	let empty: Arc<Vec<u8>> = Arc::new(Vec::new());
+	let empty: Arc<Buffer> = Arc::new(Buffer::new(0));
 	let payload: Arc<dyn Memory> = Arc::clone(&empty) as Arc<dyn Memory>;
 	let mut send = Box::pin(
 		submit(
 			&reactor,
 			&socket,
 			Op::SendWithFds {
-				memory: payload,
+				space: reactor.bind(payload),
 				extents: whole(&empty),
 				fds: Vec::new(),
 			},
@@ -739,7 +725,7 @@ mod uring {
 	fn a_drop_on_the_reactor_thread_waits_for_release() {
 		let (_left, right) = socket_pair();
 		let reactor = sqpoll_reactor();
-		let buf = Arc::new(vec![0u8; 8]);
+		let buf = Arc::new(Buffer::new(8));
 		let completion = stalled_recv(&reactor, &right, &buf);
 		// This thread is the reactor's driver from here on.
 		reactor.poll(Some(Duration::ZERO)).unwrap();
@@ -772,7 +758,7 @@ mod uring {
 	fn an_inline_drive_does_not_eat_a_protocol_wake() {
 		let (_left, right) = socket_pair();
 		let reactor = sqpoll_reactor();
-		let buf = Arc::new(vec![0u8; 8]);
+		let buf = Arc::new(Buffer::new(8));
 		let completion = stalled_recv(&reactor, &right, &buf);
 		reactor.poll(Some(Duration::ZERO)).unwrap();
 		// A wake raised through the reactor's protocol, landed while the receive is in
@@ -806,13 +792,13 @@ mod uring {
 
 		let (mut left, right) = socket_pair();
 		let reactor = Reactor::new(Config::default()).unwrap();
-		let buf = Arc::new(vec![0u8; 4]);
+		let buf = Arc::new(Buffer::new(4));
 		let completion = submit(
 			&reactor,
 			&right,
 			Op::Read {
 				offset: 0,
-				memory: memory(&buf),
+				space: reactor.bind(memory(&buf)),
 				extents: whole(&buf),
 			},
 		)
@@ -846,7 +832,7 @@ mod uring {
 		let ((), response) = ready.expect("the receive landed");
 		let response = response.expect("the bytes are the operation's own result, cancel or not");
 		assert_eq!(response.count().unwrap(), 4);
-		assert_eq!(&buf[..], b"wins", "the bytes the receive moved");
+		assert_eq!(buf.to_vec(), b"wins", "the bytes the receive moved");
 	}
 }
 
@@ -865,13 +851,13 @@ mod portable {
 
 		let (mut left, right) = socket_pair();
 		let reactor = Reactor::new(Config::default()).unwrap();
-		let buf = Arc::new(vec![0u8; 4]);
+		let buf = Arc::new(Buffer::new(4));
 		let completion = submit(
 			&reactor,
 			&right,
 			Op::Read {
 				offset: 0,
-				memory: memory(&buf),
+				space: reactor.bind(memory(&buf)),
 				extents: whole(&buf),
 			},
 		)
@@ -901,10 +887,14 @@ mod portable {
 		let ((), response) = ready.expect("the receive was stopped");
 		let error = response.expect_err("the receive was stopped");
 		assert!(
-			reactor.is_cancelled(&error),
+			error.kind() == ErrorKind::Cancelled,
 			"a readiness backend stops the receive it was asked to"
 		);
-		assert_eq!(&buf[..], &[0u8; 4], "the stopped receive wrote the buffer");
+		assert_eq!(
+			buf.to_vec(),
+			&[0u8; 4],
+			"the stopped receive wrote the buffer"
+		);
 		// Nothing is lost: the bytes wait in the peer's buffer for the next one.
 		let mut reader: &std::os::unix::net::UnixStream = &right;
 		let mut got = [0u8; 4];

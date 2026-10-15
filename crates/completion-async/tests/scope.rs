@@ -1,5 +1,6 @@
 //! Scopes: tasks that hold a borrow instead of a shared owner.
 mod common;
+use common::Buffer;
 
 use std::future::Future as _;
 use std::io::{self, Write as _};
@@ -53,8 +54,8 @@ fn a_scoped_task_runs_a_transfer() {
 			.unwrap(),
 		&executor,
 	);
-	let buffer = Arc::new(vec![0u8; 5]);
-	let into = Arc::clone(&buffer);
+	let buffer = Arc::new(Buffer::new(5));
+	let into = executor.bind(buffer.clone()).whole();
 
 	let read = executor
 		.scope(move |scope| async move {
@@ -64,7 +65,7 @@ fn a_scoped_task_runs_a_transfer() {
 		.unwrap();
 
 	assert_eq!(read.unwrap(), 5);
-	assert_eq!(&buffer[..], b"hello");
+	assert_eq!(buffer.to_vec(), b"hello");
 }
 
 /// A handle its caller never awaited does not stop the task, and the scope is
@@ -106,15 +107,19 @@ fn a_transfer_reads_into_lent_memory() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let file: File = Facade::with_executor(common::open(&path).unwrap(), &executor);
-	let guest = vec![0u8; 5];
+	let guest = Buffer::new(5);
 	let lent = &guest;
 
 	let read = executor
-		.scope(|scope| async move { file.read_exact_at(scope.lend(lent), 0).await.into_result() })
+		.scope(|scope| async move {
+			file.read_exact_at(scope.lend(lent).whole(), 0)
+				.await
+				.into_result()
+		})
 		.unwrap();
 
 	assert_eq!(read.unwrap(), 5);
-	assert_eq!(&guest[..], b"hello");
+	assert_eq!(guest.to_vec(), b"hello");
 }
 
 /// A forgotten transfer never runs its destructor, so nothing on the future's
@@ -126,12 +131,12 @@ fn the_scope_waits_out_a_forgotten_transfer_on_lent_memory() {
 	let (left, mut right) = pair();
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::with_executor(left, &executor);
-	let guest = vec![0u8; 5];
+	let guest = Buffer::new(5);
 	let lent = &guest;
 
 	executor
 		.scope(|scope| async move {
-			let mut receive = Box::pin(socket.recv(scope.lend(lent)));
+			let mut receive = Box::pin(socket.recv(scope.lend(lent).whole()));
 			// One poll submits it; nothing has arrived, so it stays in flight.
 			std::future::poll_fn(|cx| {
 				assert!(receive.as_mut().poll(cx).is_pending());
@@ -145,14 +150,11 @@ fn the_scope_waits_out_a_forgotten_transfer_on_lent_memory() {
 	right.write_all(b"late!").unwrap();
 	// Drive the reactor long enough for an armed receive to complete.
 	executor
-		.block_on(Timeout::with_executor(
-			Duration::from_millis(100),
-			&executor,
-		))
+		.block_on(Timeout::with_executor(Duration::from_millis(100), &executor).unwrap())
 		.unwrap()
 		.unwrap();
 	assert_eq!(
-		&guest[..],
+		guest.to_vec(),
 		&[0; 5],
 		"the kernel wrote after the scope returned"
 	);
@@ -168,11 +170,15 @@ fn lent_memory_is_refused_by_another_reactor() {
 	let mut executor = executor();
 	let other = self::executor();
 	let file: File = Facade::with_executor(common::open(&path).unwrap(), &other);
-	let guest = vec![0u8; 5];
+	let guest = Buffer::new(5);
 	let lent = &guest;
 
 	let read = executor
-		.scope(|scope| async move { file.read_at(scope.lend(lent), 0).await.into_result() })
+		.scope(|scope| async move {
+			file.read_at(scope.lend(lent).whole(), 0)
+				.await
+				.into_result()
+		})
 		.unwrap();
 
 	match read {

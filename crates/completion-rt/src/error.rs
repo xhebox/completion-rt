@@ -1,9 +1,8 @@
-//! The error every completion-async operation reports.
+//! The error every reactor operation reports, and the async layer over it.
 
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
-use std::panic::Location;
 
 /// What the caller does next. Matching on it is the decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +14,8 @@ pub enum ErrorKind {
 	ExecutorClosed,
 	/// The kernel or backend failed the call; the error is its [`source`](StdError::source).
 	Failed,
+	/// The reactor has been shut down, so nothing new can be armed or submitted.
+	Stopped,
 }
 
 /// Whether repeating the same call can succeed.
@@ -27,33 +28,40 @@ pub enum Status {
 	Temporary,
 }
 
-/// An error from a completion-async operation.
+/// An error from a reactor operation.
 #[derive(Debug)]
 pub struct Error {
 	kind: ErrorKind,
 	status: Status,
 	source: Option<io::Error>,
-	location: &'static Location<'static>,
 }
 
 impl Error {
-	#[track_caller]
-	pub(crate) fn cancelled() -> Error {
+	/// The caller gave up on the operation.
+	#[doc(hidden)]
+	pub fn cancelled() -> Error {
 		Error {
 			kind: ErrorKind::Cancelled,
 			status: Status::Permanent,
 			source: None,
-			location: Location::caller(),
 		}
 	}
 
-	#[track_caller]
-	pub(crate) fn executor_closed() -> Error {
+	/// The executor was dropped. Only the async layer, which owns executors, builds this.
+	#[doc(hidden)]
+	pub fn executor_closed() -> Error {
 		Error {
 			kind: ErrorKind::ExecutorClosed,
 			status: Status::Permanent,
 			source: None,
-			location: Location::caller(),
+		}
+	}
+
+	pub(crate) fn stopped() -> Error {
+		Error {
+			kind: ErrorKind::Stopped,
+			status: Status::Permanent,
+			source: None,
 		}
 	}
 
@@ -63,11 +71,6 @@ impl Error {
 
 	pub fn status(&self) -> Status {
 		self.status
-	}
-
-	/// The call site that created this error.
-	pub fn location(&self) -> &'static Location<'static> {
-		self.location
 	}
 }
 
@@ -80,6 +83,7 @@ impl fmt::Display for Error {
 			(ErrorKind::ExecutorClosed, _) => {
 				f.write_str("the executor was dropped before spawning a task")
 			}
+			(ErrorKind::Stopped, _) => f.write_str("the reactor has been stopped"),
 		}
 	}
 }
@@ -93,7 +97,6 @@ impl StdError for Error {
 }
 
 impl From<io::Error> for Error {
-	#[track_caller]
 	fn from(error: io::Error) -> Error {
 		let status = match error.kind() {
 			io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
@@ -105,7 +108,6 @@ impl From<io::Error> for Error {
 			kind: ErrorKind::Failed,
 			status,
 			source: Some(error),
-			location: Location::caller(),
 		}
 	}
 }

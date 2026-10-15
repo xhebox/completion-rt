@@ -1,13 +1,14 @@
 //! Direct I/O: whether the open asks the kernel for it, and the error shape
 //! when the filesystem refuses.
 mod common;
+use common::Buffer;
 
 use common::block_on;
 
 use std::io;
 use std::sync::Arc;
 
-use completion_async::{Config, ErrorKind, Executor, Extent, Facade, File, Memory, OpenOptions};
+use completion_async::{Config, ErrorKind, Executor, Facade, File, OpenOptions};
 
 /// The async driver the file operations run on: it owns the reactor, so
 /// `block_on` both polls the operation and drives the backend under it.
@@ -59,24 +60,24 @@ fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 	let reader: Facade<std::io::PipeReader> = Facade::with_executor(reader, &executor);
 	let writer: Facade<std::io::PipeWriter> = Facade::with_executor(writer, &executor);
 
-	let payload: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
-	let memory: Arc<dyn Memory> = Arc::clone(&payload) as Arc<dyn Memory>;
+	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
+	let memory = executor.bind(payload.clone()).whole();
 	let moved = executor
-		.block_on(writer.write_vectored_at(memory, [Extent { offset: 0, len: 5 }], 0))
+		.block_on(writer.write_at(memory.take(5), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(moved, 5);
 
-	let read: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
-	let memory: Arc<dyn Memory> = Arc::clone(&read) as Arc<dyn Memory>;
+	let read: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let memory = executor.bind(read.clone()).whole();
 	let moved = executor
-		.block_on(reader.read_vectored_at(memory, [Extent { offset: 0, len: 5 }], 0))
+		.block_on(reader.read_at(memory.take(5), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(moved, 5);
-	assert_eq!(&read[..], b"hello");
+	assert_eq!(read.to_vec(), b"hello");
 }
 
 /// The vector path names host memory through a backing instead of owning a
@@ -96,50 +97,49 @@ fn the_vector_path_goes_through_the_backing() {
 			.unwrap(),
 		&executor,
 	);
-	let range = [Extent { offset: 0, len: 7 }];
 
-	let source: Arc<Vec<u8>> = Arc::new(b"payload".to_vec());
-	let memory: Arc<dyn Memory> = Arc::clone(&source) as Arc<dyn Memory>;
+	let source: Arc<Buffer> = Arc::new(Buffer::from_slice(b"payload"));
+	let memory = executor.bind(source.clone()).whole();
 	assert_eq!(
 		executor
-			.block_on(file.write_vectored_at(memory, range, 0))
+			.block_on(file.write_at(memory, 0))
 			.unwrap()
 			.into_result()
 			.unwrap(),
 		7
 	);
 
-	let sink: Arc<Vec<u8>> = Arc::new(vec![0; 7]);
-	let memory: Arc<dyn Memory> = Arc::clone(&sink) as Arc<dyn Memory>;
+	let sink: Arc<Buffer> = Arc::new(Buffer::new(7));
+	let memory = executor.bind(sink.clone()).whole();
 	assert_eq!(
 		executor
-			.block_on(file.read_vectored_at(memory, range, 0))
+			.block_on(file.read_at(memory, 0))
 			.unwrap()
 			.into_result()
 			.unwrap(),
 		7
 	);
 
-	let memory: Arc<dyn Memory> = Arc::clone(&sink) as Arc<dyn Memory>;
+	let memory = executor.bind(sink.clone()).whole();
 	assert_eq!(
 		executor
-			.block_on(file.write_vectored_at(memory, range, 7))
+			.block_on(file.write_at(memory, 7))
 			.unwrap()
 			.into_result()
 			.unwrap(),
 		7
 	);
-	let whole: Arc<Vec<u8>> = Arc::new(vec![0; 14]);
-	let memory: Arc<dyn Memory> = Arc::clone(&whole) as Arc<dyn Memory>;
+	let whole: Arc<Buffer> = Arc::new(Buffer::new(14));
+	let memory = executor.bind(whole.clone()).whole();
 	assert_eq!(
 		executor
-			.block_on(file.read_vectored_at(memory, [Extent { offset: 0, len: 14 }], 0))
+			.block_on(file.read_at(memory, 0))
 			.unwrap()
 			.into_result()
 			.unwrap(),
 		14
 	);
-	assert_eq!(&whole[..], b"payloadpayload");
+	assert_eq!(whole.to_vec(), b"payloadpayload");
 }
 
 /// A read that stops short of the buffer is the count it reached, not an
@@ -153,9 +153,9 @@ fn read_exact_at_reports_the_file_ending_first() {
 	let mut executor = executor();
 	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 
-	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
+	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
 	// One call: five bytes are left, and that is what it reports.
-	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
+	let memory = executor.bind(buffer.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -164,15 +164,15 @@ fn read_exact_at_reports_the_file_ending_first() {
 			.unwrap(),
 		5
 	);
-	assert_eq!(&buffer[..5], b"hello");
+	assert_eq!(&buffer.to_vec()[..5], b"hello");
 
-	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
+	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
 	// The loop stops where the file does, and the progress it made is the
 	// bytes it did bring back, not the whole buffer.
-	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
+	let memory = executor.bind(buffer.clone()).whole();
 	let outcome = executor.block_on(file.read_exact_at(memory, 0)).unwrap();
 	assert_eq!(outcome.value, 5);
-	assert_eq!(&buffer[..5], b"hello", "what did arrive stays");
+	assert_eq!(&buffer.to_vec()[..5], b"hello", "what did arrive stays");
 	match outcome
 		.result
 		.expect_err("the file has fewer bytes than the buffer holds")
@@ -202,8 +202,9 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	);
 
 	let len = 4 << 20;
-	let payload: Arc<Vec<u8>> = Arc::new((0..len).map(|i| i as u8).collect());
-	let memory: Arc<dyn Memory> = Arc::clone(&payload) as Arc<dyn Memory>;
+	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
+	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(&bytes));
+	let memory = executor.bind(payload.clone()).whole();
 	executor
 		.block_on(file.write_all_at(memory, 0))
 		.unwrap()
@@ -211,14 +212,14 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 		.unwrap();
 	executor.block_on(file.sync()).unwrap().unwrap();
 
-	let read: Arc<Vec<u8>> = Arc::new(vec![0; len]);
-	let memory: Arc<dyn Memory> = Arc::clone(&read) as Arc<dyn Memory>;
+	let read: Arc<Buffer> = Arc::new(Buffer::new(len));
+	let memory = executor.bind(read.clone()).whole();
 	executor
 		.block_on(file.read_exact_at(memory, 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
-	assert_eq!(*read, *payload, "the payload did not come back whole");
+	assert_eq!(read.to_vec(), bytes, "the payload did not come back whole");
 }
 
 /// The facade binds the file to the executor, so a call site names neither an
@@ -236,8 +237,8 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 		.unwrap();
 	let file: File = Facade::with_executor(file, &executor);
 
-	let written: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
-	let memory: Arc<dyn Memory> = Arc::clone(&written) as Arc<dyn Memory>;
+	let written: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
+	let memory = executor.bind(written.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.write_at(memory, 0))
@@ -248,8 +249,8 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	);
 	executor.block_on(file.sync()).unwrap().unwrap();
 
-	let read: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
-	let memory: Arc<dyn Memory> = Arc::clone(&read) as Arc<dyn Memory>;
+	let read: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let memory = executor.bind(read.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -258,7 +259,7 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 			.unwrap(),
 		5
 	);
-	assert_eq!(&read[..], b"hello");
+	assert_eq!(read.to_vec(), b"hello");
 
 	// Back to the plain file: nothing names it any more, so the facade gives it
 	// up; the executor binding is dropped.
@@ -307,8 +308,8 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	let mut executor = executor();
 	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 
-	let buffer: Arc<Vec<u8>> = Arc::new(vec![0; 5]);
-	let memory: Arc<dyn Memory> = Arc::clone(&buffer) as Arc<dyn Memory>;
+	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let memory = executor.bind(buffer.clone()).whole();
 	let read = assert_static(file.read_at(memory, 0));
 	let mut reading = Reading {
 		file: Some(file),
@@ -326,7 +327,7 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 			.unwrap(),
 		5
 	);
-	assert_eq!(&buffer[..], b"hello");
+	assert_eq!(buffer.to_vec(), b"hello");
 }
 
 /// `flush` reports the file's deferred write-back errors by closing a
@@ -346,8 +347,8 @@ fn flush_leaves_the_facade_usable() {
 		&executor,
 	);
 
-	let first: Arc<Vec<u8>> = Arc::new(b"hello".to_vec());
-	let memory: Arc<dyn Memory> = Arc::clone(&first) as Arc<dyn Memory>;
+	let first: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
+	let memory = executor.bind(first.clone()).whole();
 	executor
 		.block_on(file.write_all_at(memory, 0))
 		.unwrap()
@@ -357,22 +358,22 @@ fn flush_leaves_the_facade_usable() {
 
 	// The duplicate the flush closed was not the facade's descriptor: the same
 	// facade still writes and reads.
-	let second: Arc<Vec<u8>> = Arc::new(b"world".to_vec());
-	let memory: Arc<dyn Memory> = Arc::clone(&second) as Arc<dyn Memory>;
+	let second: Arc<Buffer> = Arc::new(Buffer::from_slice(b"world"));
+	let memory = executor.bind(second.clone()).whole();
 	executor
 		.block_on(file.write_all_at(memory, 5))
 		.unwrap()
 		.into_result()
 		.unwrap();
 
-	let read: Arc<Vec<u8>> = Arc::new(vec![0; 10]);
-	let memory: Arc<dyn Memory> = Arc::clone(&read) as Arc<dyn Memory>;
+	let read: Arc<Buffer> = Arc::new(Buffer::new(10));
+	let memory = executor.bind(read.clone()).whole();
 	executor
 		.block_on(file.read_exact_at(memory, 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
-	assert_eq!(&read[..], b"helloworld");
+	assert_eq!(read.to_vec(), b"helloworld");
 }
 
 /// A descriptor nothing owns anymore: `flush` must report the error rather than

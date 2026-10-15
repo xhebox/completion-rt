@@ -1,7 +1,7 @@
 //! The thread's global executor.
 //!
 //! Each thread has its own executor. It is created on the first call to
-//! [`block_on`], [`scope`], [`spawn`] or [`try_spawn`], with
+//! [`block_on`], [`scope`], [`spawn`], [`try_spawn`] or [`bind`], with
 //! `Config::default()`. It is never replaced, and it lives until the thread
 //! exits.
 //!
@@ -14,11 +14,11 @@
 
 use std::cell::{OnceCell, RefCell};
 use std::future::Future;
-use std::io;
+use std::sync::Arc;
 
-use completion_rt::Reactor;
+use completion_rt::{Memory, Reactor};
 
-use crate::{Config, Error, Executor, Scope, Spawner, Task};
+use crate::{Config, Error, Executor, Scope, Space, Spawner, Task};
 
 thread_local! {
 	static EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
@@ -50,7 +50,7 @@ fn initialize() {
 ///
 /// Panics if the executor is already running, as it is when called from inside
 /// another `block_on`.
-pub fn block_on<F: Future>(future: F) -> io::Result<F::Output> {
+pub fn block_on<F: Future>(future: F) -> Result<F::Output, Error> {
 	initialize();
 	EXECUTOR.with(|slot| {
 		let Ok(mut slot) = slot.try_borrow_mut() else {
@@ -89,13 +89,19 @@ pub(crate) fn reactor() -> Reactor {
 	handles(|_, reactor| reactor.clone())
 }
 
+/// Binds `memory` to this thread's global executor; see
+/// [`Executor::bind`].
+pub fn bind(memory: Arc<dyn Memory>) -> Space<'static> {
+	handles(|_, reactor| Space::new(reactor.bind(memory)))
+}
+
 /// Runs `body` with a scope on this thread's global executor, so the tasks it
 /// spawns may borrow from the caller.
 ///
 /// The scope returns once `body` does, dropping whatever is still in flight.
 /// Panics if the executor is already running, as it is when called from inside
 /// another [`block_on`] or `scope`.
-pub fn scope<'a, F, Fut, R>(body: F) -> io::Result<R>
+pub fn scope<'a, F, Fut, R>(body: F) -> Result<R, Error>
 where
 	F: FnOnce(Scope<'a>) -> Fut,
 	Fut: Future<Output = R> + 'a,

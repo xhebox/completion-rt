@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 mod common;
+use common::Buffer;
 
 use std::future::Future;
 use std::os::unix::net::UnixStream;
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use completion_async::{Cancel, Config, ErrorKind, Executor, Facade, File, Memory};
+use completion_async::{Cancel, Config, ErrorKind, Executor, Facade, File, Span};
 
 /// The async driver the operations run on.
 fn executor() -> Executor {
@@ -25,10 +26,10 @@ fn executor() -> Executor {
 	Executor::new(Config::default()).unwrap()
 }
 
-/// The buffer in the shape the engine names memory.
-fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
-	let memory: Arc<dyn Memory> = buf.clone();
-	memory
+/// The whole of `buf`, bound to `executor`: the space holds a second handle on
+/// it, so it outlives the operation.
+fn span(executor: &Executor, buf: &Arc<Buffer>) -> Span<'static> {
+	executor.bind(buf.clone()).whole()
 }
 
 /// `until` returns `Ok` when the operation completes first, even with a cancel
@@ -41,14 +42,14 @@ fn until_completes_when_the_op_lands_first() {
 	let mut executor = executor();
 	let file = File::with_executor(std::fs::File::open(path).unwrap(), &executor);
 
-	let buf = Arc::new(vec![0u8; 5]);
+	let buf = Arc::new(Buffer::new(5));
 	let cancel = Cancel::new();
 	let outcome = executor
-		.block_on(file.read_at(memory(&buf), 0).until(&cancel))
+		.block_on(file.read_at(span(&executor, &buf), 0).until(&cancel))
 		.unwrap();
 	assert_eq!(outcome.value, 5, "the read completed first");
 	assert!(outcome.result.is_ok(), "the cancel never fired");
-	assert_eq!(&buf[..], b"hello");
+	assert_eq!(buf.to_vec(), b"hello");
 }
 
 /// Cancelling a parent cancels its children; cancelling a child leaves the
@@ -189,7 +190,7 @@ fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
 	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-	let buf = Arc::new(vec![0u8; 8]);
+	let buf = Arc::new(Buffer::new(8));
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
 	let thread = std::thread::spawn(move || {
@@ -198,7 +199,7 @@ fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 	});
 	let started = Instant::now();
 	let outcome = executor
-		.block_on(right.recv(memory(&buf)).until(&cancel))
+		.block_on(right.recv(span(&executor, &buf)).until(&cancel))
 		.unwrap();
 	thread.join().unwrap();
 	assert!(
@@ -245,10 +246,10 @@ fn a_cancel_shared_by_two_executors_wakes_both() {
 			left.set_nonblocking(true).unwrap();
 			right.set_nonblocking(true).unwrap();
 			let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-			let buf = Arc::new(vec![0u8; 8]);
+			let buf = Arc::new(Buffer::new(8));
 			let started = Instant::now();
 			let outcome = executor
-				.block_on(right.recv(memory(&buf)).until(&cancel))
+				.block_on(right.recv(span(&executor, &buf)).until(&cancel))
 				.unwrap();
 			// `left` outlives the receive: a peer that went would end it with EOF,
 			// not leave it stalled for the cancel to reach.
@@ -301,7 +302,7 @@ fn a_cancel_from_another_thread_wakes_a_parked_reactor() {
 		left.set_nonblocking(true).unwrap();
 		right.set_nonblocking(true).unwrap();
 		let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-		let buf = Arc::new(vec![0u8; 8]);
+		let buf = Arc::new(Buffer::new(8));
 		let cancel = Cancel::new();
 		let raiser = cancel.clone();
 		let raising = std::thread::spawn(move || {
@@ -311,7 +312,7 @@ fn a_cancel_from_another_thread_wakes_a_parked_reactor() {
 			raiser.cancel();
 		});
 		let outcome = executor
-			.block_on(right.recv(memory(&buf)).until(&cancel))
+			.block_on(right.recv(span(&executor, &buf)).until(&cancel))
 			.unwrap();
 		raising.join().unwrap();
 		assert!(

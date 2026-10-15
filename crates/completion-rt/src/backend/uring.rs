@@ -1,24 +1,22 @@
 //! Linux `io_uring` backend.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::core::Response;
+use crate::OwnedDescriptor;
 use crate::desc::{RawHandle, from_raw_socket};
-use crate::memory::Extents;
-use crate::memory::Spans;
-use crate::{Memory, OwnedDescriptor, Span};
-use io_uring::{EnterFlags, IoUring, opcode, squeue, types};
+use crate::error::Error;
+use crate::memory::{IoVec, IoVecs};
+use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue, types};
 use rustix::io::Errno;
 
-use super::Backend;
+use super::park::{Doorbell, PARKED, Park};
+use super::{Backend, Response};
 use crate::backend::Config;
-use crate::event::Event;
-use crate::park::Park;
 
 const MIN_RING_ENTRIES: u32 = 2;
 
@@ -37,9 +35,33 @@ fn writable_mask() -> u32 {
 /// handed to operations start at one.
 const CANCEL_TOKEN: u64 = 0;
 
-/// The token the wake-up poll is reported under. Ids handed to operations
-/// start at one and would have to wrap the counter to reach this.
-const NOTIFY_TOKEN: u64 = u64::MAX;
+/// The token the futex wait on the park's state word is reported under. Ids
+/// handed to operations start at one and would have to wrap the counter to
+/// reach this.
+const FUTEX_TOKEN: u64 = u64::MAX;
+
+/// `FUTEX2_SIZE_U32`: the state word is a 32-bit futex (`include/uapi/linux/futex.h`).
+const FUTEX2_SIZE_U32: u32 = 0x02;
+
+/// Wakes a park sleeping on its state word through the ring's `FUTEX_WAIT`:
+/// `FUTEX_WAKE` on the word completes that wait, so `enter` returns.
+struct FutexWake;
+
+impl Doorbell for FutexWake {
+	fn ring(&self, word: &std::sync::atomic::AtomicU32) {
+		// Shared, not private: the ring queues its `FUTEX_WAIT` on this same
+		// address, and a private wake would not match it.
+		let _ = rustix::thread::futex::wake(word, rustix::thread::futex::Flags::empty(), 1);
+	}
+}
+
+/// An IOPOLL ring spins instead of sleeping, and its spin reads the state
+/// word itself (`Park::woke`), so there is nothing to ring.
+struct Spin;
+
+impl Doorbell for Spin {
+	fn ring(&self, _word: &std::sync::atomic::AtomicU32) {}
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Kind {
@@ -53,29 +75,24 @@ enum Step {
 	Read {
 		fd: RawHandle,
 		fdoff: u64,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
+		buffers: IoVecs,
 	},
 	Write {
 		fd: RawHandle,
 		fdoff: u64,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
+		buffers: IoVecs,
 	},
 	Recv {
 		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
+		buffers: IoVecs,
 	},
 	RecvWithFds {
 		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
+		buffers: IoVecs,
 	},
 	Send {
 		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
+		buffers: IoVecs,
 		fds: Vec<OwnedDescriptor>,
 	},
 	Fsync {
@@ -99,6 +116,9 @@ enum Step {
 	Writable {
 		fd: RawHandle,
 	},
+	Hangup {
+		fd: RawHandle,
+	},
 }
 
 impl Step {
@@ -110,7 +130,8 @@ impl Step {
 			| Step::Flush { .. }
 			| Step::Fallocate { .. }
 			| Step::Readable { .. }
-			| Step::Writable { .. } => Kind::Done,
+			| Step::Writable { .. }
+			| Step::Hangup { .. } => Kind::Done,
 			_ => Kind::Count,
 		}
 	}
@@ -210,29 +231,27 @@ impl Control {
 struct Active {
 	step: Step,
 	/// The SQE points to this allocation until completion.
-	_buffers: Spans,
+	_buffers: IoVecs,
 	control: Option<Control>,
 	fds: Vec<OwnedDescriptor>,
 }
 
 pub(crate) struct Uring {
 	ring: IoUring,
-	completion: Option<Event>,
 	iopoll: bool,
 	active: HashMap<u64, Active>,
-	ready: VecDeque<(u64, io::Result<Response>)>,
+	ready: VecDeque<(u64, Result<Response, Error>)>,
 	/// Whether the kernel takes `IORING_ENTER_NO_IOWAIT` (Linux 6.15+). A kernel that does not still blocks in `io_uring_enter`, and that sleep counts as iowait.
 	no_iowait: bool,
-	notify_armed: bool,
+	/// Whether the futex wait is queued and has not completed.
+	futex_armed: bool,
 	sqpoll: bool,
-}
-
-fn borrowed(event: &Event) -> BorrowedFd<'_> {
-	event.descriptor()
+	/// Hangup polls already reported, still armed until their last completion.
+	retiring: HashSet<u64>,
 }
 
 impl Uring {
-	pub(super) fn new(config: &Config, _embedded: bool) -> io::Result<(Uring, Event)> {
+	pub(super) fn new(config: &Config) -> io::Result<Uring> {
 		let mut builder = IoUring::builder();
 		if config.iopoll {
 			builder.setup_iopoll();
@@ -244,42 +263,36 @@ impl Uring {
 		let iopoll = ring.params().is_setup_iopoll();
 		let sqpoll = ring.params().is_setup_sqpoll();
 		let no_iowait = ring.params().is_feature_no_iowait();
-		let (completion, event) = if iopoll {
-			(None, Event::new()?)
-		} else {
-			let event = Event::new()?;
-			ring.submitter()
-				.register_eventfd(event.handle().as_raw_fd())?;
-			(Some(event.clone()), event)
-		};
-		Ok((
-			Uring {
-				ring,
-				completion,
-				iopoll,
-				active: HashMap::new(),
-				ready: VecDeque::new(),
-				no_iowait,
-				notify_armed: false,
-				sqpoll,
-			},
-			event,
-		))
+		Ok(Uring {
+			ring,
+			iopoll,
+			active: HashMap::new(),
+			ready: VecDeque::new(),
+			no_iowait,
+			futex_armed: false,
+			sqpoll,
+			retiring: HashSet::new(),
+		})
 	}
 
-	/// Polling the notification fd makes external wakes visible to `enter_wait`.
-	fn arm_notify(&mut self) -> io::Result<()> {
-		if self.notify_armed {
+	/// Queues a wait on the park's state word. A wake that flips the word and
+	/// calls `FUTEX_WAKE` completes it, so `enter` returns. The word is `PARKED`
+	/// here: `Park::park` set it before polling.
+	fn arm_futex(&mut self, park: &Park) -> io::Result<()> {
+		if self.futex_armed {
 			return Ok(());
 		}
-		let Some(event) = self.completion.as_ref() else {
-			return Ok(());
-		};
-		let entry = opcode::PollAdd::new(types::Fd(event.handle().as_raw_fd()), readable_mask())
-			.build()
-			.user_data(NOTIFY_TOKEN);
+		let word = park.state().as_ptr().cast_const();
+		let entry = opcode::FutexWait::new(
+			word,
+			u64::from(PARKED),
+			u64::from(u32::MAX),
+			FUTEX2_SIZE_U32,
+		)
+		.build()
+		.user_data(FUTEX_TOKEN);
 		push(&mut self.ring, entry)?;
-		self.notify_armed = true;
+		self.futex_armed = true;
 		Ok(())
 	}
 
@@ -356,24 +369,63 @@ impl Uring {
 	}
 
 	fn reap(&mut self) -> io::Result<()> {
+		let mut settled = Vec::new();
+		let mut rearm = Vec::new();
 		{
 			let ring = &mut self.ring;
 			let active = &mut self.active;
-			let notify_armed = &mut self.notify_armed;
+			let futex_armed = &mut self.futex_armed;
 			let ready = &mut self.ready;
+			let retiring = &mut self.retiring;
 			for cqe in ring.completion() {
 				let id = cqe.user_data();
+				let more = cqueue::more(cqe.flags());
+				if retiring.contains(&id) {
+					if !more {
+						retiring.remove(&id);
+					}
+					continue;
+				}
+				// Only a hangup poll is multishot, and it reports nothing until
+				// the mask names the hangup.
+				if more {
+					if hung(cqe.result()) && active.remove(&id).is_some() {
+						retiring.insert(id);
+						settled.push(id);
+						ready.push_back((id, Ok(Response::Done)));
+					}
+					continue;
+				}
 				let entry = active.remove(&id);
+				if let Some(Active {
+					step: Step::Hangup { fd },
+					..
+				}) = &entry && cqe.result() >= 0
+					&& !hung(cqe.result())
+				{
+					// The kernel ended the multishot without a hangup (a CQ it
+					// could not post to): the wait is still owed.
+					rearm.push((id, *fd));
+					continue;
+				}
 				if id == CANCEL_TOKEN {
 					continue;
 				}
-				if id == NOTIFY_TOKEN {
-					*notify_armed = false;
+				if id == FUTEX_TOKEN {
+					// Woken, refused because the word had moved on, or cancelled: each
+					// one just ends the wait.
+					*futex_armed = false;
 					continue;
 				}
 				let moved = i64::from(cqe.result());
 				if moved < 0 {
-					ready.push_back((id, Err(io::Error::from_raw_os_error(-moved as i32))));
+					let errno = -moved as i32;
+					let error = if errno == Errno::CANCELED.raw_os_error() {
+						Error::cancelled()
+					} else {
+						Error::from(io::Error::from_raw_os_error(errno))
+					};
+					ready.push_back((id, Err(error)));
 					continue;
 				}
 				let moved = moved as usize;
@@ -400,6 +452,17 @@ impl Uring {
 				ready.push_back((id, Ok(response)));
 			}
 		}
+		for id in settled {
+			let entry = opcode::AsyncCancel::new(id).build().user_data(CANCEL_TOKEN);
+			if let Err(error) = push(&mut self.ring, entry) {
+				log::warn!(id, error:%; "a reported hangup poll stays armed");
+			}
+		}
+		for (id, fd) in rearm {
+			if let Err(error) = self.submit(id, Step::Hangup { fd }) {
+				self.ready.push_back((id, Err(Error::from(error))));
+			}
+		}
 		Ok(())
 	}
 
@@ -408,15 +471,10 @@ impl Uring {
 		step: &mut Step,
 		control: &mut Option<Control>,
 		id: u64,
-	) -> io::Result<(squeue::Entry, Spans)> {
+	) -> io::Result<(squeue::Entry, IoVecs)> {
 		let (entry, buffers) = match step {
-			Step::Read {
-				fd,
-				fdoff,
-				memory,
-				extents,
-			} => {
-				let buffers = crate::memory::spans(memory, extents)?;
+			Step::Read { fd, fdoff, buffers } => {
+				let buffers = std::mem::take(buffers);
 				let entry = opcode::Readv::new(
 					types::Fd(fd.as_raw_fd()),
 					buffers.as_ptr().cast(),
@@ -427,13 +485,8 @@ impl Uring {
 				.user_data(id);
 				(entry, buffers)
 			}
-			Step::Write {
-				fd,
-				fdoff,
-				memory,
-				extents,
-			} => {
-				let buffers = crate::memory::spans(memory, extents)?;
+			Step::Write { fd, fdoff, buffers } => {
+				let buffers = std::mem::take(buffers);
 				let entry = opcode::Writev::new(
 					types::Fd(fd.as_raw_fd()),
 					buffers.as_ptr().cast(),
@@ -458,7 +511,7 @@ impl Uring {
 					opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
 						.build()
 						.user_data(id),
-					Spans::new(),
+					IoVecs::new(),
 				)
 			}
 			Step::Flush { fd } => {
@@ -474,7 +527,7 @@ impl Uring {
 					opcode::Close::new(types::Fd(fd.as_raw_fd()))
 						.build()
 						.user_data(id),
-					Spans::new(),
+					IoVecs::new(),
 				)
 			}
 			Step::Fallocate {
@@ -495,7 +548,7 @@ impl Uring {
 						.mode(*mode)
 						.build()
 						.user_data(id),
-					Spans::new(),
+					IoVecs::new(),
 				)
 			}
 			Step::Accept { fd } => {
@@ -517,14 +570,10 @@ impl Uring {
 				.flags(flags)
 				.build()
 				.user_data(id);
-				(entry, Spans::new())
+				(entry, IoVecs::new())
 			}
-			Step::Recv {
-				fd,
-				memory,
-				extents,
-			} => {
-				let buffers = crate::memory::spans(memory, extents)?;
+			Step::Recv { fd, buffers } => {
+				let buffers = std::mem::take(buffers);
 				let [buf] = buffers.as_slice() else {
 					return Err(io::Error::new(
 						io::ErrorKind::Unsupported,
@@ -540,12 +589,8 @@ impl Uring {
 						.user_data(id);
 				(entry, buffers)
 			}
-			Step::RecvWithFds {
-				fd,
-				memory,
-				extents,
-			} => {
-				let buffers = crate::memory::spans(memory, extents)?;
+			Step::RecvWithFds { fd, buffers } => {
+				let buffers = std::mem::take(buffers);
 				let [buf] = buffers.as_slice() else {
 					return Err(io::Error::new(
 						io::ErrorKind::Unsupported,
@@ -561,13 +606,8 @@ impl Uring {
 					.user_data(id);
 				(entry, buffers)
 			}
-			Step::Send {
-				fd,
-				memory,
-				extents,
-				fds,
-			} => {
-				let buffers = crate::memory::spans(memory, extents)?;
+			Step::Send { fd, buffers, fds } => {
+				let buffers = std::mem::take(buffers);
 				let [buf] = buffers.as_slice() else {
 					return Err(io::Error::new(
 						io::ErrorKind::Unsupported,
@@ -594,11 +634,19 @@ impl Uring {
 			}
 			Step::Readable { fd } => {
 				let entry = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), readable_mask());
-				(entry.build().user_data(id), Spans::new())
+				(entry.build().user_data(id), IoVecs::new())
 			}
 			Step::Writable { fd } => {
 				let entry = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), writable_mask());
-				(entry.build().user_data(id), Spans::new())
+				(entry.build().user_data(id), IoVecs::new())
+			}
+			Step::Hangup { fd } => {
+				// The kernel ORs IO_POLL_UNMASK (EPOLLERR | EPOLLHUP | EPOLLNVAL |
+				// EPOLLRDHUP, io_uring/poll.c) into every poll's events, so even an
+				// empty mask fires on a half-close. Multishot keeps the poll armed
+				// past those; `reap` waits for a mask with HUP or ERR.
+				let entry = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), 0).multi(true);
+				(entry.build().user_data(id), IoVecs::new())
 			}
 		};
 		Ok((entry, buffers))
@@ -632,43 +680,35 @@ impl Uring {
 	}
 }
 
+impl Drop for Uring {
+	fn drop(&mut self) {
+		// A queued futex wait points at the park's state word, which the reactor
+		// frees with its last `Arc`. Cancel it and reap its completion first, so
+		// the ring lets go before the word can go.
+		if !self.futex_armed {
+			return;
+		}
+		let entry = opcode::AsyncCancel::new(FUTEX_TOKEN)
+			.build()
+			.user_data(CANCEL_TOKEN);
+		if push(&mut self.ring, entry).is_err() {
+			return;
+		}
+		while self.futex_armed {
+			if self.ring.submit_and_wait(1).is_err() || self.reap().is_err() {
+				return;
+			}
+		}
+	}
+}
+
 impl Backend for Uring {
-	fn read(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		fdoff: u64,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
-		self.submit(
-			id,
-			Step::Read {
-				fd,
-				fdoff,
-				memory,
-				extents,
-			},
-		)
+	fn read(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
+		self.submit(id, Step::Read { fd, fdoff, buffers })
 	}
 
-	fn write(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		fdoff: u64,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
-		self.submit(
-			id,
-			Step::Write {
-				fd,
-				fdoff,
-				memory,
-				extents,
-			},
-		)
+	fn write(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
+		self.submit(id, Step::Write { fd, fdoff, buffers })
 	}
 
 	fn fsync(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
@@ -713,53 +753,20 @@ impl Backend for Uring {
 		)
 	}
 
-	fn recv(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
-		self.submit(
-			id,
-			Step::Recv {
-				fd,
-				memory,
-				extents,
-			},
-		)
+	fn recv(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
+		self.submit(id, Step::Recv { fd, buffers })
 	}
 
-	fn recv_with_fds(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
-		self.submit(
-			id,
-			Step::RecvWithFds {
-				fd,
-				memory,
-				extents,
-			},
-		)
+	fn recv_with_fds(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
+		self.submit(id, Step::RecvWithFds { fd, buffers })
 	}
 
-	fn send(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
+	fn send(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
 		self.submit(
 			id,
 			Step::Send {
 				fd,
-				memory,
-				extents,
+				buffers,
 				fds: Vec::new(),
 			},
 		)
@@ -769,19 +776,10 @@ impl Backend for Uring {
 		&mut self,
 		id: u64,
 		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
+		buffers: IoVecs,
 		fds: Vec<OwnedDescriptor>,
 	) -> io::Result<()> {
-		self.submit(
-			id,
-			Step::Send {
-				fd,
-				memory,
-				extents,
-				fds,
-			},
-		)
+		self.submit(id, Step::Send { fd, buffers, fds })
 	}
 
 	fn accept(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
@@ -796,6 +794,10 @@ impl Backend for Uring {
 		self.submit(id, Step::Writable { fd })
 	}
 
+	fn hangup(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
+		self.submit(id, Step::Hangup { fd })
+	}
+
 	fn cancel(&mut self, id: u64) {
 		let entry = opcode::AsyncCancel::new(id).build().user_data(CANCEL_TOKEN);
 		let _ = push(&mut self.ring, entry).and_then(|()| self.ring.submit());
@@ -808,13 +810,11 @@ impl Backend for Uring {
 		if self.iopoll {
 			self.poll_devices(timeout, park)?;
 		} else if timeout == Some(Duration::ZERO) {
-			// Only clear notifications after a wait; a nonblocking poll must not consume an unseen cross-thread wake.
 			self.ring.submit()?;
 			self.reap()?;
 		} else {
-			self.arm_notify()?;
+			self.arm_futex(park)?;
 			self.enter_wait(timeout)?;
-			self.drain_notification()?;
 			self.reap()?;
 		}
 		match self.ready.front() {
@@ -823,47 +823,35 @@ impl Backend for Uring {
 		}
 	}
 
-	fn take(&mut self, id: u64) -> io::Result<Response> {
+	fn take(&mut self, id: u64) -> Result<Response, Error> {
 		match self.ready.pop_front() {
 			Some((found, response)) if found == id => response,
 			Some((found, response)) => {
 				self.ready.push_front((found, response));
-				Err(io::Error::other(format!(
+				Err(Error::from(io::Error::other(format!(
 					"take({id}) found a completion for {found}"
-				)))
+				))))
 			}
-			None => Err(io::Error::new(
+			None => Err(Error::from(io::Error::new(
 				io::ErrorKind::NotFound,
 				"no completion to take",
-			)),
+			))),
 		}
 	}
 
-	fn poll_fd(&self) -> io::Result<Event> {
-		match self.completion.as_ref() {
-			Some(event) => Ok(event.clone()),
-			None => Err(io::Error::new(
-				io::ErrorKind::Unsupported,
-				"IOPOLL only completes while polling, so it has no poll_fd",
-			)),
+	fn doorbell(&self) -> Arc<dyn Doorbell> {
+		if self.iopoll {
+			Arc::new(Spin)
+		} else {
+			Arc::new(FutexWake)
 		}
 	}
+}
 
-	/// Reads the notification fd back to zero: a counter left raised makes the next armed poll complete at once, ending the wait early. An external poller drains it before driving, so a completion or a wake raised afterwards re-raises it.
-	fn drain_notification(&mut self) -> io::Result<()> {
-		let Some(event) = self.completion.as_ref() else {
-			return Ok(());
-		};
-		loop {
-			match rustix::io::read(borrowed(event), &mut [0u8; 8]) {
-				Ok(_) => break,
-				Err(Errno::AGAIN) => break,
-				Err(Errno::INTR) => continue,
-				Err(error) => return Err(error.into()),
-			}
-		}
-		Ok(())
-	}
+/// Whether a poll's result mask names the peer gone or the socket failed.
+fn hung(result: i32) -> bool {
+	let gone = rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR;
+	result >= 0 && (result as u32) & (gone.bits() as u32) != 0
 }
 
 /// Return a full-ring error to the caller rather than spinning for space.
@@ -886,35 +874,20 @@ fn try_push(ring: &mut IoUring, entry: &squeue::Entry) -> bool {
 	unsafe { submission.push(entry) }.is_ok()
 }
 
-fn count(bufs: &[Span]) -> io::Result<u32> {
+fn count(bufs: &[IoVec]) -> io::Result<u32> {
 	u32::try_from(bufs.len())
 		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many buffers"))
-}
-
-pub(super) fn cancelled(error: &io::Error) -> bool {
-	error.raw_os_error() == Some(Errno::CANCELED.raw_os_error())
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	/// A kernel `EINTR` is the operation failing, not the ring cancelling it.
-	#[test]
-	fn an_interrupted_operation_is_not_a_cancelled_one() {
-		assert!(cancelled(&io::Error::from_raw_os_error(
-			Errno::CANCELED.raw_os_error()
-		)));
-		assert!(!cancelled(&io::Error::from_raw_os_error(
-			Errno::INTR.raw_os_error()
-		)));
-	}
-
 	/// `NO_IOWAIT` rides every blocking wait on a kernel that reports the
 	/// feature, unless the `iowait` feature withholds it.
 	#[test]
 	fn the_no_iowait_flag_follows_the_kernel_and_the_feature() -> io::Result<()> {
-		let (mut uring, _event) = Uring::new(&Config::default(), false)?;
+		let mut uring = Uring::new(&Config::default())?;
 		uring.no_iowait = false;
 		assert!(!uring.wait_flags().contains(EnterFlags::NO_IOWAIT));
 		uring.no_iowait = true;
@@ -925,15 +898,19 @@ mod tests {
 		Ok(())
 	}
 
-	/// A kernel without `NO_IOWAIT` takes the same `io_uring_enter` wait, and
-	/// a raise on the notification still ends it.
+	/// A kernel without `NO_IOWAIT` takes the same `io_uring_enter` wait.
 	#[test]
 	fn a_blocking_wait_works_without_the_feature() -> io::Result<()> {
-		let (mut uring, event) = Uring::new(&Config::default(), false)?;
-		let park = Park::new(event.clone(), false);
+		let mut uring = Uring::new(&Config::default())?;
+		let park = Arc::new(Park::new(uring.doorbell()));
 		uring.no_iowait = false;
 		let start = Instant::now();
-		let waited = uring.poll(Some(Duration::from_millis(5)), &park);
+		let mut waited = None;
+		park.park(|| {
+			waited = Some(uring.poll(Some(Duration::from_millis(5)), &park));
+			Ok(())
+		})?;
+		let waited = waited.expect("the poll ran");
 		assert!(
 			matches!(waited, Err(ref error) if error.kind() == io::ErrorKind::WouldBlock),
 			"an empty wait reports nothing completed: {waited:?}"
@@ -942,19 +919,6 @@ mod tests {
 			start.elapsed() >= Duration::from_millis(5),
 			"the wait did not hold for its deadline"
 		);
-
-		let raiser = event.clone();
-		let thread = std::thread::spawn(move || {
-			std::thread::sleep(Duration::from_millis(20));
-			raiser.notify().expect("raise the wake-up");
-		});
-		let start = Instant::now();
-		let _ = uring.poll(Some(Duration::from_secs(5)), &park);
-		assert!(
-			start.elapsed() < Duration::from_secs(4),
-			"the raise did not wake the wait"
-		);
-		thread.join().expect("the raiser");
 		Ok(())
 	}
 }

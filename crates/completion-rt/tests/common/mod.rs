@@ -7,13 +7,13 @@
 
 use std::future::Future;
 use std::io;
-use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Once;
+use std::sync::atomic::Ordering::Relaxed;
 use std::task::{Context, Poll, Waker};
 
-use completion_rt::{AsDescriptor, Handle, InFlightState, Op, Reactor, Response, Token};
+use completion_rt::{AsDescriptor, Error, Handle, InFlightState, Op, Reactor, Response, Token};
 
 /// Runs a future to completion on this thread, driving `reactor` while it waits.
 ///
@@ -126,7 +126,7 @@ impl<U> Completion<U> {
 }
 
 impl<U: Unpin> Future for Completion<U> {
-	type Output = (U, io::Result<Response>);
+	type Output = (U, Result<Response, Error>);
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = self.get_mut();
@@ -141,23 +141,12 @@ impl<U: Unpin> Future for Completion<U> {
 }
 
 /// Submits `op` on `handle`; the completion is attributed to the caller's line.
-#[track_caller]
 pub(crate) fn submit<S: AsDescriptor + Send + Sync + 'static>(
 	reactor: &Reactor,
 	handle: &Handle<S>,
 	op: Op,
-) -> io::Result<Completion> {
-	let token = reactor.submit(handle, op, Location::caller(), None)?;
-	Ok(Completion {
-		token,
-		userdata: Some(()),
-	})
-}
-
-/// Waits on the reactor's event; the completion is attributed to the caller's line.
-#[track_caller]
-pub(crate) fn wait_event(reactor: &Reactor) -> io::Result<Completion> {
-	let token = reactor.wait_event(Location::caller())?;
+) -> Result<Completion, Error> {
+	let token = reactor.submit(handle, op)?;
 	Ok(Completion {
 		token,
 		userdata: Some(()),
@@ -170,4 +159,73 @@ pub(crate) fn idle(reactor: &Reactor) -> bool {
 		.in_flight()
 		.iter()
 		.all(|entry| entry.state == InFlightState::Done)
+}
+
+/// Bytes a test binds to a space. Atomic, so the backend may write them through
+/// an iovec while the buffer is shared.
+pub(crate) struct Buffer(std::sync::Arc<[std::sync::atomic::AtomicU8]>);
+
+impl Buffer {
+	/// `len` zeroed bytes.
+	pub(crate) fn new(len: usize) -> Buffer {
+		Buffer::from_slice(&vec![0; len])
+	}
+
+	pub(crate) fn from_slice(bytes: &[u8]) -> Buffer {
+		Buffer(
+			bytes
+				.iter()
+				.map(|&byte| std::sync::atomic::AtomicU8::new(byte))
+				.collect(),
+		)
+	}
+
+	pub(crate) fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	pub(crate) fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
+	/// Copies `out.len()` bytes at `offset` out of the buffer.
+	pub(crate) fn copy_to(&self, offset: usize, out: &mut [u8]) {
+		for (index, byte) in out.iter_mut().enumerate() {
+			*byte = self.0[offset + index].load(Relaxed);
+		}
+	}
+
+	/// Copies `bytes` into the buffer at `offset`.
+	pub(crate) fn copy_from(&self, offset: usize, bytes: &[u8]) {
+		for (index, byte) in bytes.iter().enumerate() {
+			self.0[offset + index].store(*byte, Relaxed);
+		}
+	}
+
+	pub(crate) fn to_vec(&self) -> Vec<u8> {
+		self.0.iter().map(|byte| byte.load(Relaxed)).collect()
+	}
+}
+
+// SAFETY: the bytes are atomics, so a write through the pointer races on bytes
+// only, never on a reference; `iovec` checks the extent against the length.
+unsafe impl completion_rt::Memory for Buffer {
+	fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	fn iovec(&self, extent: completion_rt::Extent) -> io::Result<completion_rt::IoVec> {
+		let end = usize::try_from(extent.offset)
+			.ok()
+			.and_then(|offset| offset.checked_add(extent.len));
+		if !end.is_some_and(|end| end <= self.0.len()) {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"range outside the buffer",
+			));
+		}
+		let base = self.0.as_ptr() as *mut u8;
+		// SAFETY: in bounds, checked above.
+		Ok(unsafe { completion_rt::IoVec::new(base.add(extent.offset as usize), extent.len) })
+	}
 }

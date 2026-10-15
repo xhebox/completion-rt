@@ -1,10 +1,10 @@
 //! Readiness on a descriptor that carries no transfer.
 //!
-//! [`Signal`] is the kind for these: an eventfd, a pidfd, a vhost-user
-//! endpoint. Nothing moves through one, so a wait is the whole operation. A
-//! resource with a transfer has no wait to offer — the backend arms the
-//! readiness itself when a call would block — which the compile-fail cases on
-//! [`Facade`] hold to.
+//! [`Signal`] is a descriptor whose only operation is the wait: an eventfd, a
+//! pidfd, a vhost-user endpoint. Nothing moves through one, so a wait is the
+//! whole operation. A resource with a transfer has no wait to offer — the
+//! backend arms the readiness itself when a call would block — which the
+//! compile-fail cases on [`Facade`] hold to.
 //!
 //! The waits run on a pipe: unix's portable descriptor with two ends, and the
 //! one both ends of which are plain descriptors rather than a socket.

@@ -2,19 +2,16 @@
 
 use std::future::Future;
 use std::io;
-use std::panic::Location;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use completion_rt::{
-	AsDescriptor, Extent, Extents, Handle, Memory, Op as LowOp, OwnedDescriptor, Reactor, Response,
+	AsDescriptor, Handle, Op as LowOp, OwnedDescriptor, OwnedSocket, Reactor, Response,
 };
 
 use crate::completion::{Cancel, Completion, Until, submit};
-use crate::io::{IntoMemory, Lent};
-use crate::kind::{self, ListenerHandle, Resource, SocketKind};
 use crate::outcome::Outcome;
+use crate::space::Span;
 use crate::{Error, Facade};
 
 #[derive(Clone, Copy)]
@@ -70,7 +67,7 @@ impl Call {
 		};
 	}
 
-	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Response>>> {
+	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Response, Error>>> {
 		match std::mem::replace(self, Call::Idle) {
 			Call::Idle => unreachable!("a round is polled only with one in flight"),
 			Call::Plain(mut completion) => match Pin::new(&mut completion).poll(cx) {
@@ -102,27 +99,15 @@ fn short(mode: Mode) -> io::Error {
 	}
 }
 
-pub(super) fn whole(memory: &dyn Memory) -> Extents {
-	Extents::from_slice(&[Extent {
-		offset: 0,
-		len: memory.len(),
-	}])
-}
-
-pub(super) type Submit<S> = Box<
-	dyn Fn(&Reactor, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
-		+ Send
-		+ Sync,
->;
+pub(super) type Submit<S> =
+	Box<dyn Fn(&Reactor, &Handle<S>) -> Result<Completion, Error> + Send + Sync>;
 
 pub(super) struct Flow<'a, S> {
 	handle: Handle<S>,
 	reactor: Reactor,
 	cancel: Option<Cancel>,
 	kind: Kind,
-	memory: Lent<'a>,
-	extents: Extents,
-	origin: &'static Location<'static>,
+	span: Span<'a>,
 	done: usize,
 	control: Control,
 	call: Call,
@@ -131,10 +116,8 @@ pub(super) struct Flow<'a, S> {
 impl<'a, S> Flow<'a, S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
-		origin: &'static Location<'static>,
 		kind: Kind,
-		memory: Lent<'a>,
-		extents: Extents,
+		span: Span<'a>,
 		control: Control,
 	) -> Flow<'a, S> {
 		Self {
@@ -142,9 +125,7 @@ impl<'a, S> Flow<'a, S> {
 			reactor: facade.reactor().clone(),
 			cancel: None,
 			kind,
-			memory,
-			extents,
-			origin,
+			span,
 			done: 0,
 			control,
 			call: Call::idle(),
@@ -172,7 +153,7 @@ impl<S: AsDescriptor + Send + Sync + 'static> Flow<'_, S> {
 	pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
 		loop {
 			if matches!(self.call, Call::Idle) {
-				if self.kind.mode() != Mode::Once && self.done >= self.extents.len_bytes() {
+				if self.kind.mode() != Mode::Once && self.done >= self.span.len() {
 					return Poll::Ready(Ok(()));
 				}
 				if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
@@ -180,7 +161,7 @@ impl<S: AsDescriptor + Send + Sync + 'static> Flow<'_, S> {
 				}
 				match self.submit() {
 					Ok(completion) => self.call.arm(completion, self.cancel.as_ref()),
-					Err(error) => return Poll::Ready(Err(Error::from(error))),
+					Err(error) => return Poll::Ready(Err(error)),
 				}
 			}
 			match self.call.poll(cx) {
@@ -195,42 +176,41 @@ impl<S: AsDescriptor + Send + Sync + 'static> Flow<'_, S> {
 		}
 	}
 
-	fn submit(&mut self) -> io::Result<Completion> {
-		let extents = self.extents.skip(self.done);
+	fn submit(&mut self) -> Result<Completion, Error> {
+		let span = self.span.low();
+		let extents = span.extents().skip(self.done);
 		let shift = self.done as u64;
-		let memory = Arc::clone(&self.memory.memory);
-		let lease = self.memory.lease.as_deref();
+		let space = span.space().clone();
 		let reactor = &self.reactor;
 		let handle = &self.handle;
-		let origin = self.origin;
 		let op = match self.kind {
 			Kind::Read { fdoff } | Kind::ReadAll { fdoff } => LowOp::Read {
 				offset: fdoff + shift,
-				memory,
+				space,
 				extents,
 			},
 			Kind::Write { fdoff } | Kind::WriteAll { fdoff } => LowOp::Write {
 				offset: fdoff + shift,
-				memory,
+				space,
 				extents,
 			},
 			Kind::Recv | Kind::RecvAll => match &mut self.control {
-				Control::In(_) => LowOp::RecvWithFds { memory, extents },
-				_ => LowOp::Recv { memory, extents },
+				Control::In(_) => LowOp::RecvWithFds { space, extents },
+				_ => LowOp::Recv { space, extents },
 			},
 			Kind::Send | Kind::SendAll => match (&mut self.control, self.done) {
 				(Control::Out(fds), 0) => LowOp::SendWithFds {
-					memory,
+					space,
 					extents,
 					fds: std::mem::take(fds),
 				},
-				_ => LowOp::Send { memory, extents },
+				_ => LowOp::Send { space, extents },
 			},
 		};
-		submit(reactor, handle, op, origin, lease)
+		submit(reactor, handle, op)
 	}
 
-	fn landed(&mut self, result: io::Result<Response>) -> Result<bool, Error> {
+	fn landed(&mut self, result: Result<Response, Error>) -> Result<bool, Error> {
 		let response = result?;
 		let (count, fds) = match response {
 			Response::CountWithFds(count, fds) => (count, fds),
@@ -256,7 +236,6 @@ pub(super) struct Gate<S> {
 	reactor: Reactor,
 	cancel: Option<Cancel>,
 	submit: Submit<S>,
-	origin: &'static Location<'static>,
 	response: Option<Response>,
 	call: Call,
 }
@@ -264,18 +243,13 @@ pub(super) struct Gate<S> {
 impl<S> Gate<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
-		origin: &'static Location<'static>,
-		submit: impl Fn(&Reactor, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
-		+ Send
-		+ Sync
-		+ 'static,
+		submit: impl Fn(&Reactor, &Handle<S>) -> Result<Completion, Error> + Send + Sync + 'static,
 	) -> Gate<S> {
 		Self {
 			handle: facade.handle().clone(),
 			reactor: facade.reactor().clone(),
 			cancel: None,
 			submit: Box::new(submit),
-			origin,
 			response: None,
 			call: Call::idle(),
 		}
@@ -298,9 +272,9 @@ impl<S: AsDescriptor + Send + Sync + 'static> Gate<S> {
 				if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
 					return Poll::Ready(Err(Error::cancelled()));
 				}
-				match (self.submit)(&self.reactor, self.origin, &self.handle) {
+				match (self.submit)(&self.reactor, &self.handle) {
 					Ok(completion) => self.call.arm(completion, self.cancel.as_ref()),
-					Err(error) => return Poll::Ready(Err(Error::from(error))),
+					Err(error) => return Poll::Ready(Err(error)),
 				}
 			}
 			match self.call.poll(cx) {
@@ -322,29 +296,21 @@ pub struct Transfer<'a, S> {
 }
 
 impl<'a, S> Transfer<'a, S> {
-	pub(super) fn new(
-		facade: &Facade<S>,
-		origin: &'static Location<'static>,
-		kind: Kind,
-		memory: Lent<'a>,
-		extents: Extents,
-	) -> Transfer<'a, S> {
+	pub(super) fn new(facade: &Facade<S>, kind: Kind, span: Span<'a>) -> Transfer<'a, S> {
 		Self {
-			flow: Flow::new(facade, origin, kind, memory, extents, Control::None),
+			flow: Flow::new(facade, kind, span, Control::None),
 			finished: false,
 		}
 	}
 
 	pub(super) fn with_fds(
 		facade: &Facade<S>,
-		origin: &'static Location<'static>,
 		kind: Kind,
-		memory: Lent<'a>,
-		extents: Extents,
+		span: Span<'a>,
 		fds: Vec<OwnedDescriptor>,
 	) -> Transfer<'a, S> {
 		Self {
-			flow: Flow::new(facade, origin, kind, memory, extents, Control::Out(fds)),
+			flow: Flow::new(facade, kind, span, Control::Out(fds)),
 			finished: false,
 		}
 	}
@@ -395,22 +361,9 @@ pub struct Receive<'a, S> {
 }
 
 impl<'a, S> Receive<'a, S> {
-	pub(super) fn new(
-		facade: &Facade<S>,
-		origin: &'static Location<'static>,
-		kind: Kind,
-		memory: Lent<'a>,
-		extents: Extents,
-	) -> Receive<'a, S> {
+	pub(super) fn new(facade: &Facade<S>, kind: Kind, span: Span<'a>) -> Receive<'a, S> {
 		Self {
-			flow: Flow::new(
-				facade,
-				origin,
-				kind,
-				memory,
-				extents,
-				Control::In(Vec::new()),
-			),
+			flow: Flow::new(facade, kind, span, Control::In(Vec::new())),
 			finished: false,
 		}
 	}
@@ -451,14 +404,10 @@ pub struct Op<S> {
 impl<S> Op<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
-		origin: &'static Location<'static>,
-		submit: impl Fn(&Reactor, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
-		+ Send
-		+ Sync
-		+ 'static,
+		submit: impl Fn(&Reactor, &Handle<S>) -> Result<Completion, Error> + Send + Sync + 'static,
 	) -> Op<S> {
 		Self {
-			gate: Gate::new(facade, origin, submit),
+			gate: Gate::new(facade, submit),
 			finished: false,
 		}
 	}
@@ -501,14 +450,10 @@ pub struct Accept<S> {
 impl<S> Accept<S> {
 	pub(super) fn new(
 		facade: &Facade<S>,
-		origin: &'static Location<'static>,
-		submit: impl Fn(&Reactor, &'static Location<'static>, &Handle<S>) -> io::Result<Completion>
-		+ Send
-		+ Sync
-		+ 'static,
+		submit: impl Fn(&Reactor, &Handle<S>) -> Result<Completion, Error> + Send + Sync + 'static,
 	) -> Accept<S> {
 		Self {
-			gate: Gate::new(facade, origin, submit),
+			gate: Gate::new(facade, submit),
 			finished: false,
 		}
 	}
@@ -551,166 +496,161 @@ impl<S: ListenerHandle> Future for Accept<S> {
 	}
 }
 
-impl<S: Resource> Facade<S>
-where
-	S::Kind: SocketKind,
-{
-	/// Receives into the whole of `mem`, in one call: a short count is what
-	/// arrived, not an error. [`recv_exact`](Facade::recv_exact) loops.
-	#[track_caller]
-	pub fn recv<'a>(&self, mem: impl IntoMemory<'a>) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents = whole(&*mem.memory);
-		Transfer::new(self, Location::caller(), Kind::Recv, mem, extents)
-	}
+/// A resource that sends and receives: one with message boundaries
+/// ([`UdpSocket`](std::net::UdpSocket), `UnixDatagram`) or a byte stream.
+macro_rules! socket {
+	($($resource:ty),* $(,)?) => {
+		$(
+			impl Facade<$resource> {
+				/// Receives into `span`, in one call: a short count is what arrived, not
+				/// an error. [`recv_exact`](Facade::recv_exact) loops.
+				pub fn recv<'a>(&self, span: Span<'a>) -> Transfer<'a, $resource> {
+					Transfer::new(self, Kind::Recv, span)
+				}
 
-	/// Receives into the named ranges of `mem`, in one call.
-	#[track_caller]
-	pub fn recv_vectored<'a>(
-		&self,
-		mem: impl IntoMemory<'a>,
-		ranges: impl IntoIterator<Item = Extent>,
-	) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Location::caller(), Kind::Recv, mem, extents)
-	}
+				/// Receives into `span`, taking the descriptors the control messages
+				/// carry with the bytes.
+				pub fn recv_with_fds<'a>(&self, span: Span<'a>) -> Receive<'a, $resource> {
+					Receive::new(self, Kind::Recv, span)
+				}
 
-	/// Receives into the whole of `mem`, taking the descriptors the control
-	/// messages carry with the bytes.
-	#[track_caller]
-	pub fn recv_with_fds<'a>(&self, mem: impl IntoMemory<'a>) -> Receive<'a, S> {
-		let mem = mem.into_memory();
-		let extents = whole(&*mem.memory);
-		Receive::new(self, Location::caller(), Kind::Recv, mem, extents)
-	}
+				/// Sends `span`, in one call: a short count is what the call took, not an
+				/// error. [`send_all`](Facade::send_all) loops.
+				pub fn send<'a>(&self, span: Span<'a>) -> Transfer<'a, $resource> {
+					Transfer::new(self, Kind::Send, span)
+				}
 
-	/// Sends the whole of `mem`, in one call: a short count is what the call
-	/// took, not an error. [`send_all`](Facade::send_all) loops.
-	#[track_caller]
-	pub fn send<'a>(&self, mem: impl IntoMemory<'a>) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents = whole(&*mem.memory);
-		Transfer::new(self, Location::caller(), Kind::Send, mem, extents)
-	}
+				/// Sends `span`, carrying `fds` with the bytes.
+				///
+				/// One call carries the descriptors; see
+				/// [`send_all_with_fds`](Facade::send_all_with_fds) for a send that loops.
+				pub fn send_with_fds<'a>(
+					&self,
+					span: Span<'a>,
+					fds: Vec<OwnedDescriptor>,
+				) -> Transfer<'a, $resource> {
+					Transfer::with_fds(self, Kind::Send, span, fds)
+				}
 
-	/// Sends the named ranges of `mem`, in one call.
-	#[track_caller]
-	pub fn send_vectored<'a>(
-		&self,
-		mem: impl IntoMemory<'a>,
-		ranges: impl IntoIterator<Item = Extent>,
-	) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Location::caller(), Kind::Send, mem, extents)
-	}
-
-	/// Sends the whole of `mem`, carrying `fds` with the bytes.
-	///
-	/// One call carries the descriptors; see
-	/// [`send_all_with_fds`](Facade::send_all_with_fds) for a send that loops.
-	#[track_caller]
-	pub fn send_with_fds<'a>(
-		&self,
-		mem: impl IntoMemory<'a>,
-		fds: Vec<OwnedDescriptor>,
-	) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents = whole(&*mem.memory);
-		Transfer::with_fds(self, Location::caller(), Kind::Send, mem, extents, fds)
-	}
-
-	/// Takes and clears the socket's pending error. Failure to read the error is returned as the outer `Err`.
-	pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-		imp::take_error((**self.handle()).as_descriptor())
-	}
+				/// Takes and clears the socket's pending error. Failure to read the error is returned as the outer `Err`.
+				pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+					imp::take_error((**self.handle()).as_descriptor())
+				}
+			}
+		)*
+	};
 }
 
-impl<S: Resource<Kind = kind::Stream>> Facade<S> {
-	/// Receives into the whole of `mem`, over as many calls as it takes to fill
-	/// it.
-	///
-	/// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) when the peer closes
-	/// first.
-	#[track_caller]
-	pub fn recv_exact<'a>(&self, mem: impl IntoMemory<'a>) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents = whole(&*mem.memory);
-		Transfer::new(self, Location::caller(), Kind::RecvAll, mem, extents)
-	}
+socket!(std::net::UdpSocket, std::net::TcpStream,);
 
-	/// Receives into the named ranges of `mem`, over as many calls as it takes
-	/// to fill them.
-	#[track_caller]
-	pub fn recv_exact_vectored<'a>(
-		&self,
-		mem: impl IntoMemory<'a>,
-		ranges: impl IntoIterator<Item = Extent>,
-	) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Location::caller(), Kind::RecvAll, mem, extents)
-	}
+#[cfg(unix)]
+socket!(
+	std::os::unix::net::UnixDatagram,
+	std::os::unix::net::UnixStream,
+);
 
-	/// [`recv_with_fds`](Facade::recv_with_fds) over as many calls as it takes
-	/// to fill `mem`, gathering the descriptors every call brings.
-	#[track_caller]
-	pub fn recv_exact_with_fds<'a>(&self, mem: impl IntoMemory<'a>) -> Receive<'a, S> {
-		let mem = mem.into_memory();
-		let extents = whole(&*mem.memory);
-		Receive::new(self, Location::caller(), Kind::RecvAll, mem, extents)
-	}
+#[cfg(windows)]
+socket!(completion_rt::OwnedSocket);
 
-	/// Sends the whole of `mem`, over as many calls as it takes.
-	///
-	/// [`WriteZero`](std::io::ErrorKind::WriteZero) when a call takes nothing.
-	#[track_caller]
-	pub fn send_all<'a>(&self, mem: impl IntoMemory<'a>) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents = whole(&*mem.memory);
-		Transfer::new(self, Location::caller(), Kind::SendAll, mem, extents)
-	}
+/// A byte-stream socket: the same sends and receives a datagram has, over as
+/// many calls as it takes to move everything, plus `shutdown`.
+macro_rules! stream {
+	($($resource:ty),* $(,)?) => {
+		$(
+			impl Facade<$resource> {
+				/// Receives into `span`, over as many calls as it takes to fill it.
+				///
+				/// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) when the peer closes
+				/// first.
+				pub fn recv_exact<'a>(&self, span: Span<'a>) -> Transfer<'a, $resource> {
+					Transfer::new(self, Kind::RecvAll, span)
+				}
 
-	/// Sends the named ranges of `mem`, over as many calls as it takes.
-	#[track_caller]
-	pub fn send_all_vectored<'a>(
-		&self,
-		mem: impl IntoMemory<'a>,
-		ranges: impl IntoIterator<Item = Extent>,
-	) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents: Extents = ranges.into_iter().collect();
-		Transfer::new(self, Location::caller(), Kind::SendAll, mem, extents)
-	}
+				/// [`recv_with_fds`](Facade::recv_with_fds) over as many calls as it takes
+				/// to fill `span`, gathering the descriptors every call brings.
+				pub fn recv_exact_with_fds<'a>(&self, span: Span<'a>) -> Receive<'a, $resource> {
+					Receive::new(self, Kind::RecvAll, span)
+				}
 
-	/// Sends all of `mem`, attaching `fds` only to the first call's bytes.
-	#[track_caller]
-	pub fn send_all_with_fds<'a>(
-		&self,
-		mem: impl IntoMemory<'a>,
-		fds: Vec<OwnedDescriptor>,
-	) -> Transfer<'a, S> {
-		let mem = mem.into_memory();
-		let extents = whole(&*mem.memory);
-		Transfer::with_fds(self, Location::caller(), Kind::SendAll, mem, extents, fds)
-	}
+				/// Sends `span`, over as many calls as it takes.
+				///
+				/// [`WriteZero`](std::io::ErrorKind::WriteZero) when a call takes nothing.
+				pub fn send_all<'a>(&self, span: Span<'a>) -> Transfer<'a, $resource> {
+					Transfer::new(self, Kind::SendAll, span)
+				}
 
-	/// Shuts down one or both directions. `Write` sends EOF to the peer without closing the receive side.
-	pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-		imp::shutdown((**self.handle()).as_descriptor(), how)
-	}
+				/// Sends all of `span`, attaching `fds` only to the first call's bytes.
+				pub fn send_all_with_fds<'a>(
+					&self,
+					span: Span<'a>,
+					fds: Vec<OwnedDescriptor>,
+				) -> Transfer<'a, $resource> {
+					Transfer::with_fds(self, Kind::SendAll, span, fds)
+				}
+
+				/// Shuts down one or both directions. `Write` sends EOF to the peer without closing the receive side.
+				pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+					imp::shutdown((**self.handle()).as_descriptor(), how)
+				}
+
+				/// Resolves once the connection is gone both ways, or has failed.
+				///
+				/// A peer that shut only its write side has not hung up: the stream
+				/// still takes sends. On TCP a peer's close arrives as that same
+				/// half-close, so the hangup comes once this side shuts its write
+				/// side too, or the connection resets. io_uring only; the other
+				/// backends fail it with [`Unsupported`](std::io::ErrorKind::Unsupported).
+				pub fn hangup(&self) -> Op<$resource> {
+					Op::new(self, |reactor, handle| {
+						submit(reactor, handle, LowOp::Hangup)
+					})
+				}
+			}
+		)*
+	};
 }
 
-impl<S: ListenerHandle> Facade<S> {
-	/// Takes the next connection in: the stream it made, in a facade of its own.
-	#[track_caller]
-	pub fn accept(&self) -> Accept<S> {
-		Accept::new(self, Location::caller(), |reactor, origin, handle| {
-			submit(reactor, handle, LowOp::Accept, origin, None)
-		})
-	}
+stream!(std::net::TcpStream);
+
+#[cfg(unix)]
+stream!(std::os::unix::net::UnixStream);
+
+/// A listening socket whose accepted connections have a type of their own.
+///
+/// Implementing this is what gives a listener [`Facade::accept`]; the stream it
+/// yields is the associated type, so an accepted connection is a facade over
+/// the concrete socket type rather than one the caller narrows.
+pub trait ListenerHandle: AsDescriptor + Send + Sync + 'static {
+	type Stream: AsDescriptor + Send + Sync + 'static + From<OwnedSocket>;
 }
+
+impl ListenerHandle for std::net::TcpListener {
+	type Stream = std::net::TcpStream;
+}
+
+#[cfg(unix)]
+impl ListenerHandle for std::os::unix::net::UnixListener {
+	type Stream = std::os::unix::net::UnixStream;
+}
+
+/// A listener takes the next connection in.
+macro_rules! listener {
+	($($resource:ty),* $(,)?) => {$(
+		impl Facade<$resource> {
+			/// Takes the next connection in: the stream it made, in a facade of its own.
+			pub fn accept(&self) -> Accept<$resource> {
+				Accept::new(self, |reactor, handle| {
+					submit(reactor, handle, LowOp::Accept)
+				})
+			}
+		}
+	)*};
+}
+
+listener!(std::net::TcpListener);
+
+#[cfg(unix)]
+listener!(std::os::unix::net::UnixListener);
 
 #[cfg(unix)]
 mod imp {

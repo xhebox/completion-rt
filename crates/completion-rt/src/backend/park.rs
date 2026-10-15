@@ -1,55 +1,61 @@
 //! One wake protocol for the reactor.
 //!
-//! The state word and the doorbell stand in for the futex behind
-//! `std::thread::{park, unpark}`: a wake flips the word, or rings the doorbell
-//! when the reactor has already gone to sleep in the backend.
+//! The state word stands in for the futex behind `std::thread::{park, unpark}`:
+//! a wake flips the word, and rings the backend's doorbell when a park has gone
+//! to sleep in the backend.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::event::Event;
+/// What wakes a park that is asleep in its backend: the backend's own
+/// primitive, rung on the park's state word.
+pub(crate) trait Doorbell: Send + Sync {
+	/// Wakes the sleeping park. `word` is the park's state word, just set to
+	/// the notified value.
+	fn ring(&self, word: &AtomicU32);
+}
 
 /// No park is outstanding.
 const EMPTY: u32 = 0;
 /// A park is between its compare-exchange and its return.
-const PARKED: u32 = 1;
+pub(crate) const PARKED: u32 = 1;
 /// A wake arrived with no park to take it.
 const NOTIFIED: u32 = 2;
 
 /// The reactor's single wake protocol.
 pub(crate) struct Park {
 	state: AtomicU32,
-	doorbell: Event,
-	/// An embedded reactor never parks inside the reactor — an external poller
-	/// waits on `poll_fd` — so the state never reaches `PARKED` and every
-	/// unpark has to ring the doorbell.
-	external: bool,
+	doorbell: Arc<dyn Doorbell>,
 }
 
 impl Park {
-	pub(crate) fn new(doorbell: Event, external: bool) -> Park {
+	pub(crate) fn new(doorbell: Arc<dyn Doorbell>) -> Park {
 		Self {
 			state: AtomicU32::new(EMPTY),
 			doorbell,
-			external,
 		}
+	}
+
+	/// The word a futex-waiting backend sleeps on: it waits while the word is
+	/// [`PARKED`]. Only a futex-waiting backend reads it.
+	#[allow(dead_code)]
+	pub(crate) fn state(&self) -> &AtomicU32 {
+		&self.state
 	}
 
 	/// Raises a wake for the reactor.
 	pub(crate) fn unpark(&self) {
-		if self.external {
-			let _ = self.doorbell.notify();
-			return;
-		}
-		// Only a park that has gone to sleep needs the doorbell: one taken by
-		// the failed compare-exchange in `park` is left in the state word.
+		// Only a park that has gone to sleep needs waking: one taken by the
+		// failed compare-exchange in `park` is left in the state word.
 		if self.state.swap(NOTIFIED, Ordering::AcqRel) == PARKED {
-			let _ = self.doorbell.notify();
+			self.doorbell.ring(&self.state);
 		}
 	}
 
 	/// Whether a wake is pending, for a backend that spins instead of waiting.
-	#[cfg(target_os = "linux")]
+	/// Only an IOPOLL ring reads it.
+	#[allow(dead_code)]
 	pub(crate) fn woke(&self) -> bool {
 		self.state.load(Ordering::Acquire) == NOTIFIED
 	}

@@ -6,20 +6,20 @@ use std::mem::{MaybeUninit, size_of};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::task::{Context, Poll as TaskPoll, Wake, Waker};
 use std::time::Duration;
 
 use blocking::{Task, unblock};
 use polling::{Event as Ready, Events, Poller};
 
-use crate::core::Response;
+use super::park::{Doorbell, Park};
+use crate::OwnedDescriptor;
 use crate::desc::{RawHandle, from_raw_socket};
-use crate::event::Event as Wakeup;
-use crate::memory::Extents;
-use crate::park::Park;
-use crate::{Memory, OwnedDescriptor};
+use crate::error::Error;
+use crate::memory::IoVecs;
 
-use super::Backend;
+use super::{Backend, Response};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Direction {
@@ -52,26 +52,11 @@ struct Job {
 }
 
 enum Work {
-	Read {
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	},
-	Write {
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	},
-	Recv {
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	},
-	RecvWithFds {
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	},
-	Send {
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	},
+	Read { buffers: IoVecs },
+	Write { buffers: IoVecs },
+	Recv { buffers: IoVecs },
+	RecvWithFds { buffers: IoVecs },
+	Send { buffers: IoVecs },
 	Accept,
 }
 
@@ -87,11 +72,12 @@ struct Poll {
 	direction: Direction,
 }
 
-/// A pool job's wake rings the same doorbell the reactor's `Park` holds — the
-/// `Wakeup` `Portable::new` returns, which the reactor hands to its `Park`.
-/// It does not go through `Park::unpark`: a finished job only needs the reactor
-/// to reap it, not the executor to tick.
-struct PoolWake(Wakeup);
+/// A pool job's wake rings the same doorbell the reactor's `Park` holds, the
+/// poller. It does not go through `Park::unpark`: a finished job only needs the
+/// reactor to reap it, not the executor to tick. A notify that a zero-timeout
+/// wait takes instead loses nothing, since every poll collects the pool after
+/// its wait.
+struct PoolWake(Arc<Poller>);
 
 impl Wake for PoolWake {
 	fn wake(self: Arc<Self>) {
@@ -103,9 +89,16 @@ impl Wake for PoolWake {
 	}
 }
 
+impl Doorbell for Poller {
+	fn ring(&self, _word: &AtomicU32) {
+		if let Err(error) = self.notify() {
+			log::warn!(error:%; "the poller refused a wake");
+		}
+	}
+}
+
 pub(crate) struct Portable {
-	poller: Poller,
-	event: Wakeup,
+	poller: Arc<Poller>,
 	readers: HashMap<RawHandle, HashSet<u64>>,
 	writers: HashMap<RawHandle, HashSet<u64>>,
 	keys: HashMap<RawHandle, usize>,
@@ -118,28 +111,20 @@ pub(crate) struct Portable {
 	waker: Waker,
 	events: Events,
 	scratch: Vec<Ready>,
-	done: VecDeque<(u64, io::Result<Response>)>,
+	done: VecDeque<(u64, Result<Response, Error>)>,
 }
 
 impl Portable {
-	pub(super) fn new(config: &super::Config, embedded: bool) -> io::Result<(Portable, Wakeup)> {
+	pub(super) fn new(config: &super::Config) -> io::Result<Portable> {
 		if config.iopoll || config.sqpoll {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
 				"this backend has no IOPOLL or SQPOLL mode",
 			));
 		}
-		if embedded {
-			return Err(io::Error::new(
-				io::ErrorKind::Unsupported,
-				"a poller has no descriptor a foreign poller can wait on",
-			));
-		}
-		let poller = Poller::new()?;
-		let event = Wakeup::new()?;
-		let mut backend = Portable {
-			poller,
-			event: event.clone(),
+		let poller = Arc::new(Poller::new()?);
+		Ok(Portable {
+			poller: Arc::clone(&poller),
 			readers: HashMap::new(),
 			writers: HashMap::new(),
 			keys: HashMap::new(),
@@ -149,15 +134,18 @@ impl Portable {
 			ops: HashMap::new(),
 			polls: HashMap::new(),
 			pool: HashMap::new(),
-			waker: Waker::from(Arc::new(PoolWake(event.clone()))),
+			waker: Waker::from(Arc::new(PoolWake(poller))),
 			events: Events::with_capacity(NonZeroUsize::new(EVENTS).expect("a nonzero capacity")),
 			scratch: Vec::with_capacity(EVENTS),
 			done: VecDeque::new(),
-		};
-		let fd = event.handle();
-		backend.readers.entry(fd).or_default();
-		backend.arm(fd)?;
-		Ok((backend, event))
+		})
+	}
+
+	fn land(&mut self, out: Vec<(u64, io::Result<Response>)>) {
+		self.done.extend(
+			out.into_iter()
+				.map(|(id, result)| (id, result.map_err(Error::from))),
+		);
 	}
 
 	fn arm(&mut self, fd: RawHandle) -> io::Result<()> {
@@ -239,7 +227,7 @@ impl Portable {
 
 	fn rearm(&mut self, fd: RawHandle) -> io::Result<()> {
 		let waited = self.readers.contains_key(&fd) || self.writers.contains_key(&fd);
-		if waited || fd == self.event.handle() {
+		if waited {
 			self.arm(fd)
 		} else if let Some(key) = self.keys.remove(&fd) {
 			self.sources.remove(&key);
@@ -254,25 +242,10 @@ impl Portable {
 		}
 	}
 
-	/// Only a wait may drain the wake-up; otherwise a concurrent notification could be lost.
-	fn drain_wakeup(&self) -> io::Result<()> {
-		let fd = unsafe { BorrowedFd::borrow_raw(self.event.handle().as_raw_fd()) };
-		let mut buf = [0u8; 64];
-		loop {
-			match rustix::io::read(fd, &mut buf) {
-				Ok(_) => continue,
-				Err(rustix::io::Errno::AGAIN) => return Ok(()),
-				Err(rustix::io::Errno::INTR) => continue,
-				Err(error) => return Err(error.into()),
-			}
-		}
-	}
-
 	fn deliver(
 		&mut self,
 		event: &Ready,
 		out: &mut Vec<(u64, io::Result<Response>)>,
-		waited: bool,
 	) -> io::Result<()> {
 		let Some(fd) = self.sources.get(&event.key).copied() else {
 			return Ok(());
@@ -290,9 +263,6 @@ impl Portable {
 		}
 		for token in tokens {
 			self.ready(token, out)?;
-		}
-		if fd == self.event.handle() && waited {
-			self.drain_wakeup()?;
 		}
 		Ok(())
 	}
@@ -332,14 +302,13 @@ impl Portable {
 		fd: RawHandle,
 		fdoff: u64,
 		kind: Kind,
-		memory: Option<Arc<dyn Memory>>,
-		extents: Extents,
+		buffers: IoVecs,
 	) -> io::Result<()> {
-		if matches!(kind, Kind::Read | Kind::Write) && extents.is_empty() {
+		if matches!(kind, Kind::Read | Kind::Write) && buffers.is_empty() {
 			self.done.push_back((token, Ok(Response::Count(0))));
 			return Ok(());
 		}
-		let task = unblock(move || (token, run_file(fd, fdoff, kind, memory, extents)));
+		let task = unblock(move || (token, run_file(fd, fdoff, kind, buffers)));
 		self.pool.insert(token, Job { task });
 		Ok(())
 	}
@@ -410,43 +379,29 @@ impl Drop for Portable {
 }
 
 impl Backend for Portable {
-	fn read(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		fdoff: u64,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
+	fn read(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
 		if takes_pool(fd) {
-			self.submit_pool(id, fd, fdoff, Kind::Read, Some(memory), extents)
+			self.submit_pool(id, fd, fdoff, Kind::Read, buffers)
 		} else {
 			self.submit_op(
 				id,
 				fd,
 				Direction::Readable,
-				Work::Read { memory, extents },
+				Work::Read { buffers },
 				Vec::new(),
 			)
 		}
 	}
 
-	fn write(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		fdoff: u64,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
+	fn write(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
 		if takes_pool(fd) {
-			self.submit_pool(id, fd, fdoff, Kind::Write, Some(memory), extents)
+			self.submit_pool(id, fd, fdoff, Kind::Write, buffers)
 		} else {
 			self.submit_op(
 				id,
 				fd,
 				Direction::Writable,
-				Work::Write { memory, extents },
+				Work::Write { buffers },
 				Vec::new(),
 			)
 		}
@@ -454,86 +409,61 @@ impl Backend for Portable {
 
 	fn fsync(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
 		if takes_pool(fd) {
-			return self.submit_pool(id, fd, 0, Kind::Fsync, None, Extents::new());
+			return self.submit_pool(id, fd, 0, Kind::Fsync, IoVecs::new());
 		}
 		let result = rustix::fs::fsync(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
 			.map(|()| Response::Done)
 			.map_err(io::Error::from);
-		self.done.push_back((id, result));
+		self.done.push_back((id, result.map_err(Error::from)));
 		Ok(())
 	}
 
 	fn allocate(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()> {
 		debug_assert!(takes_pool(fd), "only a file is allocated");
-		self.submit_pool(
-			id,
-			fd,
-			0,
-			Kind::Allocate { offset, len },
-			None,
-			Extents::new(),
-		)
+		self.submit_pool(id, fd, 0, Kind::Allocate { offset, len }, IoVecs::new())
 	}
 
 	fn punch(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()> {
 		debug_assert!(takes_pool(fd), "only a file is punched");
-		self.submit_pool(id, fd, 0, Kind::Punch { offset, len }, None, Extents::new())
+		self.submit_pool(id, fd, 0, Kind::Punch { offset, len }, IoVecs::new())
 	}
 
 	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
 		if takes_pool(fd) {
-			return self.submit_pool(id, fd, 0, Kind::Flush, None, Extents::new());
+			return self.submit_pool(id, fd, 0, Kind::Flush, IoVecs::new());
 		}
 		let result = flush_handle(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
 			.map(|()| Response::Done);
-		self.done.push_back((id, result));
+		self.done.push_back((id, result.map_err(Error::from)));
 		Ok(())
 	}
 
-	fn recv(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
+	fn recv(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
 		self.submit_op(
 			id,
 			fd,
 			Direction::Readable,
-			Work::Recv { memory, extents },
+			Work::Recv { buffers },
 			Vec::new(),
 		)
 	}
 
-	fn recv_with_fds(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
+	fn recv_with_fds(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
 		self.submit_op(
 			id,
 			fd,
 			Direction::Readable,
-			Work::RecvWithFds { memory, extents },
+			Work::RecvWithFds { buffers },
 			Vec::new(),
 		)
 	}
 
-	fn send(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
+	fn send(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
 		self.submit_op(
 			id,
 			fd,
 			Direction::Writable,
-			Work::Send { memory, extents },
+			Work::Send { buffers },
 			Vec::new(),
 		)
 	}
@@ -542,17 +472,10 @@ impl Backend for Portable {
 		&mut self,
 		id: u64,
 		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
+		buffers: IoVecs,
 		fds: Vec<OwnedDescriptor>,
 	) -> io::Result<()> {
-		self.submit_op(
-			id,
-			fd,
-			Direction::Writable,
-			Work::Send { memory, extents },
-			fds,
-		)
+		self.submit_op(id, fd, Direction::Writable, Work::Send { buffers }, fds)
 	}
 
 	fn accept(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
@@ -593,6 +516,15 @@ impl Backend for Portable {
 		}
 	}
 
+	/// `polling`'s interrupt interest is a no-op on kqueue, and its events carry
+	/// no `EV_EOF`, so a peer gone cannot be told from one that half-closed.
+	fn hangup(&mut self, _id: u64, _fd: RawHandle) -> io::Result<()> {
+		Err(io::Error::new(
+			io::ErrorKind::Unsupported,
+			"this backend cannot wait for a hangup",
+		))
+	}
+
 	fn cancel(&mut self, id: u64) {
 		if self.pool.contains_key(&id) {
 			// A worker already inside a syscall must finish before its buffers can be released.
@@ -605,20 +537,18 @@ impl Backend for Portable {
 		} else {
 			return;
 		}
-		self.done
-			.push_back((id, Err(rustix::io::Errno::CANCELED.into())));
+		self.done.push_back((id, Err(Error::cancelled())));
 	}
 
 	fn poll(&mut self, timeout: Option<Duration>, _park: &Park) -> io::Result<u64> {
 		if let Some((id, _)) = self.done.front() {
 			return Ok(*id);
 		}
-		let waited = timeout != Some(Duration::ZERO);
 		let mut out = Vec::new();
 		// Collect finished jobs before sleeping so their completions do not wait for the timeout.
 		self.collect_pool(&mut out);
 		if !out.is_empty() {
-			self.done.extend(out);
+			self.land(out);
 			return Ok(self.done.front().expect("just pushed").0);
 		}
 		self.events.clear();
@@ -628,43 +558,36 @@ impl Backend for Portable {
 		batch.extend(self.events.iter());
 		let result = batch
 			.iter()
-			.try_for_each(|event| self.deliver(event, &mut out, waited));
+			.try_for_each(|event| self.deliver(event, &mut out));
 		self.scratch = batch;
 		result?;
 		self.collect_pool(&mut out);
-		self.done.extend(out);
+		self.land(out);
 		match self.done.front() {
 			Some((id, _)) => Ok(*id),
 			None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
 		}
 	}
 
-	fn take(&mut self, id: u64) -> io::Result<Response> {
+	fn take(&mut self, id: u64) -> Result<Response, Error> {
 		match self.done.pop_front() {
 			Some((found, response)) if found == id => response,
 			Some((found, response)) => {
 				self.done.push_front((found, response));
-				Err(io::Error::other(format!(
+				Err(Error::from(io::Error::other(format!(
 					"take({id}) found a completion for {found}"
-				)))
+				))))
 			}
-			None => Err(io::Error::new(
+			None => Err(Error::from(io::Error::new(
 				io::ErrorKind::NotFound,
 				"no completion to take",
-			)),
+			))),
 		}
 	}
 
-	fn poll_fd(&self) -> io::Result<Wakeup> {
-		Err(io::Error::new(
-			io::ErrorKind::Unsupported,
-			"a poller is not a descriptor a foreign poller can wait on",
-		))
+	fn doorbell(&self) -> Arc<dyn Doorbell> {
+		self.poller.clone()
 	}
-}
-
-pub(super) fn cancelled(error: &io::Error) -> bool {
-	error.raw_os_error() == Some(rustix::io::Errno::CANCELED.raw_os_error())
 }
 
 fn takes_pool(fd: RawHandle) -> bool {
@@ -674,13 +597,7 @@ fn takes_pool(fd: RawHandle) -> bool {
 	rustix::fs::FileType::from_raw_mode(stat.st_mode as _) == rustix::fs::FileType::RegularFile
 }
 
-fn run_file(
-	fd: RawHandle,
-	fdoff: u64,
-	kind: Kind,
-	memory: Option<Arc<dyn crate::Memory>>,
-	extents: Extents,
-) -> io::Result<Response> {
+fn run_file(fd: RawHandle, fdoff: u64, kind: Kind, buffers: IoVecs) -> io::Result<Response> {
 	let fd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
 	match kind {
 		Kind::Fsync => rustix::fs::fsync(fd)
@@ -690,12 +607,10 @@ fn run_file(
 		Kind::Allocate { offset, len } => allocate(fd, offset, len).map(|()| Response::Done),
 		Kind::Punch { offset, len } => punch(fd, offset, len).map(|()| Response::Done),
 		Kind::Read | Kind::Write => {
-			let memory = memory.expect("a transfer carries its memory");
-			let spans = crate::memory::spans(&memory, &extents)?;
-			let Some(span) = spans.first() else {
+			let Some(span) = buffers.first() else {
 				return Ok(Response::Count(0));
 			};
-			// SAFETY: the job retains the memory backing this span; the syscall copies through its pointer without forming a Rust reference.
+			// SAFETY: the reactor holds the memory backing this iovec until the job lands; the syscall copies through its pointer without forming a Rust reference.
 			let offset = fdoff as libc::off_t;
 			count(unsafe {
 				match kind {
@@ -881,21 +796,21 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 	// SAFETY: the descriptor stays open for the operation's flight.
 	let fd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
 	match work {
-		Work::Read { memory, extents } => {
-			let Some((ptr, len)) = first_buffer(memory, extents)? else {
+		Work::Read { buffers } => {
+			let Some((ptr, len)) = first_buffer(buffers) else {
 				return Ok(Progress::Done(Response::Count(0)));
 			};
-			// SAFETY: the operation retains the memory backing this pointer until the syscall returns.
+			// SAFETY: the reactor holds the memory backing this pointer until the operation lands.
 			match call(unsafe { libc::read(fd.as_raw_fd(), ptr.cast(), len) })? {
 				Call::Bytes(count) => Ok(Progress::Done(Response::Count(count))),
 				Call::Blocked => Ok(Progress::Blocked),
 			}
 		}
-		Work::Write { memory, extents } => {
-			let Some((ptr, len)) = first_buffer(memory, extents)? else {
+		Work::Write { buffers } => {
+			let Some((ptr, len)) = first_buffer(buffers) else {
 				return Ok(Progress::Done(Response::Count(0)));
 			};
-			// SAFETY: the operation retains the memory backing this pointer until the syscall returns.
+			// SAFETY: the reactor holds the memory backing this pointer until the operation lands.
 			match call(unsafe { libc::write(fd.as_raw_fd(), ptr.cast(), len) })? {
 				Call::Bytes(count) => Ok(Progress::Done(Response::Count(count))),
 				Call::Blocked => Ok(Progress::Blocked),
@@ -916,16 +831,16 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 			Err(rustix::io::Errno::AGAIN) => Ok(Progress::Blocked),
 			Err(error) => Err(error.into()),
 		},
-		Work::Recv { memory, extents } => {
-			let (ptr, len) = one_buffer(memory, extents)?;
+		Work::Recv { buffers } => {
+			let (ptr, len) = one_buffer(buffers)?;
 			match call(unsafe { libc::recv(fd.as_raw_fd(), ptr.cast(), len, libc::MSG_DONTWAIT) })?
 			{
 				Call::Bytes(count) => Ok(Progress::Done(Response::Count(count))),
 				Call::Blocked => Ok(Progress::Blocked),
 			}
 		}
-		Work::RecvWithFds { memory, extents } => {
-			let (ptr, len) = one_buffer(memory, extents)?;
+		Work::RecvWithFds { buffers } => {
+			let (ptr, len) = one_buffer(buffers)?;
 			let mut iov = libc::iovec {
 				iov_base: ptr.cast(),
 				iov_len: len,
@@ -947,8 +862,8 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 				Call::Blocked => Ok(Progress::Blocked),
 			}
 		}
-		Work::Send { memory, extents } => {
-			let (ptr, len) = one_buffer(memory, extents)?;
+		Work::Send { buffers } => {
+			let (ptr, len) = one_buffer(buffers)?;
 			let carried: Vec<libc::c_int> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
 			let result = if carried.is_empty() {
 				call(unsafe { libc::send(fd.as_raw_fd(), ptr.cast(), len, libc::MSG_DONTWAIT) })
@@ -990,8 +905,7 @@ fn run_op(op: &mut Op) -> io::Result<Progress> {
 	}
 }
 
-fn one_buffer(memory: &Arc<dyn Memory>, extents: &Extents) -> io::Result<(*mut u8, usize)> {
-	let buffers = crate::memory::spans(memory, extents)?;
+fn one_buffer(buffers: &IoVecs) -> io::Result<(*mut u8, usize)> {
 	let [buf] = buffers.as_slice() else {
 		return Err(io::Error::new(
 			io::ErrorKind::Unsupported,
@@ -1001,12 +915,8 @@ fn one_buffer(memory: &Arc<dyn Memory>, extents: &Extents) -> io::Result<(*mut u
 	Ok((buf.as_ptr(), buf.len()))
 }
 
-fn first_buffer(
-	memory: &Arc<dyn Memory>,
-	extents: &Extents,
-) -> io::Result<Option<(*mut u8, usize)>> {
-	let buffers = crate::memory::spans(memory, extents)?;
-	Ok(buffers.first().map(|buf| (buf.as_ptr(), buf.len())))
+fn first_buffer(buffers: &IoVecs) -> Option<(*mut u8, usize)> {
+	buffers.first().map(|buf| (buf.as_ptr(), buf.len()))
 }
 
 fn take_fds(msg: &libc::msghdr, out: &mut Vec<OwnedDescriptor>) {
@@ -1040,7 +950,7 @@ mod tests {
 	/// Closed-descriptor deregistration differs by poller: epoll may reject it, while kqueue may have removed it already. Either outcome must discard the registration.
 	#[test]
 	fn a_deregistration_of_a_closed_descriptor_leaves_no_key_behind() {
-		let (mut backend, _event) = Portable::new(&Config::default(), false).unwrap();
+		let mut backend = Portable::new(&Config::default()).unwrap();
 		let (reader, _writer) = std::io::pipe().unwrap();
 		let token = 7;
 		let fd = RawHandle::from_descriptor(reader.as_descriptor());
@@ -1062,7 +972,7 @@ mod tests {
 	/// Simulate a poller that lost the source before deregistration; stale readiness must not retain or dispatch the old key.
 	#[test]
 	fn a_refused_deregistration_leaves_no_key_behind() {
-		let (mut backend, _event) = Portable::new(&Config::default(), false).unwrap();
+		let mut backend = Portable::new(&Config::default()).unwrap();
 		let (reader, _writer) = std::io::pipe().unwrap();
 		let token = 7;
 		let fd = RawHandle::from_descriptor(reader.as_descriptor());

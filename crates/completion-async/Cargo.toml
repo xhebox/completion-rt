@@ -9,6 +9,7 @@ repository = "https://github.com/xhebox/completion-rt"
 
 [dependencies]
 completion-rt = { path = "../completion-rt" }
+fastrace = "0.7.19"
 log ={ version = "0.4.34", features = ["std", "kv"] }
 
 [target.'cfg(unix)'.dependencies]

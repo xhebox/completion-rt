@@ -1,6 +1,5 @@
 //! Socket operations that need the reactor driven by hand: an accept whose
-//! landed result is never taken, a receive or take observed between passes, and
-//! the origin a submission reports.
+//! landed result is never taken, and a receive or take observed between passes.
 //!
 //! These drive `Reactor::poll` themselves — a bounded pass to put an operation
 //! in flight, a `ZERO` poll to hand one to the kernel, an `in_flight` snapshot to know it
@@ -8,39 +7,20 @@
 //! exposes. The tests that only move bytes through the facade live with the
 //! high crate.
 
+#![cfg(unix)]
+
 mod common;
 
 use common::submit;
 
-#[cfg(unix)]
-use std::io::Read;
-use std::net::{TcpListener, TcpStream};
 use std::pin::pin;
-use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use completion_rt::{Config, Extent, Extents, Handle, Memory, Op, Reactor};
+use completion_rt::{Config, Handle, Op, Reactor};
 
-/// A connected pair over loopback: the portable way to two real sockets.
-fn pair() -> (TcpStream, TcpStream) {
-	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-	let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-	let (server, _) = listener.accept().unwrap();
-	(client, server)
-}
-
-fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
-	let memory: Arc<dyn Memory> = buf.clone();
-	memory
-}
-
-fn whole(buf: &Arc<Vec<u8>>) -> Extents {
-	Extents::from_slice(&[Extent {
-		offset: 0,
-		len: buf.len(),
-	}])
-}
+#[cfg(unix)]
+use std::io::Read;
 
 /// A listener to connect to inside `directory`, and the path its socket lives
 /// at.
@@ -203,60 +183,4 @@ fn a_cancelled_accept_that_succeeded_closes_its_socket() {
 	}
 
 	drive_until_the_connection_ends(&reactor, &mut client);
-}
-
-/// The origin a reactor reports names the call that asked for the operation.
-///
-/// A facade takes the location where the operation was asked for, because the
-/// frame that reaches the reactor through the loop is the loop's own; a
-/// report that points at `flow.rs` names code that cannot stop asking.
-#[test]
-fn an_operation_reports_the_line_that_asked_for_it() {
-	let (client, server) = pair();
-	let reactor = Reactor::new(Config::default()).unwrap();
-	let client = Handle::new(client);
-	let buffer = Arc::new(vec![0u8; 16]);
-
-	let before = line!();
-	let mut receive = pin!(
-		submit(
-			&reactor,
-			&client,
-			Op::Recv {
-				memory: memory(&buffer),
-				extents: whole(&buffer),
-			},
-		)
-		.unwrap()
-	);
-	let after = line!();
-	let mut cx = Context::from_waker(Waker::noop());
-	assert!(
-		std::future::Future::poll(receive.as_mut(), &mut cx).is_pending(),
-		"the peer sends nothing, so the receive waits"
-	);
-	reactor.poll(Some(Duration::ZERO)).unwrap();
-
-	let entry = reactor
-		.in_flight()
-		.into_iter()
-		.find(|entry| entry.op == "recv")
-		.expect("the receive is in the reactor");
-	assert_eq!(
-		entry.origin.file(),
-		file!(),
-		"the origin names another file than the caller's"
-	);
-	assert!(
-		(before..=after).contains(&entry.origin.line()),
-		"the origin names line {}, outside the call at {before}..={after}",
-		entry.origin.line()
-	);
-
-	// The peer going ends the receive, so the future is dropped with nothing in
-	// flight: the fallback is not what this test is about.
-	drop(server);
-	while !common::idle(&reactor) {
-		reactor.poll(Some(Duration::from_millis(1))).unwrap();
-	}
 }

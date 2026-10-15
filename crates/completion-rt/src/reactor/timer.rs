@@ -6,13 +6,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::io;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use crate::core::stopped;
-use crate::park::Park;
+use crate::backend::Park;
+use crate::error::Error;
 
 /// Names one armed timer: its deadline, then a serial that keeps timers with
 /// the same deadline apart.
@@ -22,7 +21,7 @@ pub struct TimerKey {
 	serial: u64,
 }
 
-pub(crate) struct TimerWheel {
+pub(super) struct TimerWheel {
 	inner: RefCell<Inner>,
 	serial: Cell<u64>,
 	park: Arc<Park>,
@@ -45,7 +44,7 @@ enum Settled {
 }
 
 impl TimerWheel {
-	pub(crate) fn new(park: Arc<Park>) -> TimerWheel {
+	pub(super) fn new(park: Arc<Park>) -> TimerWheel {
 		TimerWheel {
 			inner: RefCell::new(Inner::default()),
 			serial: Cell::new(0),
@@ -54,7 +53,7 @@ impl TimerWheel {
 	}
 
 	/// Arms a timer that fires at `deadline`.
-	pub(crate) fn insert(&self, deadline: Instant) -> TimerKey {
+	pub(super) fn insert(&self, deadline: Instant) -> TimerKey {
 		let serial = self.serial.get();
 		self.serial.set(serial + 1);
 		let key = TimerKey { deadline, serial };
@@ -66,12 +65,12 @@ impl TimerWheel {
 
 	/// Polls the timer `key`: `Ready` once it has fired, otherwise `Pending`
 	/// with `cx`'s waker recorded for the reactor to wake.
-	pub(crate) fn poll(&self, key: TimerKey, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+	pub(super) fn poll(&self, key: TimerKey, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
 		let mut inner = self.inner.borrow_mut();
 		if let Some(settled) = inner.settled.remove(&key) {
 			return Poll::Ready(match settled {
 				Settled::Fired => Ok(()),
-				Settled::Stopped => Err(stopped()),
+				Settled::Stopped => Err(Error::stopped()),
 			});
 		}
 		match inner.armed.get_mut(&key) {
@@ -81,22 +80,20 @@ impl TimerWheel {
 				}
 				Poll::Pending
 			}
-			None => Poll::Ready(Err(io::Error::new(
-				io::ErrorKind::NotFound,
-				"the timer was cancelled",
-			))),
+			// The key is not in the wheel: the timer was disarmed, not late.
+			None => Poll::Ready(Err(Error::cancelled())),
 		}
 	}
 
 	/// Disarms the timer `key`, whether or not it has fired.
-	pub(crate) fn cancel(&self, key: TimerKey) {
+	pub(super) fn cancel(&self, key: TimerKey) {
 		let mut inner = self.inner.borrow_mut();
 		inner.armed.remove(&key);
 		inner.settled.remove(&key);
 	}
 
 	/// Caps `timeout` at the nearest armed deadline.
-	pub(crate) fn within(&self, timeout: Option<Duration>) -> Option<Duration> {
+	pub(super) fn within(&self, timeout: Option<Duration>) -> Option<Duration> {
 		let nearest = self
 			.inner
 			.borrow()
@@ -110,7 +107,7 @@ impl TimerWheel {
 	}
 
 	/// Fires every timer due at `now` and wakes its waker.
-	pub(crate) fn expire(&self, now: Instant) {
+	pub(super) fn expire(&self, now: Instant) {
 		let mut wakers = Vec::new();
 		{
 			let mut inner = self.inner.borrow_mut();
@@ -130,7 +127,7 @@ impl TimerWheel {
 
 	/// Ends every armed timer; their futures fail with the stopped error. Called
 	/// once the reactor's `stopped` flag is set, so nothing re-arms after it.
-	pub(crate) fn settle_stopped(&self) {
+	pub(super) fn settle_stopped(&self) {
 		let mut wakers = Vec::new();
 		{
 			let mut inner = self.inner.borrow_mut();

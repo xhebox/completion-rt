@@ -7,6 +7,7 @@
 #![cfg(unix)]
 
 mod common;
+use common::Buffer;
 
 use common::block_on;
 
@@ -15,11 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use completion_rt::{
-	Config, Extent, Extents, Handle, InFlight, InFlightState, Memory, Op, Reactor,
+	Config, ErrorKind, Extent, Extents, Handle, InFlight, InFlightState, Memory, Op, Reactor,
 };
 
 /// The buffer in the shape the engine names memory.
-fn memory(buf: &Arc<Vec<u8>>) -> Arc<dyn Memory> {
+fn memory(buf: &Arc<Buffer>) -> Arc<dyn Memory> {
 	let memory: Arc<dyn Memory> = buf.clone();
 	memory
 }
@@ -48,13 +49,13 @@ fn in_flight_shows_a_stalled_read() {
 	let reader = Handle::new(reader);
 
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf: Arc<Vec<u8>> = Arc::new(vec![0; 8]);
+	let buf: Arc<Buffer> = Arc::new(Buffer::new(8));
 	let read = common::submit(
 		&reactor,
 		&reader,
 		Op::Read {
 			offset: 0,
-			memory: memory(&buf),
+			space: reactor.bind(memory(&buf)),
 			extents: Extents::from_slice(&[Extent { offset: 0, len: 8 }]),
 		},
 	)
@@ -91,7 +92,7 @@ fn in_flight_shows_a_stalled_read() {
 	let (_, result) = block_on(&reactor, read);
 	let error = result.expect_err("the read was not cancelled");
 	assert!(
-		reactor.is_cancelled(&error),
+		error.kind() == ErrorKind::Cancelled,
 		"the read was not cancelled: {error:?}"
 	);
 	assert!(

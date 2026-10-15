@@ -6,14 +6,12 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::io;
-use std::panic::Location;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
-use completion_rt::{AsDescriptor, Handle, Lease, Op, Reactor, Response, Token};
+use completion_rt::{AsDescriptor, Error, ErrorKind, Handle, Op, Reactor, Response, Token};
 
 /// A clonable cancellation signal. Clones share the signal; [`Cancel::child`] creates a signal also cancelled by its parent.
 #[derive(Clone)]
@@ -57,6 +55,7 @@ impl CancelInner {
 
 impl Cancel {
 	/// A fresh cancel, unraised.
+	#[fastrace::trace]
 	pub fn new() -> Cancel {
 		Self {
 			inner: Arc::new(CancelInner::new()),
@@ -180,21 +179,15 @@ pub(crate) fn submit<S: AsDescriptor + Send + Sync + 'static>(
 	reactor: &Reactor,
 	fd: &Handle<S>,
 	op: Op,
-	origin: &'static Location<'static>,
-	lease: Option<&Lease>,
-) -> io::Result<Completion> {
-	let token = reactor.submit(fd, op, origin, lease)?;
-	Ok(Completion {
-		reactor: reactor.clone(),
-		token,
-	})
+) -> Result<Completion, Error> {
+	let token = reactor.submit(fd, op)?;
+	Ok(Completion { token })
 }
 
 /// Resolves to the response the reactor lands for one operation.
 ///
 /// Dropping an in-flight operation that accesses caller memory waits for the kernel to release it. An unsignalled drop logs an error and panics in debug builds unless already unwinding; a requested cancellation does not panic.
 pub(crate) struct Completion {
-	reactor: Reactor,
 	token: Token,
 }
 
@@ -212,13 +205,6 @@ impl Completion {
 	fn request_cancel(&self) {
 		self.token.cancel();
 	}
-
-	fn was_cancelled(&self, response: &io::Result<Response>) -> bool {
-		match response {
-			Ok(_) => false,
-			Err(error) => self.reactor.is_cancelled(error),
-		}
-	}
 }
 
 /// Returned by [`Until`] when the cancel wins.
@@ -234,13 +220,17 @@ pub(crate) struct Until {
 }
 
 impl Future for Until {
-	type Output = Result<io::Result<Response>, Cancelled>;
+	type Output = Result<Result<Response, Error>, Cancelled>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = self.get_mut();
 		match Pin::new(&mut this.completion).poll(cx) {
 			Poll::Ready(response) => {
-				if this.requested && this.completion.was_cancelled(&response) {
+				if this.requested
+					&& response
+						.as_ref()
+						.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
+				{
 					Poll::Ready(Err(Cancelled))
 				} else {
 					Poll::Ready(Ok(response))
@@ -258,7 +248,7 @@ impl Future for Until {
 }
 
 impl Future for Completion {
-	type Output = io::Result<Response>;
+	type Output = Result<Response, Error>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		self.get_mut().token.poll(cx.waker())
@@ -287,14 +277,7 @@ mod tests {
 		// A pipe cannot be synced, so the operation lands on an error; that it
 		// lands at all is all this helper needs.
 		let (reader, _writer) = std::io::pipe().unwrap();
-		let completion = submit(
-			reactor,
-			&Handle::new(reader),
-			Op::Fsync,
-			Location::caller(),
-			None,
-		)
-		.unwrap();
+		let completion = submit(reactor, &Handle::new(reader), Op::Fsync).unwrap();
 		let mut until = std::pin::pin!(completion.until(cancel));
 		let mut cx = Context::from_waker(Waker::noop());
 		for _ in 0..8 {

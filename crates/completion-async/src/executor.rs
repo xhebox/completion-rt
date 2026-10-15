@@ -4,7 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::io;
+
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex, PoisonError, Weak as SyncWeak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use completion_rt::{BorrowedDescriptor, Lease, Memory, Reactor};
+use completion_rt::{Lease, Memory, Reactor};
 
 use crate::Error;
 use crate::completion::cancel_task_future;
-use crate::io::Lent;
+use crate::space::Space;
 
 const TICK_BUDGET: usize = 64;
 
@@ -383,10 +383,7 @@ impl Wake for TaskWake {
 
 /// A reactor and the task set it drives.
 ///
-/// Built by [`Executor::new`], it parks the thread calling
-/// [`Executor::block_on`] in its own reactor. Built by [`Executor::embedded`],
-/// it also serves a caller that owns the poll loop, through
-/// [`Executor::poll_fd`] and [`Executor::turn`].
+/// It parks the thread calling [`Executor::block_on`] in its own reactor.
 pub struct Executor {
 	reactor: Reactor,
 	local: Rc<Local<'static>>,
@@ -394,29 +391,21 @@ pub struct Executor {
 }
 
 impl Executor {
-	pub fn new(config: Config) -> io::Result<Executor> {
-		Ok(Executor::assemble(Reactor::new(config.into_rt())?))
-	}
-
-	/// An executor whose reactor never parks, for a caller that waits on
-	/// [`Executor::poll_fd`] and calls [`Executor::turn`] itself.
-	pub fn embedded(config: Config) -> io::Result<Executor> {
-		Ok(Executor::assemble(Reactor::embedded(config.into_rt())?))
-	}
-
-	fn assemble(reactor: Reactor) -> Executor {
+	#[fastrace::trace]
+	pub fn new(config: Config) -> Result<Executor, Error> {
+		let reactor = Reactor::new(config.into_rt())?;
 		let driver = reactor.waker();
 		let local = Rc::new(Local::new());
 		local.drive(&driver);
-		Executor {
+		Ok(Executor {
 			reactor,
 			local,
 			driver,
-		}
+		})
 	}
 
 	/// Runs the root future, with bounded passes over ready tasks so I/O and timers keep advancing.
-	pub fn block_on<F: Future>(&mut self, fut: F) -> io::Result<F::Output> {
+	pub fn block_on<F: Future>(&mut self, fut: F) -> Result<F::Output, Error> {
 		Executor::run(&self.reactor, &self.local, &self.driver, fut)
 	}
 
@@ -425,7 +414,7 @@ impl Executor {
 		local: &Local<'static>,
 		driver: &Waker,
 		fut: F,
-	) -> io::Result<F::Output> {
+	) -> Result<F::Output, Error> {
 		let mut fut = std::pin::pin!(fut);
 		let mut cx = Context::from_waker(driver);
 		loop {
@@ -445,6 +434,14 @@ impl Executor {
 		}
 	}
 
+	/// Binds `memory` to this executor for its operations to name spans of.
+	///
+	/// The space keeps the memory alive until it and every operation naming it
+	/// are gone; an operation on another executor refuses it.
+	pub fn bind(&self, memory: Arc<dyn Memory>) -> Space<'static> {
+		Space::new(self.reactor.bind(memory))
+	}
+
 	/// A handle for spawning tasks on this executor.
 	pub fn spawner(&self) -> Spawner {
 		Spawner {
@@ -458,7 +455,7 @@ impl Executor {
 	/// awaits. Whatever is still in flight when the body returns is dropped
 	/// before this does, which is what lets a task hold a borrow rather than a
 	/// shared owner of the memory it transfers through.
-	pub fn scope<'s, F, Fut, R>(&mut self, body: F) -> io::Result<R>
+	pub fn scope<'s, F, Fut, R>(&mut self, body: F) -> Result<R, Error>
 	where
 		F: FnOnce(Scope<'s>) -> Fut,
 		Fut: Future<Output = R> + 's,
@@ -488,6 +485,7 @@ impl Executor {
 		let body = body(Scope {
 			local: Rc::clone(&local),
 			lease: Rc::clone(&lease),
+			reactor: self.reactor.clone(),
 		});
 		let future = ScopeFuture {
 			local,
@@ -504,39 +502,6 @@ impl Executor {
 
 	pub(crate) fn reactor(&self) -> &Reactor {
 		&self.reactor
-	}
-
-	/// The descriptor to wait on between passes of an [`Executor::embedded`]
-	/// executor. Any other fails with [`io::ErrorKind::Unsupported`].
-	pub fn poll_fd(&self) -> io::Result<BorrowedDescriptor<'_>> {
-		self.reactor.poll_fd()
-	}
-
-	/// One pass of an [`Executor::embedded`] executor's reactor, for a caller
-	/// that waits on [`Executor::poll_fd`] with its own poller: it drains the
-	/// descriptor the poller woke on, runs the tasks spawned through
-	/// [`Executor::spawner`], then hands what they submitted to the reactor and
-	/// reaps. Any other executor fails with [`io::ErrorKind::Unsupported`].
-	///
-	/// Returns how long the caller may wait on [`Executor::poll_fd`] before
-	/// calling this again: [`Duration::ZERO`] while tasks are still ready, so the
-	/// caller comes straight back; otherwise the time to the next timer
-	/// deadline, or `None` if there is none, meaning wait on the descriptor
-	/// alone.
-	pub fn turn(&mut self) -> io::Result<Option<Duration>> {
-		let reactor = &self.reactor;
-		// Drain first: a completion or a wake raised after this re-raises the
-		// descriptor, so the caller can wait on it again rather than spin.
-		reactor.drain_notification()?;
-		self.local.tick(TICK_BUDGET);
-		let deadline = reactor.turn()?;
-		// The pass may have readied tasks — a completion or a due timer — and
-		// they must run before the caller waits again.
-		if self.local.ready.has_ready() {
-			Ok(Some(Duration::ZERO))
-		} else {
-			Ok(deadline)
-		}
 	}
 }
 
@@ -573,6 +538,7 @@ impl Drop for Executor {
 pub struct Scope<'a> {
 	local: Rc<Local<'a>>,
 	lease: Rc<Lease>,
+	reactor: Reactor,
 }
 
 impl<'a> Scope<'a> {
@@ -581,16 +547,14 @@ impl<'a> Scope<'a> {
 	/// The operations are tied to the scope: one submitted after it ends is
 	/// refused, and the scope does not return while one is still in the kernel —
 	/// even one whose future was forgotten.
-	pub fn lend(&self, memory: impl Memory + 'a) -> Lent<'a> {
-		let memory: Arc<dyn Memory + 'a> = Arc::new(memory);
-		// SAFETY: only the lifetime bound changes. The erased `Arc` reaches the
-		// reactor under this scope's lease, and `Executor::scope` — a plain call,
-		// which cannot be forgotten — settles the lease before returning, so every
-		// operation naming the memory has left the kernel and dropped its clone
-		// while `'a` still holds. Every other clone is typed `Lent<'a>` or sits in
-		// a `Transfer<'a, _>`, both bounded by `'a`.
-		let memory: Arc<dyn Memory> = unsafe { std::mem::transmute(memory) };
-		Lent::lent(memory, Rc::clone(&self.lease))
+	pub fn lend(&self, memory: &'a dyn Memory) -> Space<'a> {
+		// SAFETY: the space reaches the reactor under this scope's lease, and
+		// `Executor::scope` — a plain call, which cannot be forgotten — settles
+		// the lease before returning, so every operation naming the memory has
+		// left the kernel while `'a` still holds. Every other handle on the space
+		// is typed `Space<'a>` or `Span<'a>`, or sits in a `Transfer<'a, _>`, all
+		// bounded by `'a`.
+		Space::new(unsafe { self.reactor.lend(memory, &self.lease) })
 	}
 
 	/// Spawns `future` on this scope.

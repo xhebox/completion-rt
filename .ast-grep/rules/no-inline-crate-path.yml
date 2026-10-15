@@ -1,0 +1,21 @@
+id: no-inline-crate-path
+language: Rust
+severity: error
+files:
+  - "crates/*/src/**/*.rs"
+rule:
+  all:
+    - kind: crate
+    - not:
+        inside:
+          kind: use_declaration
+          stopBy: end
+    # `pub(crate)`, `pub(in crate::…)`.
+    - not:
+        inside:
+          kind: visibility_modifier
+          stopBy: end
+message: >
+  Cross-module references go through `use`, so a module's imports list every
+  module it depends on. Import the item instead of naming it by its `crate::`
+  path.

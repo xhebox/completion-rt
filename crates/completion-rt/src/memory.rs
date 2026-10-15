@@ -1,4 +1,4 @@
-//! Memory a transfer goes through: the extent, the span, and the address
+//! Memory a transfer goes through: the extent, the iovec, and the address
 //! space that resolves one into the other.
 
 use std::io;
@@ -11,6 +11,12 @@ use smallvec::SmallVec;
 pub struct Extent {
 	pub offset: u64,
 	pub len: usize,
+}
+
+impl From<(u64, usize)> for Extent {
+	fn from((offset, len): (u64, usize)) -> Extent {
+		Extent { offset, len }
+	}
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -91,15 +97,15 @@ impl<'a> IntoIterator for &'a Extents {
 	}
 }
 
-/// One span the kernel reads or writes, ABI-compatible with `libc::iovec`.
+/// One range the kernel reads or writes, ABI-compatible with `libc::iovec`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Span {
+pub struct IoVec {
 	ptr: *mut u8,
 	len: usize,
 }
 
-impl Span {
+impl IoVec {
 	pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
 		Self { ptr, len }
 	}
@@ -113,37 +119,44 @@ impl Span {
 	}
 }
 
-impl std::fmt::Debug for Span {
+impl std::fmt::Debug for IoVec {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("Span")
+		f.debug_struct("IoVec")
 			.field("ptr", &self.ptr)
 			.field("len", &self.len)
 			.finish()
 	}
 }
 
-unsafe impl Send for Span {}
+unsafe impl Send for IoVec {}
 
-pub(super) type Spans = Vec<Span>;
+pub(crate) type IoVecs = Vec<IoVec>;
 
-/// A buffer an operation transfers through, shared with the backend rather
-/// than owned by it.
+/// An address space operations transfer through, shared with the backend
+/// rather than owned by it: a guest's RAM or a mapping.
 ///
 /// # Safety
-/// Implementations must allow external writes through a shared reference without breaking it.
+/// The contents may change under any holder at any time — the kernel, another
+/// thread, a guest — so nothing may read or write them through an ordinary
+/// Rust reference: only through a resolved [`IoVec`], or a volatile copy.
+///
+/// [`iovec`](Memory::iovec) resolves an extent to an address that stays valid
+/// and keeps naming the same bytes for as long as the memory is bound or lent,
+/// and fails with [`InvalidInput`](io::ErrorKind::InvalidInput) for an extent
+/// outside the memory.
 pub unsafe trait Memory: Send + Sync {
-	fn span(&self, extent: Extent) -> io::Result<Span>;
+	fn iovec(&self, extent: Extent) -> io::Result<IoVec>;
 
 	fn len(&self) -> usize;
 }
 
-pub(super) fn spans<T: Memory + ?Sized>(memory: &T, extents: &[Extent]) -> io::Result<Spans> {
-	extents.iter().map(|extent| memory.span(*extent)).collect()
+pub(crate) fn iovecs<T: Memory + ?Sized>(memory: &T, extents: &[Extent]) -> io::Result<IoVecs> {
+	extents.iter().map(|extent| memory.iovec(*extent)).collect()
 }
 
 unsafe impl<T: Memory + ?Sized> Memory for Arc<T> {
-	fn span(&self, extent: Extent) -> io::Result<Span> {
-		(**self).span(extent)
+	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
+		(**self).iovec(extent)
 	}
 
 	fn len(&self) -> usize {
@@ -152,58 +165,12 @@ unsafe impl<T: Memory + ?Sized> Memory for Arc<T> {
 }
 
 unsafe impl<T: Memory + ?Sized> Memory for &T {
-	fn span(&self, extent: Extent) -> io::Result<Span> {
-		(**self).span(extent)
+	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
+		(**self).iovec(extent)
 	}
 
 	fn len(&self) -> usize {
 		(**self).len()
-	}
-}
-
-unsafe impl Memory for Vec<u8> {
-	fn len(&self) -> usize {
-		Vec::len(self)
-	}
-
-	fn span(&self, extent: Extent) -> io::Result<Span> {
-		let end = extent
-			.offset
-			.checked_add(extent.len as u64)
-			.filter(|end| *end <= self.len() as u64)
-			.ok_or_else(|| {
-				io::Error::new(io::ErrorKind::InvalidInput, "range outside the buffer")
-			})?;
-		let _ = end;
-		Ok(unsafe {
-			Span::new(
-				self.as_ptr().add(extent.offset as usize).cast_mut(),
-				extent.len,
-			)
-		})
-	}
-}
-
-unsafe impl Memory for Box<[u8]> {
-	fn len(&self) -> usize {
-		<[u8]>::len(self)
-	}
-
-	fn span(&self, extent: Extent) -> io::Result<Span> {
-		let end = extent
-			.offset
-			.checked_add(extent.len as u64)
-			.filter(|end| *end <= self.len() as u64)
-			.ok_or_else(|| {
-				io::Error::new(io::ErrorKind::InvalidInput, "range outside the buffer")
-			})?;
-		let _ = end;
-		Ok(unsafe {
-			Span::new(
-				self.as_ptr().add(extent.offset as usize).cast_mut(),
-				extent.len,
-			)
-		})
 	}
 }
 
@@ -216,20 +183,20 @@ mod tests {
 	/// A ring entry points at a submission's span array while the entry waits
 	/// in the ring, so that address has to survive the value moving — into the
 	/// in-flight table, and every rehash after that. An inline container moves
-	/// its elements with itself, which is why [`Spans`] is a heap container.
+	/// its elements with itself, which is why [`IoVecs`] is a heap container.
 	#[test]
-	fn a_span_array_keeps_its_address_across_a_move() {
-		let span = || unsafe { Span::new(std::ptr::null_mut(), 1) };
-		let mut spans: Spans = Spans::new();
-		spans.push(span());
-		let address = spans.as_ptr();
+	fn an_iovec_array_keeps_its_address_across_a_move() {
+		let iovec = || unsafe { IoVec::new(std::ptr::null_mut(), 1) };
+		let mut iovecs: IoVecs = IoVecs::new();
+		iovecs.push(iovec());
+		let address = iovecs.as_ptr();
 
-		let mut table: HashMap<u64, Spans> = HashMap::new();
-		table.insert(1, spans);
+		let mut table: HashMap<u64, IoVecs> = HashMap::new();
+		table.insert(1, iovecs);
 		// Enough entries to grow the table several times over.
 		for token in 2..64 {
-			let mut other: Spans = Spans::new();
-			other.push(span());
+			let mut other: IoVecs = IoVecs::new();
+			other.push(iovec());
 			table.insert(token, other);
 		}
 

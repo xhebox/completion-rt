@@ -3,10 +3,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::mem::size_of;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError, HANDLE, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+	ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Networking::WinSock::{
 	AcceptEx, INVALID_SOCKET, IPPROTO_TCP, SO_UPDATE_ACCEPT_CONTEXT, SOCK_STREAM, SOCKADDR,
 	SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, WSA_FLAG_OVERLAPPED, WSABUF, WSAGetLastError, WSARecv,
@@ -22,15 +26,14 @@ use windows_sys::Win32::System::IO::{
 };
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
 
-use crate::core::Response;
+use crate::OwnedDescriptor;
 use crate::desc::{RawHandle, from_raw_socket};
-use crate::memory::Extents;
-use crate::{Memory, OwnedDescriptor};
+use crate::error::Error;
+use crate::memory::IoVecs;
 
-use super::Backend;
+use super::park::{Doorbell, Park};
+use super::{Backend, Response};
 use crate::backend::Config;
-use crate::event::Event;
-use crate::park::Park;
 
 /// `ERROR_IO_PENDING`, the same number as `WSA_IO_PENDING`: the operation was
 /// accepted and will complete later.
@@ -51,19 +54,48 @@ const fn ntstatus_errno(status: usize) -> i32 {
 	(status & 0xFFFF) as i32
 }
 
+/// The completion port every operation completes on; a packet with no
+/// `OVERLAPPED` is a wake.
+struct Port(OwnedHandle);
+
+impl Port {
+	fn new() -> io::Result<Port> {
+		// SAFETY: plain Win32 call with valid arguments.
+		let port =
+			unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+		if port.is_null() {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: the port handle is unowned; we own it from here on.
+		Ok(Port(unsafe { OwnedHandle::from_raw_handle(port) }))
+	}
+
+	fn handle(&self) -> HANDLE {
+		self.0.as_raw_handle()
+	}
+}
+
+impl Doorbell for Port {
+	fn ring(&self, _word: &AtomicU32) {
+		// SAFETY: the port is open for as long as this `Arc` lives.
+		if unsafe { PostQueuedCompletionStatus(self.handle(), 0, 0, std::ptr::null_mut()) } == 0 {
+			log::warn!(error:% = io::Error::last_os_error(); "the completion port refused a wake");
+		}
+	}
+}
+
 pub(crate) struct Iocp {
-	event: Event,
+	port: Arc<Port>,
 	active: HashMap<u64, Active>,
 	/// Handles already associated with this port. A handle stays associated
 	/// until it is closed, and a second `CreateIoCompletionPort` on it fails
 	/// with `ERROR_INVALID_PARAMETER`, so each handle is associated once.
 	associated: HashSet<usize>,
-	ready: VecDeque<(u64, io::Result<Response>)>,
+	ready: VecDeque<(u64, Result<Response, Error>)>,
 }
 
 struct Active {
 	ov: Box<Overlapped>,
-	_memory: Option<Arc<dyn Memory>>,
 	/// An `AcceptEx` in flight. The socket the kernel fills in and the address
 	/// buffer it writes are both alive until the completion lands.
 	accept: Option<Pending>,
@@ -96,29 +128,19 @@ struct Overlapped {
 }
 
 impl Iocp {
-	pub(super) fn new(config: &Config, embedded: bool) -> io::Result<(Iocp, Event)> {
-		if embedded {
-			return Err(io::Error::new(
-				io::ErrorKind::Unsupported,
-				"an IOCP port is consumed by GetQueuedCompletionStatusEx, not waited on",
-			));
-		}
+	pub(super) fn new(config: &Config) -> io::Result<Iocp> {
 		if config.iopoll || config.sqpoll {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
 				"a completion port has no IOPOLL or SQPOLL mode",
 			));
 		}
-		let event = Event::new()?;
-		Ok((
-			Iocp {
-				event: event.clone(),
-				active: HashMap::new(),
-				associated: HashSet::new(),
-				ready: VecDeque::new(),
-			},
-			event,
-		))
+		Ok(Iocp {
+			port: Arc::new(Port::new()?),
+			active: HashMap::new(),
+			associated: HashSet::new(),
+			ready: VecDeque::new(),
+		})
 	}
 
 	fn post(&mut self, token: u64) {
@@ -128,7 +150,7 @@ impl Iocp {
 		let ov_ptr = &*active.ov as *const Overlapped as *const OVERLAPPED as *mut OVERLAPPED;
 		// SAFETY: `ov_ptr` names the box in `active`, which lives until the
 		// completion is collected in `poll`.
-		unsafe { PostQueuedCompletionStatus(self.event.handle().as_platform(), 0, 0, ov_ptr) };
+		unsafe { PostQueuedCompletionStatus(self.port.handle(), 0, 0, ov_ptr) };
 	}
 
 	/// Puts `id` in `active` and returns the `OVERLAPPED` the kernel completes
@@ -138,7 +160,6 @@ impl Iocp {
 		id: u64,
 		fd: HANDLE,
 		fdoff: u64,
-		memory: Option<Arc<dyn Memory>>,
 		accept: Option<Pending>,
 	) -> *mut OVERLAPPED {
 		let mut ov = Box::new(Overlapped {
@@ -158,14 +179,7 @@ impl Iocp {
 			handle: fd,
 		});
 		let ov_ptr = &mut *ov as *mut Overlapped as *mut OVERLAPPED;
-		self.active.insert(
-			id,
-			Active {
-				ov,
-				_memory: memory,
-				accept,
-			},
-		);
+		self.active.insert(id, Active { ov, accept });
 		ov_ptr
 	}
 
@@ -193,7 +207,7 @@ impl Iocp {
 		let handle: HANDLE = fd.as_platform();
 		self.associate(handle)?;
 		let code = work(handle);
-		self.enqueue(id, handle, 0, None, None);
+		self.enqueue(id, handle, 0, None);
 		self.refuse(id, code);
 		Ok(())
 	}
@@ -203,7 +217,7 @@ impl Iocp {
 			return Ok(());
 		}
 		// SAFETY: standard Win32 call; the port is open for the reactor's life.
-		let port = unsafe { CreateIoCompletionPort(fd, self.event.handle().as_platform(), 0, 0) };
+		let port = unsafe { CreateIoCompletionPort(fd, self.port.handle(), 0, 0) };
 		if port.is_null() {
 			return Err(io::Error::last_os_error());
 		}
@@ -219,9 +233,8 @@ impl Iocp {
 		buf: *mut u8,
 		len: usize,
 		fdoff: u64,
-		memory: Arc<dyn Memory>,
 	) -> io::Result<()> {
-		let ov_ptr = self.enqueue(id, fd, fdoff, Some(memory), None);
+		let ov_ptr = self.enqueue(id, fd, fdoff, None);
 		// SAFETY: standard Win32 calls; `ov_ptr` names the box in `active`,
 		// alive until the completion is collected.
 		let ok = unsafe {
@@ -240,31 +253,37 @@ impl Iocp {
 		Ok(())
 	}
 
-	fn transfer(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-		send: bool,
-	) -> io::Result<()> {
+	fn transfer(&mut self, id: u64, fd: RawHandle, buffers: IoVecs, send: bool) -> io::Result<()> {
 		let socket = fd.into_raw() as SOCKET;
 		self.associate(socket as HANDLE)?;
-		let (buf, len) = Self::buffer(&memory, &extents)?;
-		let ov_ptr = self.enqueue(id, socket as HANDLE, 0, Some(memory), None);
-		let buffer = WSABUF {
-			len: len as u32,
-			buf: buf,
-		};
+		let ov_ptr = self.enqueue(id, socket as HANDLE, 0, None);
+		// The array only has to outlive the call: an overlapped `WSASend` or
+		// `WSARecv` copies it, and keeps only the buffers it names.
+		let wsabufs: Vec<WSABUF> = buffers
+			.iter()
+			.map(|buf| WSABUF {
+				len: buf.len() as u32,
+				buf: buf.as_ptr(),
+			})
+			.collect();
+		let count = wsabufs.len() as u32;
 		let mut moved: u32 = 0;
 		let mut flags: u32 = 0;
-		// SAFETY: standard Winsock calls; `buffer`, `flags` and `ov_ptr` outlive
+		// SAFETY: standard Winsock calls; `wsabufs`, `flags` and `ov_ptr` outlive
 		// the call, and the kernel writes into them only until the completion.
 		let failed = unsafe {
 			if send {
-				WSASend(socket, &buffer, 1, &mut moved, 0, ov_ptr, None)
+				WSASend(socket, wsabufs.as_ptr(), count, &mut moved, 0, ov_ptr, None)
 			} else {
-				WSARecv(socket, &buffer, 1, &mut moved, &mut flags, ov_ptr, None)
+				WSARecv(
+					socket,
+					wsabufs.as_ptr(),
+					count,
+					&mut moved,
+					&mut flags,
+					ov_ptr,
+					None,
+				)
 			}
 		};
 		if failed != 0 {
@@ -276,15 +295,13 @@ impl Iocp {
 		Ok(())
 	}
 
-	fn buffer(memory: &Arc<dyn Memory>, extents: &Extents) -> io::Result<(*mut u8, usize)> {
-		let buffers = crate::memory::spans(memory, extents)?;
-		let [buf] = buffers.as_slice() else {
-			return Err(io::Error::new(
-				io::ErrorKind::Unsupported,
-				"iocp backend needs exactly one buffer per operation",
-			));
-		};
-		Ok((buf.as_ptr(), buf.len()))
+	/// The first of `buffers`: `ReadFile` and `WriteFile` take one, and their
+	/// scatter forms want page-aligned unbuffered I/O. A gathered span moves
+	/// short, and a caller after all of it repeats the call.
+	fn first(buffers: &IoVecs) -> (*mut u8, usize) {
+		buffers
+			.first()
+			.map_or((std::ptr::null_mut(), 0), |buf| (buf.as_ptr(), buf.len()))
 	}
 
 	fn unsupported() -> io::Error {
@@ -343,32 +360,18 @@ fn accepted(mut pending: Pending) -> io::Result<Response> {
 }
 
 impl Backend for Iocp {
-	fn read(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		fdoff: u64,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
+	fn read(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
 		let handle: HANDLE = fd.as_platform();
 		self.associate(handle)?;
-		let (buf, len) = Self::buffer(&memory, &extents)?;
-		self.issue(id, handle, true, buf, len, fdoff, memory)
+		let (buf, len) = Self::first(&buffers);
+		self.issue(id, handle, true, buf, len, fdoff)
 	}
 
-	fn write(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		fdoff: u64,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
+	fn write(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
 		let handle: HANDLE = fd.as_platform();
 		self.associate(handle)?;
-		let (buf, len) = Self::buffer(&memory, &extents)?;
-		self.issue(id, handle, false, buf, len, fdoff, memory)
+		let (buf, len) = Self::first(&buffers);
+		self.issue(id, handle, false, buf, len, fdoff)
 	}
 
 	fn fsync(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
@@ -380,7 +383,7 @@ impl Backend for Iocp {
 		} else {
 			0
 		};
-		self.enqueue(id, handle, 0, None, None);
+		self.enqueue(id, handle, 0, None);
 		if let Some(active) = self.active.get_mut(&id) {
 			active.ov.submit_error = submit_error;
 		}
@@ -391,7 +394,7 @@ impl Backend for Iocp {
 	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
 		// Windows exposes no close-time deferred write-back error; `FlushFileBuffers` would force durability instead.
 		let handle: HANDLE = fd.as_platform();
-		self.enqueue(id, handle, 0, None, None);
+		self.enqueue(id, handle, 0, None);
 		self.post(id);
 		Ok(())
 	}
@@ -468,7 +471,7 @@ impl Backend for Iocp {
 				std::ptr::null_mut(),
 				0,
 				&mut done,
-				self.enqueue(id, handle, 0, None, None),
+				self.enqueue(id, handle, 0, None),
 			)
 		};
 		if ok == 0 {
@@ -480,42 +483,23 @@ impl Backend for Iocp {
 		Ok(())
 	}
 
-	fn recv(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
-		self.transfer(id, fd, memory, extents, false)
+	fn recv(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
+		self.transfer(id, fd, buffers, false)
 	}
 
-	fn recv_with_fds(
-		&mut self,
-		_id: u64,
-		_fd: RawHandle,
-		_memory: Arc<dyn Memory>,
-		_extents: Extents,
-	) -> io::Result<()> {
+	fn recv_with_fds(&mut self, _id: u64, _fd: RawHandle, _buffers: IoVecs) -> io::Result<()> {
 		Err(Self::unsupported())
 	}
 
-	fn send(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		memory: Arc<dyn Memory>,
-		extents: Extents,
-	) -> io::Result<()> {
-		self.transfer(id, fd, memory, extents, true)
+	fn send(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
+		self.transfer(id, fd, buffers, true)
 	}
 
 	fn send_with_fds(
 		&mut self,
 		_id: u64,
 		_fd: RawHandle,
-		_memory: Arc<dyn Memory>,
-		_extents: Extents,
+		_buffers: IoVecs,
 		_fds: Vec<OwnedDescriptor>,
 	) -> io::Result<()> {
 		Err(Self::unsupported())
@@ -547,7 +531,7 @@ impl Backend for Iocp {
 			return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
 		}
 		pending.socket = Some(socket);
-		let ov_ptr = self.enqueue(id, listener as HANDLE, 0, None, Some(pending));
+		let ov_ptr = self.enqueue(id, listener as HANDLE, 0, Some(pending));
 		// SAFETY: the same buffer and socket `pending` owns, and `ov_ptr` the
 		// box `active` owns; both outlive the call and the completion.
 		let ok = unsafe {
@@ -585,6 +569,13 @@ impl Backend for Iocp {
 		))
 	}
 
+	fn hangup(&mut self, _id: u64, _fd: RawHandle) -> io::Result<()> {
+		Err(io::Error::new(
+			io::ErrorKind::Unsupported,
+			"a completion port has no readiness wait",
+		))
+	}
+
 	fn cancel(&mut self, id: u64) {
 		let Some(active) = self.active.get(&id) else {
 			return;
@@ -609,7 +600,7 @@ impl Backend for Iocp {
 		// memory of the right size.
 		let ok = unsafe {
 			GetQueuedCompletionStatusEx(
-				self.event.handle().as_platform(),
+				self.port.handle(),
 				entries.as_mut_ptr(),
 				entries.len() as u32,
 				&mut count,
@@ -659,7 +650,7 @@ impl Backend for Iocp {
 					result.map(Response::Count)
 				}
 			};
-			self.ready.push_back((id, response));
+			self.ready.push_back((id, response.map_err(landed)));
 		}
 		match self.ready.front() {
 			Some((id, _)) => Ok(*id),
@@ -667,32 +658,34 @@ impl Backend for Iocp {
 		}
 	}
 
-	fn take(&mut self, id: u64) -> io::Result<Response> {
+	fn take(&mut self, id: u64) -> Result<Response, Error> {
 		match self.ready.pop_front() {
 			Some((found, response)) if found == id => response,
 			Some((found, response)) => {
 				self.ready.push_front((found, response));
-				Err(io::Error::other(format!(
+				Err(Error::from(io::Error::other(format!(
 					"take({id}) found a completion for {found}"
-				)))
+				))))
 			}
-			None => Err(io::Error::new(
+			None => Err(Error::from(io::Error::new(
 				io::ErrorKind::NotFound,
 				"no completion to take",
-			)),
+			))),
 		}
 	}
 
-	fn poll_fd(&self) -> io::Result<Event> {
-		Err(io::Error::new(
-			io::ErrorKind::Unsupported,
-			"an IOCP port is consumed by GetQueuedCompletionStatusEx, not waited on",
-		))
+	fn doorbell(&self) -> Arc<dyn Doorbell> {
+		self.port.clone()
 	}
 }
 
-pub(super) fn cancelled(error: &io::Error) -> bool {
-	error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32)
+/// A failed completion; the abort `CancelIoEx` causes is the cancel.
+fn landed(error: io::Error) -> Error {
+	if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) {
+		Error::cancelled()
+	} else {
+		Error::from(error)
+	}
 }
 
 // SAFETY: the pointer fields are opaque kernel handles; the box owns them

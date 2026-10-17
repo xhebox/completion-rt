@@ -129,7 +129,7 @@ impl Op {
 	/// Returns the [`Buffer`] accessed by this operation, or `None` if it transfers no bytes.
 	pub fn buffer(&self) -> Option<Buffer> {
 		self.span()
-			.filter(|span| !span.is_empty())
+			.filter(|span| span.len() > 0)
 			.map(|span| span.buffer().clone())
 	}
 }

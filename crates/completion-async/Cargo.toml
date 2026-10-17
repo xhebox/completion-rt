@@ -23,5 +23,6 @@ windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Network
 env_logger = "0.11"
 tempfile = "3"
 
-[lints.rust]
-unreachable_pub = "deny"
+[lints]
+workspace = true
+

@@ -17,7 +17,7 @@ assert_eq!(read.into_result()?, 5);
 ## Semantics
 
 - Dropping an operation's future cancels and detaches it without blocking: the reactor keeps its Buffer and descriptor alive until the kernel finishes, but the Span's bytes stay in flight until then. Cancel first with a Cancel and until when the range is to be read or reused right away.
-- Memory is shared, not moved: a `Buffer` is a cheap reference-counted handle (`Buffer::zeroed`, `Buffer::from_slice`, or `Buffer::new(Arc::new(memory))` for a `Memory` you implement), and each operation names one `Span` of that buffer — `buffer.span(offset, len)`, or `buffer.gather(ranges)` for several. A range outside the memory fails the operation; it does not panic. `BufferPool` hands out pre-faulted, page-aligned buffers from a fixed set of blocks, for repeated I/O.
+- Memory is shared, not moved: a `Buffer` is a cheap reference-counted handle (`Buffer::zeroed`, `Buffer::from`, or `Buffer::new(Arc::new(memory))` for a `Memory` you implement), and each operation names one `Span` of that buffer — `buffer.span(offset, len)`, or `buffer.gather(ranges)` for several. A range outside the memory fails the operation; it does not panic. `BufferPool` hands out pre-faulted, page-aligned buffers from a fixed set of blocks, for repeated I/O.
 - `Facade::read_at`, `write_at`, `recv` and `send` make exactly one system call, so they can move fewer bytes than asked. `Facade`'s `read_exact_at`, `write_all_at`, `recv_exact` and `send_all` repeat the call until everything is moved; if one stops early, on an error or a cancel, `Outcome::value` still says how many bytes it moved.
 - A `Reactor` and everything bound to it stay on the thread that built it. Only its waker and a `Cancel` cross threads.
 

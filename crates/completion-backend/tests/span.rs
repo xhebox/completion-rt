@@ -155,3 +155,26 @@ fn a_buffer_is_a_memory() {
 		io::ErrorKind::InvalidInput
 	);
 }
+
+/// A resolved [`IoVec`] names one contiguous range, so its bytes are a slice
+/// once nothing is moving them: that is how a caller puts bytes into a buffer
+/// or takes them out of one after a transfer lands, rather than through a copy
+/// helper on every type that can hold memory.
+#[test]
+fn an_iovec_hands_out_the_bytes_it_names() {
+	let buffer = Buffer::from_slice(b"hello");
+	let memory: Arc<dyn Memory> = Arc::new(buffer.clone());
+
+	let iovec = memory.iovec(Extent { offset: 1, len: 3 }).unwrap();
+	// SAFETY: no operation names this memory, and the buffer outlives both
+	// slices taken from the range.
+	assert_eq!(unsafe { iovec.as_slice() }, b"ell");
+	// SAFETY: as above, and the write side is nobody else's either.
+	unsafe { iovec.as_mut_slice() }.copy_from_slice(b"ELL");
+	assert_eq!(buffer.to_vec(), b"hELLo");
+
+	// A range of no bytes is a slice of no bytes, not a dangling one.
+	let empty = memory.iovec(Extent { offset: 5, len: 0 }).unwrap();
+	// SAFETY: a zero-length range names no bytes.
+	assert!(unsafe { empty.as_slice() }.is_empty());
+}

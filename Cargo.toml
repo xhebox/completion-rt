@@ -1,3 +1,10 @@
 [workspace]
 members = ["crates/completion-backend", "crates/completion-async"]
 resolver = "3"
+
+[workspace.lints.rust]
+unreachable_pub = "deny"
+
+[workspace.lints.clippy]
+len_without_is_empty = "allow"
+

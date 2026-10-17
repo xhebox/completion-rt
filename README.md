@@ -5,11 +5,11 @@ Completion-model async I/O for Rust: io_uring on Linux, IOCP on Windows, and a r
 ```rust
 use std::sync::Arc;
 
-use completion_async::{Cancel, Config, Executor, Facade};
+use completion_async::{Cancel, Config, Executor, Facade, Space};
 
 let mut executor = Executor::new(Config::default())?;
 let file = Facade::with_executor(std::fs::File::open("data")?, &executor);
-let space = executor.bind(Arc::new(memory)); // 5 bytes: a `Memory` you implement
+let space = Space::new(Arc::new(memory)); // 5 bytes: a `Memory` you implement
 let cancel = Cancel::new();
 
 let read = executor.block_on(file.read_exact_at(space.whole(), 0).until(&cancel))?;
@@ -18,8 +18,8 @@ assert_eq!(read.into_result()?, 5);
 
 ## Semantics
 
-- Dropping an operation's future returns only once the kernel has let go of its memory. Cancel first, with a `Cancel` and `until`; a drop that has to wait is a bug, which panics in a debug build and is logged in a release one.
-- Memory is shared, not moved: it is bound to an executor once (`Executor::bind`) or lent to a scope (`Scope::lend`), and each operation names one `Span` of that space — `space.span(offset, len)`, or `space.gather(ranges)` for several. A range outside the memory fails the operation; it does not panic.
+- Dropping an operation's future cancels and detaches it without blocking: the reactor keeps its Space and descriptor alive until the kernel finishes, but the Span's bytes stay in flight until then. Cancel first with a Cancel and until when the range is to be read or reused right away.
+- Memory is shared, not moved: a `Space` holds an `Arc` of it (`Space::new(Arc::new(memory))`), and each operation names one `Span` of that space — `space.span(offset, len)`, or `space.gather(ranges)` for several. A range outside the memory fails the operation; it does not panic.
 - `Facade::read_at`, `write_at`, `recv` and `send` make exactly one system call, so they can move fewer bytes than asked. `Facade`'s `read_exact_at`, `write_all_at`, `recv_exact` and `send_all` repeat the call until everything is moved; if one stops early, on an error or a cancel, `Outcome::value` still says how many bytes it moved.
 - A `Reactor` and everything bound to it stay on the thread that built it. Only its waker and a `Cancel` cross threads.
 

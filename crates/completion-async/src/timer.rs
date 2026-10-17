@@ -5,40 +5,55 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use completion_rt::{Reactor, TimerKey};
+use completion_rt::Error;
 
+use crate::Executor;
+use crate::completion::{Cancel, Completion, submit_timer};
 use crate::global;
-use crate::{Error, Executor};
+use crate::reactor::Reactor;
 
 /// Resolves to `Ok(())` once `duration` has elapsed.
 ///
-/// The timer is armed on construction: the deadline is `Instant::now() +
-/// duration`, fixed there, and the wheel already holds it. Polling is what waits
-/// for that deadline, so a `Timeout` that sits unpolled for a while still fires
-/// on time. The constructor reports a reactor that has already stopped; the poll
-/// reports one that stops in between.
+/// The deadline is fixed on construction: it is `Instant::now() + duration`, and
+/// the poll that arms it names it, so a `Timeout` that sits unpolled for a
+/// while still fires on time. The constructor cannot fail; a reactor that has
+/// already stopped is reported by the poll.
 pub struct Timeout {
 	reactor: Reactor,
-	key: TimerKey,
+	deadline: Instant,
+	cancel: Option<Cancel>,
+	call: Option<Completion>,
+	finished: bool,
 }
 
 impl Timeout {
 	/// A timer that fires `duration` from now, armed on this thread's global
 	/// executor.
 	#[fastrace::trace]
-	pub fn new(duration: Duration) -> Result<Timeout, Error> {
+	pub fn new(duration: Duration) -> Timeout {
 		Timeout::arm(duration, global::reactor())
 	}
 
 	/// A timer that fires `duration` from now, armed on `executor`.
 	#[fastrace::trace]
-	pub fn with_executor(duration: Duration, executor: &Executor) -> Result<Timeout, Error> {
+	pub fn with_executor(duration: Duration, executor: &Executor) -> Timeout {
 		Timeout::arm(duration, executor.reactor().clone())
 	}
 
-	fn arm(duration: Duration, reactor: Reactor) -> Result<Timeout, Error> {
-		let key = reactor.insert_timer(Instant::now() + duration)?;
-		Ok(Timeout { reactor, key })
+	fn arm(duration: Duration, reactor: Reactor) -> Timeout {
+		Self {
+			reactor,
+			deadline: Instant::now() + duration,
+			cancel: None,
+			call: None,
+			finished: false,
+		}
+	}
+
+	/// Gives the timer up when `cancel` fires.
+	pub fn until(mut self, cancel: &Cancel) -> Timeout {
+		self.cancel = Some(cancel.clone());
+		self
 	}
 }
 
@@ -47,14 +62,43 @@ impl Future for Timeout {
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
 		let this = self.get_mut();
-		this.reactor.poll_timer(this.key, cx)
-	}
-}
-
-impl Drop for Timeout {
-	fn drop(&mut self) {
-		// Unconditional: the key was armed by the constructor, and a `cancel`
-		// of a fired or already-cancelled key is a no-op.
-		self.reactor.cancel_timer(self.key);
+		assert!(!this.finished, "a timeout is not polled after it resolved");
+		loop {
+			if this.call.is_none() {
+				if this.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+					this.finished = true;
+					return Poll::Ready(Err(Error::cancelled()));
+				}
+				match submit_timer(&this.reactor, this.deadline, this.cancel.as_ref()) {
+					Ok(completion) => this.call = Some(completion),
+					Err(error) => {
+						this.finished = true;
+						return Poll::Ready(Err(error));
+					}
+				}
+			}
+			let Some(call) = &mut this.call else {
+				unreachable!("a timer is polled only with its timer in flight");
+			};
+			match call.poll(cx) {
+				Poll::Pending => return Poll::Pending,
+				// The cancel won: the timer has been disarmed.
+				Poll::Ready(None) => {
+					this.call = None;
+					this.finished = true;
+					return Poll::Ready(Err(Error::cancelled()));
+				}
+				Poll::Ready(Some(Ok(_))) => {
+					this.call = None;
+					this.finished = true;
+					return Poll::Ready(Ok(()));
+				}
+				Poll::Ready(Some(Err(error))) => {
+					this.call = None;
+					this.finished = true;
+					return Poll::Ready(Err(error));
+				}
+			}
+		}
 	}
 }

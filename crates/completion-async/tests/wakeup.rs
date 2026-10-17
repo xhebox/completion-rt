@@ -83,7 +83,7 @@ fn a_parked_block_on_is_woken_from_another_thread_every_round() {
 	common::init_logging();
 	let mut executor = Executor::new(Config::default()).unwrap();
 	let watchdogs = (0..ROUNDS)
-		.map(|_| Timeout::with_executor(WATCHDOG, &executor).unwrap())
+		.map(|_| Timeout::with_executor(WATCHDOG, &executor))
 		.collect::<Vec<_>>()
 		.into_iter();
 

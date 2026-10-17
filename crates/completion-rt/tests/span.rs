@@ -6,9 +6,9 @@ use common::Buffer;
 
 use std::sync::Arc;
 
-use completion_rt::{Config, Extent, Extents, Memory, Reactor};
+use completion_rt::{Extent, Memory, Space};
 
-fn extents(ranges: &[(u64, usize)]) -> Extents {
+fn extents(ranges: &[(u64, usize)]) -> Vec<Extent> {
 	ranges
 		.iter()
 		.map(|&(offset, len)| Extent { offset, len })
@@ -17,9 +17,8 @@ fn extents(ranges: &[(u64, usize)]) -> Extents {
 
 #[test]
 fn a_span_names_the_extents_it_was_taken_with() {
-	let reactor = Reactor::new(Config::default()).unwrap();
 	let memory: Arc<dyn Memory> = Arc::new(Buffer::new(8));
-	let space = reactor.bind(memory);
+	let space = Space::new(memory);
 
 	let span = space.gather([Extent { offset: 0, len: 2 }, Extent { offset: 4, len: 3 }]);
 
@@ -30,9 +29,8 @@ fn a_span_names_the_extents_it_was_taken_with() {
 
 #[test]
 fn skip_and_take_cut_the_extents_in_order() {
-	let reactor = Reactor::new(Config::default()).unwrap();
 	let memory: Arc<dyn Memory> = Arc::new(Buffer::new(8));
-	let space = reactor.bind(memory);
+	let space = Space::new(memory);
 
 	let span = space.gather([Extent { offset: 0, len: 2 }, Extent { offset: 4, len: 3 }]);
 
@@ -42,9 +40,8 @@ fn skip_and_take_cut_the_extents_in_order() {
 
 #[test]
 fn whole_covers_the_memory_as_one_extent() {
-	let reactor = Reactor::new(Config::default()).unwrap();
 	let memory: Arc<dyn Memory> = Arc::new(Buffer::new(8));
-	let space = reactor.bind(memory);
+	let space = Space::new(memory);
 
 	assert_eq!(space.whole().extents(), &extents(&[(0, 8)]));
 }

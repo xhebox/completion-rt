@@ -19,84 +19,6 @@ impl From<(u64, usize)> for Extent {
 	}
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Extents(SmallVec<[Extent; 2]>);
-
-impl Extents {
-	pub(crate) fn new() -> Extents {
-		Extents(SmallVec::new())
-	}
-
-	pub fn from_slice(extents: &[Extent]) -> Extents {
-		Extents(SmallVec::from_slice(extents))
-	}
-
-	pub(crate) fn push(&mut self, extent: Extent) {
-		self.0.push(extent);
-	}
-
-	pub fn skip(&self, bytes: usize) -> Extents {
-		let mut remaining = bytes;
-		let mut out = Extents::new();
-		for extent in &self.0 {
-			if remaining >= extent.len {
-				remaining -= extent.len;
-				continue;
-			}
-			out.push(Extent {
-				offset: extent.offset + remaining as u64,
-				len: extent.len - remaining,
-			});
-			remaining = 0;
-		}
-		out
-	}
-
-	pub fn len_bytes(&self) -> usize {
-		self.0
-			.iter()
-			.fold(0, |len, extent| len.saturating_add(extent.len))
-	}
-}
-
-impl std::ops::Deref for Extents {
-	type Target = [Extent];
-
-	fn deref(&self) -> &[Extent] {
-		&self.0
-	}
-}
-
-impl Extend<Extent> for Extents {
-	fn extend<T: IntoIterator<Item = Extent>>(&mut self, extents: T) {
-		self.0.extend(extents);
-	}
-}
-
-impl FromIterator<Extent> for Extents {
-	fn from_iter<T: IntoIterator<Item = Extent>>(extents: T) -> Extents {
-		Extents(extents.into_iter().collect())
-	}
-}
-
-impl IntoIterator for Extents {
-	type Item = Extent;
-	type IntoIter = smallvec::IntoIter<[Extent; 2]>;
-
-	fn into_iter(self) -> smallvec::IntoIter<[Extent; 2]> {
-		self.0.into_iter()
-	}
-}
-
-impl<'a> IntoIterator for &'a Extents {
-	type Item = &'a Extent;
-	type IntoIter = std::slice::Iter<'a, Extent>;
-
-	fn into_iter(self) -> std::slice::Iter<'a, Extent> {
-		self.iter()
-	}
-}
-
 /// One range the kernel reads or writes, ABI-compatible with `libc::iovec`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -110,11 +32,11 @@ impl IoVec {
 		Self { ptr, len }
 	}
 
-	pub fn len(&self) -> usize {
+	pub(crate) fn len(&self) -> usize {
 		self.len
 	}
 
-	pub fn as_ptr(&self) -> *mut u8 {
+	pub(crate) fn as_ptr(&self) -> *mut u8 {
 		self.ptr
 	}
 }
@@ -141,8 +63,8 @@ pub(crate) type IoVecs = Vec<IoVec>;
 /// Rust reference: only through a resolved [`IoVec`], or a volatile copy.
 ///
 /// [`iovec`](Memory::iovec) resolves an extent to an address that stays valid
-/// and keeps naming the same bytes for as long as the memory is bound or lent,
-/// and fails with [`InvalidInput`](io::ErrorKind::InvalidInput) for an extent
+/// and keeps naming the same bytes for as long as the memory is bound, and
+/// fails with [`InvalidInput`](io::ErrorKind::InvalidInput) for an extent
 /// outside the memory.
 pub unsafe trait Memory: Send + Sync {
 	fn iovec(&self, extent: Extent) -> io::Result<IoVec>;
@@ -150,27 +72,125 @@ pub unsafe trait Memory: Send + Sync {
 	fn len(&self) -> usize;
 }
 
-pub(crate) fn iovecs<T: Memory + ?Sized>(memory: &T, extents: &[Extent]) -> io::Result<IoVecs> {
-	extents.iter().map(|extent| memory.iovec(*extent)).collect()
+/// The memory an operation transfers through: bound once ([`Space::new`]),
+/// and sliced into [`Span`]s for each transfer.
+///
+/// A handle: clones are cheap and name the same memory.
+#[derive(Clone)]
+pub struct Space(Arc<dyn Memory>);
+
+impl Space {
+	/// A space over `memory`, kept alive until the space and every operation
+	/// naming it are gone.
+	pub fn new(memory: Arc<dyn Memory>) -> Space {
+		Space(memory)
+	}
+
+	/// The bytes the memory holds.
+	pub fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+
+	/// `len` bytes at `offset`. The range is checked when an operation is
+	/// submitted, not here.
+	pub fn span(&self, offset: u64, len: usize) -> Span {
+		self.gather([Extent { offset, len }])
+	}
+
+	/// All of the memory.
+	pub fn whole(&self) -> Span {
+		self.span(0, self.len())
+	}
+
+	/// The ranges `extents`, in order, as one span: an operation reads or
+	/// writes them as if they were contiguous.
+	pub fn gather<E: Into<Extent>>(&self, extents: impl IntoIterator<Item = E>) -> Span {
+		Span {
+			space: self.clone(),
+			extents: extents.into_iter().map(Into::into).collect(),
+		}
+	}
 }
 
-unsafe impl<T: Memory + ?Sized> Memory for Arc<T> {
-	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
-		(**self).iovec(extent)
-	}
-
-	fn len(&self) -> usize {
-		(**self).len()
-	}
+/// The ranges of a [`Space`] one operation transfers through.
+///
+/// It holds the space, so it lives as long as the memory, not as long as the
+/// handle it was taken from.
+#[derive(Clone)]
+pub struct Span {
+	space: Space,
+	extents: SmallVec<[Extent; 2]>,
 }
 
-unsafe impl<T: Memory + ?Sized> Memory for &T {
-	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
-		(**self).iovec(extent)
+impl Span {
+	/// The space the ranges are of.
+	pub fn space(&self) -> &Space {
+		&self.space
 	}
 
-	fn len(&self) -> usize {
-		(**self).len()
+	/// The ranges, in order.
+	pub fn extents(&self) -> &[Extent] {
+		&self.extents
+	}
+
+	/// The addresses the span's extents resolve to, in order.
+	pub(crate) fn resolve(&self) -> io::Result<IoVecs> {
+		let memory = self.space.0.as_ref();
+		self.extents
+			.iter()
+			.map(|extent| memory.iovec(*extent))
+			.collect()
+	}
+
+	/// The bytes the span covers.
+	pub fn len(&self) -> usize {
+		self.extents
+			.iter()
+			.fold(0, |len, extent| len.saturating_add(extent.len))
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+
+	/// The span without its first `bytes`.
+	pub fn skip(self, bytes: usize) -> Span {
+		let mut remaining = bytes;
+		let mut extents = SmallVec::new();
+		for extent in &self.extents {
+			if remaining >= extent.len {
+				remaining -= extent.len;
+				continue;
+			}
+			extents.push(Extent {
+				offset: extent.offset + remaining as u64,
+				len: extent.len - remaining,
+			});
+			remaining = 0;
+		}
+		Span { extents, ..self }
+	}
+
+	/// The span's first `bytes`, or all of it if it is shorter.
+	pub fn take(self, bytes: usize) -> Span {
+		let mut remaining = bytes;
+		let mut extents = SmallVec::new();
+		for extent in &self.extents {
+			if remaining == 0 {
+				break;
+			}
+			let len = extent.len.min(remaining);
+			remaining -= len;
+			extents.push(Extent {
+				offset: extent.offset,
+				len,
+			});
+		}
+		Span { extents, ..self }
 	}
 }
 

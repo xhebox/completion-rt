@@ -1,17 +1,17 @@
-//! The completion futures: a [`Completion`] that resolves when the reactor
-//! lands its operation, the [`Until`] that races it against a [`Cancel`], and
-//! the task-cancel flag that tells a dropped completion it was given up on
-//! purpose.
+//! The completion future: a [`Completion`] that resolves when the reactor lands
+//! its operation, or reports the cancel that beat it to the kernel.
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
+use std::time::Instant;
 
-use completion_rt::{AsDescriptor, Error, ErrorKind, Handle, Op, Reactor, Response, Token};
+use completion_rt::{AsDescriptor, Error, ErrorKind, Op, Response};
+
+use crate::reactor::{Key, Reactor};
 
 /// A clonable cancellation signal. Clones share the signal; [`Cancel::child`] creates a signal also cancelled by its parent.
 #[derive(Clone)]
@@ -40,8 +40,18 @@ impl CancelInner {
 		if self.cancelled.swap(true, Ordering::AcqRel) {
 			return;
 		}
-		let wakers = std::mem::take(&mut *self.wakers.lock().unwrap());
-		let children = std::mem::take(&mut *self.children.lock().unwrap());
+		let wakers = std::mem::take(
+			&mut *self
+				.wakers
+				.lock()
+				.expect("the cancel's wakers were poisoned"),
+		);
+		let children = std::mem::take(
+			&mut *self
+				.children
+				.lock()
+				.expect("the cancel's wakers were poisoned"),
+		);
 		for (_, waker) in wakers {
 			waker.wake();
 		}
@@ -80,7 +90,11 @@ impl Cancel {
 			child.cancel();
 			return child;
 		}
-		let mut children = self.inner.children.lock().unwrap();
+		let mut children = self
+			.inner
+			.children
+			.lock()
+			.expect("the cancel's children were poisoned");
 		// Recheck under the lock to cover cancellation racing child registration.
 		if self.is_cancelled() {
 			drop(children);
@@ -100,12 +114,20 @@ impl Cancel {
 
 	#[cfg(test)]
 	fn children(&self) -> usize {
-		self.inner.children.lock().unwrap().len()
+		self.inner
+			.children
+			.lock()
+			.expect("the cancel's children were poisoned")
+			.len()
 	}
 
 	#[cfg(test)]
 	fn waiting(&self) -> usize {
-		self.inner.wakers.lock().unwrap().len()
+		self.inner
+			.wakers
+			.lock()
+			.expect("the cancel's wakers were poisoned")
+			.len()
 	}
 }
 
@@ -137,7 +159,11 @@ impl Future for Wait {
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
 		let this = self.get_mut();
-		let mut wakers = this.inner.wakers.lock().unwrap();
+		let mut wakers = this
+			.inner
+			.wakers
+			.lock()
+			.expect("the cancel's wakers were poisoned");
 		if this.inner.cancelled.load(Ordering::Acquire) {
 			this.registered = false;
 			return Poll::Ready(());
@@ -151,122 +177,105 @@ impl Future for Wait {
 impl Drop for Wait {
 	fn drop(&mut self) {
 		if self.registered {
-			self.inner.wakers.lock().unwrap().remove(&self.key);
+			self.inner
+				.wakers
+				.lock()
+				.expect("the cancel's wakers were poisoned")
+				.remove(&self.key);
 		}
 	}
 }
 
-thread_local! {
-	static TASK_CANCEL: Cell<bool> = const { Cell::new(false) };
-}
-
-pub(crate) fn cancel_task_future<F>(future: F) {
-	struct Restore(bool);
-
-	impl Drop for Restore {
-		fn drop(&mut self) {
-			TASK_CANCEL.set(self.0);
-		}
-	}
-
-	// A cancelled task is an explicit give-up, even when its opaque future hides a Completion.
-	let _restore = Restore(TASK_CANCEL.replace(true));
-	drop(future);
-}
-
-/// Submits `op` on `fd` and wraps its token in a [`Completion`].
-pub(crate) fn submit<S: AsDescriptor + Send + Sync + 'static>(
+/// Submits `op` on `fd`, racing it against `cancel` when one is given.
+pub(crate) fn submit(
 	reactor: &Reactor,
-	fd: &Handle<S>,
+	fd: Arc<dyn AsDescriptor>,
 	op: Op,
+	cancel: Option<&Cancel>,
 ) -> Result<Completion, Error> {
-	let token = reactor.submit(fd, op)?;
-	Ok(Completion { token })
+	let key = reactor.submit(fd, op)?;
+	Ok(Completion::new(reactor.clone(), key, cancel))
 }
 
-/// Resolves to the response the reactor lands for one operation.
+/// Arms a timer for `deadline`, racing it against `cancel` when one is given.
+pub(crate) fn submit_timer(
+	reactor: &Reactor,
+	deadline: Instant,
+	cancel: Option<&Cancel>,
+) -> Result<Completion, Error> {
+	let key = reactor.submit_timer(deadline)?;
+	Ok(Completion::new(reactor.clone(), key, cancel))
+}
+
+/// Resolves to the response the reactor lands for one operation or timer, or to
+/// `None` when a cancel it was given won.
 ///
-/// Dropping an in-flight operation that accesses caller memory waits for the kernel to release it. An unsignalled drop logs an error and panics in debug builds unless already unwinding; a requested cancellation does not panic.
+/// Dropping an in-flight operation is predictable and does not block: the drop
+/// cancels the operation and detaches it, and the reactor keeps its
+/// [`Space`](completion_rt::Space) and descriptor alive until the kernel
+/// finishes with it, though the span's bytes stay in flight until then. A
+/// range that is to be read or reused right away is waited for by naming a
+/// [`Cancel`]: the completion then resolves to `None` only once the kernel has
+/// let go of the [`Span`](completion_rt::Span).
 pub(crate) struct Completion {
-	token: Token,
+	reactor: Reactor,
+	key: Key,
+	wait: Option<Wait>,
+	requested: bool,
 }
 
 impl Completion {
-	/// Races the operation against `cancel`, giving the [`Until`] future.
-	pub(crate) fn until(self, cancel: &Cancel) -> Until {
-		let wait = Wait::new(Arc::clone(&cancel.inner));
-		Until {
-			completion: self,
-			wait,
+	fn new(reactor: Reactor, key: Key, cancel: Option<&Cancel>) -> Completion {
+		Completion {
+			reactor,
+			key,
+			wait: cancel.map(|cancel| Wait::new(Arc::clone(&cancel.inner))),
 			requested: false,
 		}
 	}
 
-	fn request_cancel(&self) {
-		self.token.cancel();
+	/// Asks the reactor to give up on this completion's operation or timer.
+	#[cfg(test)]
+	pub(crate) fn cancel(&self) {
+		self.reactor.cancel(self.key);
 	}
-}
 
-/// Returned by [`Until`] when the cancel wins.
-pub(crate) struct Cancelled;
-
-/// Waits for completion or cancellation, including release of kernel access to memory.
-///
-/// Returns `Err(Cancelled)` only if the operation was actually cancelled; an operation that finishes despite cancellation retains its result.
-pub(crate) struct Until {
-	completion: Completion,
-	wait: Wait,
-	requested: bool,
-}
-
-impl Future for Until {
-	type Output = Result<Result<Response, Error>, Cancelled>;
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		let this = self.get_mut();
-		match Pin::new(&mut this.completion).poll(cx) {
-			Poll::Ready(response) => {
-				if this.requested
+	pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Response, Error>>> {
+		loop {
+			if let Some(response) = self.reactor.poll(self.key, cx.waker()) {
+				if self.requested
 					&& response
 						.as_ref()
 						.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
 				{
-					Poll::Ready(Err(Cancelled))
-				} else {
-					Poll::Ready(Ok(response))
+					return Poll::Ready(None);
 				}
+				return Poll::Ready(Some(response));
 			}
-			Poll::Pending => {
-				if !this.requested && Pin::new(&mut this.wait).poll(cx).is_ready() {
-					this.requested = true;
-					this.completion.request_cancel();
-				}
-				Poll::Pending
+			if !self.requested
+				&& let Some(wait) = &mut self.wait
+				&& Pin::new(wait).poll(cx).is_ready()
+			{
+				self.requested = true;
+				self.reactor.cancel(self.key);
+				continue;
 			}
+			return Poll::Pending;
 		}
-	}
-}
-
-impl Future for Completion {
-	type Output = Result<Response, Error>;
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		self.get_mut().token.poll(cx.waker())
 	}
 }
 
 impl Drop for Completion {
 	fn drop(&mut self) {
-		if TASK_CANCEL.get() {
-			self.token.cancel();
-		}
+		self.reactor.release(self.key);
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use completion_rt::{Config, Reactor};
+	use crate::reactor::Reactor;
+	use completion_rt::Config;
 	use std::time::Duration;
 
 	fn platform() -> Reactor {
@@ -277,14 +286,13 @@ mod tests {
 		// A pipe cannot be synced, so the operation lands on an error; that it
 		// lands at all is all this helper needs.
 		let (reader, _writer) = std::io::pipe().unwrap();
-		let completion = submit(reactor, &Handle::new(reader), Op::Fsync).unwrap();
-		let mut until = std::pin::pin!(completion.until(cancel));
+		let mut completion = submit(reactor, Arc::new(reader), Op::Fsync, Some(cancel)).unwrap();
 		let mut cx = Context::from_waker(Waker::noop());
 		for _ in 0..8 {
-			if until.as_mut().poll(&mut cx).is_ready() {
+			if completion.poll(&mut cx).is_ready() {
 				return;
 			}
-			reactor.poll(Some(Duration::from_secs(1))).unwrap();
+			reactor.drive(Some(Duration::from_secs(1))).unwrap();
 		}
 		panic!("the operation did not complete");
 	}

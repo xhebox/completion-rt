@@ -1,28 +1,23 @@
-//! The completion reactor: the backend, the operations in flight, and the
-//! cancellable completions they resolve to.
+//! The OS completion backend: `io_uring` on Linux, a completion port on
+//! Windows, and a readiness poller with a thread pool for other unix.
 //!
-//! This is the low layer. A [`Reactor`] owns one completion backend and is
-//! driven and submitted to from the thread that built it; only its waker crosses
-//! threads. An operation — `read`, `send`, `accept`, and the
-//! rest, each named as an [`Op`] — returns a [`Token`] that names it until its
-//! result is taken or it is released. Releasing a token whose operation is still
-//! in flight cancels it and returns only once the backend has let go of the
-//! memory it was given.
+//! This is the low layer and nothing above it. A [`Backend`] submits an
+//! [`Op`] on a descriptor under an id of the caller's choosing; the mechanism
+//! carries that id and hands it back with the operation's [`Response`]. It
+//! keeps no table of operations, has no keys, and never waits on its own: what
+//! an id means, which memory and descriptors an operation may name, and when to
+//! poll are all the caller's.
 //!
-//! The async surface over it — the executor, the facade, and the transfer
-//! futures — lives in the `completion-async` crate, which re-exports the data
-//! types and the descriptor trait from here.
+//! The async surface over it — the executor, the facade, the transfer futures,
+//! and the timers — lives in the `completion-async` crate, which re-exports the
+//! data types and the descriptor trait from here.
 
 mod backend;
 mod desc;
 mod error;
 mod memory;
-mod reactor;
 
-pub use backend::{Config, Response};
-pub use desc::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawDescriptor};
+pub use backend::{Backend, Config, Op, Response};
+pub use desc::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket};
 pub use error::{Error, ErrorKind, Status};
-pub use memory::{Extent, Extents, IoVec, Memory};
-pub use reactor::{
-	Handle, InFlight, InFlightState, Lease, Op, Reactor, Space, Span, TimerKey, Token,
-};
+pub use memory::{Extent, IoVec, Memory, Space, Span};

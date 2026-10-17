@@ -3,12 +3,10 @@
 mod common;
 use common::Buffer;
 
-use common::block_on;
-
 use std::io;
 use std::sync::Arc;
 
-use completion_async::{Config, ErrorKind, Executor, Facade, File, OpenOptions};
+use completion_async::{Config, ErrorKind, Executor, Facade, File, OpenOptions, Space};
 
 /// The async driver the file operations run on: it owns the reactor, so
 /// `block_on` both polls the operation and drives the backend under it.
@@ -61,7 +59,7 @@ fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 	let writer: Facade<std::io::PipeWriter> = Facade::with_executor(writer, &executor);
 
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
-	let memory = executor.bind(payload.clone()).whole();
+	let memory = Space::new(payload.clone()).whole();
 	let moved = executor
 		.block_on(writer.write_at(memory.take(5), 0))
 		.unwrap()
@@ -70,7 +68,7 @@ fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 	assert_eq!(moved, 5);
 
 	let read: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let memory = executor.bind(read.clone()).whole();
+	let memory = Space::new(read.clone()).whole();
 	let moved = executor
 		.block_on(reader.read_at(memory.take(5), 0))
 		.unwrap()
@@ -99,7 +97,7 @@ fn the_vector_path_goes_through_the_backing() {
 	);
 
 	let source: Arc<Buffer> = Arc::new(Buffer::from_slice(b"payload"));
-	let memory = executor.bind(source.clone()).whole();
+	let memory = Space::new(source.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.write_at(memory, 0))
@@ -110,7 +108,7 @@ fn the_vector_path_goes_through_the_backing() {
 	);
 
 	let sink: Arc<Buffer> = Arc::new(Buffer::new(7));
-	let memory = executor.bind(sink.clone()).whole();
+	let memory = Space::new(sink.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -120,7 +118,7 @@ fn the_vector_path_goes_through_the_backing() {
 		7
 	);
 
-	let memory = executor.bind(sink.clone()).whole();
+	let memory = Space::new(sink.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.write_at(memory, 7))
@@ -130,7 +128,7 @@ fn the_vector_path_goes_through_the_backing() {
 		7
 	);
 	let whole: Arc<Buffer> = Arc::new(Buffer::new(14));
-	let memory = executor.bind(whole.clone()).whole();
+	let memory = Space::new(whole.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -155,7 +153,7 @@ fn read_exact_at_reports_the_file_ending_first() {
 
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
 	// One call: five bytes are left, and that is what it reports.
-	let memory = executor.bind(buffer.clone()).whole();
+	let memory = Space::new(buffer.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -169,7 +167,7 @@ fn read_exact_at_reports_the_file_ending_first() {
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
 	// The loop stops where the file does, and the progress it made is the
 	// bytes it did bring back, not the whole buffer.
-	let memory = executor.bind(buffer.clone()).whole();
+	let memory = Space::new(buffer.clone()).whole();
 	let outcome = executor.block_on(file.read_exact_at(memory, 0)).unwrap();
 	assert_eq!(outcome.value, 5);
 	assert_eq!(&buffer.to_vec()[..5], b"hello", "what did arrive stays");
@@ -204,7 +202,7 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	let len = 4 << 20;
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(&bytes));
-	let memory = executor.bind(payload.clone()).whole();
+	let memory = Space::new(payload.clone()).whole();
 	executor
 		.block_on(file.write_all_at(memory, 0))
 		.unwrap()
@@ -213,7 +211,7 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	executor.block_on(file.sync()).unwrap().unwrap();
 
 	let read: Arc<Buffer> = Arc::new(Buffer::new(len));
-	let memory = executor.bind(read.clone()).whole();
+	let memory = Space::new(read.clone()).whole();
 	executor
 		.block_on(file.read_exact_at(memory, 0))
 		.unwrap()
@@ -238,7 +236,7 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	let file: File = Facade::with_executor(file, &executor);
 
 	let written: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
-	let memory = executor.bind(written.clone()).whole();
+	let memory = Space::new(written.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.write_at(memory, 0))
@@ -250,7 +248,7 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	executor.block_on(file.sync()).unwrap().unwrap();
 
 	let read: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let memory = executor.bind(read.clone()).whole();
+	let memory = Space::new(read.clone()).whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -262,30 +260,17 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	assert_eq!(read.to_vec(), b"hello");
 
 	// Back to the plain file: nothing names it any more, so the facade gives it
-	// up; the executor binding is dropped.
-	let Some(plain) = block_on(file.take()) else {
-		panic!("the facade still holds the file");
+	// up; no binding holds it any longer.
+	let plain = match file.try_take() {
+		Ok(plain) => plain,
+		Err(_) => panic!("the facade still holds the file"),
 	};
 	drop(plain);
 }
 
-/// A facade nothing else names gives its file back at once: a take resolves on
-/// the first poll rather than waiting for a wake that will never come.
-#[test]
-fn a_facade_with_no_operations_gives_its_file_back_at_once() {
-	let directory = common::tempdir("completion-take").unwrap();
-	let path = directory.path().join("data");
-	std::fs::write(&path, b"data").unwrap();
-	let executor = executor();
-	let file = File::with_executor(common::open(&path).unwrap(), &executor);
-
-	let plain = block_on(file.take()).expect("nothing else names the file");
-	assert_eq!(plain.metadata().unwrap().len(), 4);
-}
-
-/// A transfer owns the facade's handle and executor, so a poll-driven state
-/// machine can keep it beside the facade, let the facade binding go before the
-/// first poll, and still drive the transfer to its end.
+/// A transfer owns a clone of the facade's resource and the reactor, so a
+/// poll-driven state machine can keep it beside the facade, let the facade go
+/// before the first poll, and still drive the transfer to its end.
 #[test]
 fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	use completion_async::Transfer;
@@ -293,7 +278,7 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	/// What one hand-written poll loop holds across its polls.
 	struct Reading {
 		file: Option<File>,
-		read: Transfer<'static, std::fs::File>,
+		read: Transfer,
 	}
 
 	/// A state machine boxes what it is waiting for, which needs the future to
@@ -309,14 +294,14 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let memory = executor.bind(buffer.clone()).whole();
+	let memory = Space::new(buffer.clone()).whole();
 	let read = assert_static(file.read_at(memory, 0));
 	let mut reading = Reading {
 		file: Some(file),
 		read,
 	};
-	// The facade binding goes: the transfer names the file through its own
-	// clone of the handle.
+	// The facade goes: the transfer names the file through its own clone of
+	// the resource.
 	drop(reading.file.take());
 
 	assert_eq!(
@@ -348,7 +333,7 @@ fn flush_leaves_the_facade_usable() {
 	);
 
 	let first: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
-	let memory = executor.bind(first.clone()).whole();
+	let memory = Space::new(first.clone()).whole();
 	executor
 		.block_on(file.write_all_at(memory, 0))
 		.unwrap()
@@ -359,7 +344,7 @@ fn flush_leaves_the_facade_usable() {
 	// The duplicate the flush closed was not the facade's descriptor: the same
 	// facade still writes and reads.
 	let second: Arc<Buffer> = Arc::new(Buffer::from_slice(b"world"));
-	let memory = executor.bind(second.clone()).whole();
+	let memory = Space::new(second.clone()).whole();
 	executor
 		.block_on(file.write_all_at(memory, 5))
 		.unwrap()
@@ -367,7 +352,7 @@ fn flush_leaves_the_facade_usable() {
 		.unwrap();
 
 	let read: Arc<Buffer> = Arc::new(Buffer::new(10));
-	let memory = executor.bind(read.clone()).whole();
+	let memory = Space::new(read.clone()).whole();
 	executor
 		.block_on(file.read_exact_at(memory, 0))
 		.unwrap()

@@ -1,24 +1,15 @@
-//! The completion mechanism of the target.
+//! The completion mechanism of the target, and the operations it runs.
 
 use std::io;
-use std::sync::Arc;
+use std::task::Waker;
 use std::time::Duration;
 
-use enum_dispatch::enum_dispatch;
-
-use crate::OwnedDescriptor;
-use crate::desc::OwnedSocket;
-use crate::desc::RawHandle;
+use crate::desc::{BorrowedDescriptor, OwnedDescriptor, OwnedSocket, RawHandle};
 use crate::error::Error;
-use crate::memory::IoVecs;
+use crate::memory::{IoVecs, Space, Span};
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("the completion crate has no backend for this target");
-
-mod park;
-
-use park::Doorbell;
-pub(crate) use park::Park;
 
 #[cfg(windows)]
 mod iocp;
@@ -75,77 +66,199 @@ impl Response {
 	}
 }
 
-#[enum_dispatch(BackendEnum)]
-pub(super) trait Backend {
-	fn read(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()>;
-
-	fn write(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()>;
-
-	fn fsync(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
-
-	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
-
-	fn allocate(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()>;
-
-	fn punch(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()>;
-
-	fn recv(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()>;
-
-	fn recv_with_fds(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()>;
-
-	fn send(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()>;
-
-	fn send_with_fds(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		buffers: IoVecs,
+/// An operation named by its arguments, without the descriptor it runs on.
+///
+/// The default `B` is the [`Span`] a submission passes in: a transfer names its
+/// memory as a span of a [`Space`], resolved against it before the backend is
+/// handed anything. A backend then runs the same operation over `IoVecs`, the
+/// addresses the span resolved to. The descriptor is the submission's own and
+/// never part of the operation.
+pub enum Op<B = Span> {
+	Read {
+		offset: u64,
+		span: B,
+	},
+	Write {
+		offset: u64,
+		span: B,
+	},
+	Fsync,
+	Flush,
+	Allocate {
+		offset: u64,
+		len: u64,
+	},
+	Punch {
+		offset: u64,
+		len: u64,
+	},
+	Recv {
+		span: B,
+	},
+	RecvWithFds {
+		span: B,
+	},
+	Send {
+		span: B,
 		fds: Vec<OwnedDescriptor>,
-	) -> io::Result<()>;
-
-	fn accept(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
-
-	fn readable(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
-
-	fn writable(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
-
-	fn hangup(&mut self, id: u64, fd: RawHandle) -> io::Result<()>;
-
-	fn cancel(&mut self, _id: u64) {}
-
-	/// The id of one completed operation.
-	///
-	/// A backend keeps what one entry into the kernel produced: with a
-	/// completion already buffered this reports it without entering again, and
-	/// only an empty buffer waits. `WouldBlock` says nothing completed — a
-	/// zero timeout means "do not wait for one".
-	///
-	/// `park` carries the reactor's wake state; a backend that spins rather than
-	/// waits (IOPOLL) uses it to see a cross-thread wake.
-	fn poll(&mut self, timeout: Option<Duration>, park: &Park) -> io::Result<u64>;
-
-	fn take(&mut self, id: u64) -> Result<Response, Error>;
-
-	/// What wakes a park asleep in this backend's [`poll`](Backend::poll).
-	fn doorbell(&self) -> Arc<dyn Doorbell>;
+	},
+	Accept,
+	Readable,
+	Writable,
+	/// Resolves once the peer is gone or the socket has failed; a peer that
+	/// only shut its write side has not hung up.
+	Hangup,
 }
 
-#[enum_dispatch]
-pub(super) enum BackendEnum {
-	#[cfg(target_os = "linux")]
-	Uring(uring::Uring),
-	#[cfg(windows)]
-	Iocp(iocp::Iocp),
-	#[cfg(all(unix, not(target_os = "linux")))]
-	Portable(portable::Portable),
+impl Op<Span> {
+	/// The caller memory the operation reads or writes, if any. Control
+	/// buffers are the backend's own, so a descriptor-carrying send with no
+	/// payload bytes names none.
+	pub fn space(&self) -> Option<Space> {
+		match self {
+			Op::Read { span, .. }
+			| Op::Write { span, .. }
+			| Op::Recv { span, .. }
+			| Op::RecvWithFds { span, .. }
+			| Op::Send { span, .. } => (!span.is_empty()).then(|| span.space().clone()),
+			Op::Fsync
+			| Op::Flush
+			| Op::Allocate { .. }
+			| Op::Punch { .. }
+			| Op::Accept
+			| Op::Readable
+			| Op::Writable
+			| Op::Hangup => None,
+		}
+	}
+
+	/// The operation with every span resolved against its space: the form the
+	/// backend runs.
+	pub(crate) fn resolve(self) -> io::Result<Op<IoVecs>> {
+		Ok(match self {
+			Op::Read { offset, span } => Op::Read {
+				offset,
+				span: span.resolve()?,
+			},
+			Op::Write { offset, span } => Op::Write {
+				offset,
+				span: span.resolve()?,
+			},
+			Op::Fsync => Op::Fsync,
+			Op::Flush => Op::Flush,
+			Op::Allocate { offset, len } => Op::Allocate { offset, len },
+			Op::Punch { offset, len } => Op::Punch { offset, len },
+			Op::Recv { span } => Op::Recv {
+				span: span.resolve()?,
+			},
+			Op::RecvWithFds { span } => Op::RecvWithFds {
+				span: span.resolve()?,
+			},
+			Op::Send { span, fds } => Op::Send {
+				span: span.resolve()?,
+				fds,
+			},
+			Op::Accept => Op::Accept,
+			Op::Readable => Op::Readable,
+			Op::Writable => Op::Writable,
+			Op::Hangup => Op::Hangup,
+		})
+	}
 }
 
-pub(super) fn create(config: &Config) -> io::Result<BackendEnum> {
-	#[cfg(windows)]
-	use iocp::Iocp as BackendImpl;
-	#[cfg(all(unix, not(target_os = "linux")))]
-	use portable::Portable as BackendImpl;
-	#[cfg(target_os = "linux")]
-	use uring::Uring as BackendImpl;
-	Ok(BackendImpl::new(config)?.into())
+/// What a mechanism has to provide for [`Backend`] to run operations on it.
+///
+/// The id an operation is known by is the caller's: it mints one when it files
+/// the operation away, and the backend carries that id through its own
+/// mechanism — an `io_uring` `user_data`, a completion port's `OVERLAPPED` — so
+/// [`poll`](Mechanism::poll) reports the same id the submission was given. The
+/// backend knows nothing about what the caller keeps under that id.
+///
+/// This is the interface between [`Backend`] and one mechanism per target, so
+/// it is closed: [`Op`] and the ids are this crate's own types, and a backend
+/// outside the crate has nothing to implement it with.
+pub(crate) trait Mechanism {
+	/// Submits `op` on `fd` under `id`, or returns the failure that kept it out
+	/// of the mechanism.
+	///
+	/// A refusal is the submission's own error: the mechanism never held the
+	/// operation, so no completion will report it.
+	fn submit(&mut self, id: u64, fd: RawHandle, op: Op<IoVecs>) -> Result<(), Error>;
+
+	/// Asks the operation `id` to give up, without waiting for it: its
+	/// completion still comes back through [`poll`](Mechanism::poll).
+	fn cancel(&mut self, id: u64);
+
+	/// Collects everything the mechanism has completed into `completed`.
+	///
+	/// One call reports all the completions the mechanism has in hand, not one
+	/// of them: `timeout` of zero means "do not wait for any".
+	fn poll(
+		&mut self,
+		timeout: Option<Duration>,
+		completed: &mut Vec<(u64, Result<Response, Error>)>,
+	) -> Result<(), Error>;
+
+	/// A [`Waker`] that wakes this backend out of a blocking [`poll`](Mechanism::poll).
+	fn waker(&self) -> Waker;
+}
+
+#[cfg(windows)]
+type BackendImpl = iocp::Iocp;
+#[cfg(all(unix, not(target_os = "linux")))]
+type BackendImpl = portable::Portable;
+#[cfg(target_os = "linux")]
+type BackendImpl = uring::Uring;
+
+/// The OS completion backend: submits operations, cancels them, and reports
+/// their completions.
+///
+/// It is a handle on one mechanism per target and nothing more. The ids are the
+/// caller's own, carried through the mechanism and handed back with each
+/// completion; what a completion means, what memory and descriptors an
+/// operation may name, and when to wait are all the caller's to decide.
+pub struct Backend(BackendImpl);
+
+impl Backend {
+	/// Opens the target's completion mechanism.
+	pub fn new(config: &Config) -> Result<Self, Error> {
+		Ok(Backend(BackendImpl::new(config)?))
+	}
+
+	/// Submits `op` on `fd` under `id`, or returns the failure that kept it out
+	/// of the mechanism.
+	///
+	/// The descriptor is borrowed for the call only; `id` names the operation
+	/// from here, and its completion reports the same id. A transfer's extents
+	/// are resolved here: one outside its space fails with
+	/// [`InvalidInput`](std::io::ErrorKind::InvalidInput).
+	pub fn submit(&mut self, id: u64, fd: BorrowedDescriptor<'_>, op: Op) -> Result<(), Error> {
+		let op = op.resolve()?;
+		let raw = RawHandle::from_descriptor(fd);
+		self.0.submit(id, raw, op)
+	}
+
+	/// Asks the operation `id` to give up, without waiting for it: its
+	/// completion still comes back through [`poll`](Backend::poll).
+	pub fn cancel(&mut self, id: u64) {
+		self.0.cancel(id)
+	}
+
+	/// Collects everything the mechanism has completed into `completed`.
+	///
+	/// One call reports all the completions the mechanism has in hand, not one
+	/// of them: `timeout` of zero means "do not wait for any".
+	pub fn poll(
+		&mut self,
+		timeout: Option<Duration>,
+		completed: &mut Vec<(u64, Result<Response, Error>)>,
+	) -> Result<(), Error> {
+		self.0.poll(timeout, completed)
+	}
+
+	/// A [`Waker`] that wakes this backend out of a blocking
+	/// [`poll`](Backend::poll).
+	pub fn waker(&self) -> Waker {
+		self.0.waker()
+	}
 }

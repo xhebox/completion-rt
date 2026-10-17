@@ -4,17 +4,15 @@
 //! result is never taken, the origin a submission reports — live with the low
 //! crate, whose tests reach the reactor directly.
 mod common;
-use common::Buffer;
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
 use completion_async::{
-	AsDescriptor, BorrowedDescriptor, Cancel, Config, ErrorKind, Executor, Facade, ListenerHandle,
-	OwnedSocket, SocketHandle, Space, Span, StreamHandle,
+	AsDescriptor, BorrowedDescriptor, Buffer, Cancel, Config, ErrorKind, Executor, Facade,
+	ListenerHandle, OwnedSocket, SocketHandle, Span, StreamHandle,
 };
 
 /// The async driver the socket operations run on.
@@ -23,10 +21,10 @@ fn executor() -> Executor {
 	Executor::new(Config::default()).unwrap()
 }
 
-/// The whole of `buf` in its own space: the space holds a second handle on it,
-/// so it outlives the operation.
-fn span(buf: &Arc<Buffer>) -> Span {
-	Space::new(buf.clone()).whole()
+/// The whole of `buf` in a span: the span holds its own handle on the buffer,
+/// so it outlives the operation even when the caller's handle goes.
+fn span(buf: &Buffer) -> Span {
+	buf.whole()
 }
 
 /// A connected pair over loopback: the portable way to two real sockets.
@@ -106,7 +104,7 @@ fn send_all_moves_a_payload_larger_than_one_call() {
 	});
 
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(&bytes));
+	let payload: Buffer = Buffer::from_slice(&bytes);
 	executor
 		.block_on(socket.send_all(span(&payload)))
 		.unwrap()
@@ -142,7 +140,7 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 		client.write_all(&sender)
 	});
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(len));
+	let buffer: Buffer = Buffer::zeroed(len);
 	executor
 		.block_on(socket.recv_exact(span(&buffer)))
 		.unwrap()
@@ -204,7 +202,7 @@ fn a_caller_socket_type_gets_the_socket_operations() {
 		.unwrap()
 		.expect("the accept landed");
 
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
+	let payload: Buffer = Buffer::from_slice(b"hello");
 	assert_eq!(
 		executor
 			.block_on(socket.send_all(span(&payload)))
@@ -219,7 +217,7 @@ fn a_caller_socket_type_gets_the_socket_operations() {
 	assert_eq!(&got, b"hello");
 
 	peer.write_all(b"world").unwrap();
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buffer: Buffer = Buffer::zeroed(5);
 	assert_eq!(
 		executor
 			.block_on(socket.recv_exact(span(&buffer)))
@@ -244,7 +242,7 @@ fn a_datagram_socket_takes_a_message_a_call() {
 	let receiver: Facade<UdpSocket> = Facade::with_executor(left, &executor);
 	let sender: Facade<UdpSocket> = Facade::with_executor(right, &executor);
 
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
+	let payload: Buffer = Buffer::from_slice(b"hello");
 	assert_eq!(
 		executor
 			.block_on(sender.send(span(&payload)))
@@ -254,7 +252,7 @@ fn a_datagram_socket_takes_a_message_a_call() {
 		5
 	);
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
+	let buffer: Buffer = Buffer::zeroed(8);
 	assert_eq!(
 		executor
 			.block_on(receiver.recv(span(&buffer)))
@@ -286,7 +284,7 @@ fn an_accept_gives_a_stream_facade_of_its_own() {
 		.block_on(listener.accept())
 		.unwrap()
 		.expect("the accept landed");
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
+	let payload: Buffer = Buffer::from_slice(b"hello");
 	assert_eq!(
 		executor
 			.block_on(stream.send(span(&payload)))
@@ -306,7 +304,7 @@ fn an_accept_gives_a_stream_facade_of_its_own() {
 	// The connection reaches the other way too: the client's bytes come out of
 	// the accepted stream.
 	client.write_all(b"world").unwrap();
-	let received: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let received: Buffer = Buffer::zeroed(5);
 	assert_eq!(
 		executor
 			.block_on(stream.recv(span(&received)))
@@ -334,7 +332,7 @@ fn a_tcp_accept_gives_a_stream_facade_of_its_own() {
 		.block_on(listener.accept())
 		.unwrap()
 		.expect("the accept landed");
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
+	let payload: Buffer = Buffer::from_slice(b"hello");
 	assert_eq!(
 		executor
 			.block_on(stream.send(span(&payload)))
@@ -353,7 +351,7 @@ fn a_tcp_accept_gives_a_stream_facade_of_its_own() {
 	// The connection reaches the other way too: the client's bytes come out of
 	// the accepted stream.
 	client.write_all(b"world").unwrap();
-	let received: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let received: Buffer = Buffer::zeroed(5);
 	assert_eq!(
 		executor
 			.block_on(stream.recv(span(&received)))
@@ -382,13 +380,13 @@ fn recv_with_fds_hands_the_descriptors_back() {
 	let receiver: Facade<UnixStream> = Facade::with_executor(right, &executor);
 
 	let file = std::fs::File::open(&path).unwrap();
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
+	let payload: Buffer = Buffer::from_slice(b"hello");
 	let sent = executor
 		.block_on(sender.send_all_with_fds(span(&payload), vec![file.into()]))
 		.unwrap();
 	assert!(sent.result.is_ok(), "the send failed: {:?}", sent.result);
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buffer: Buffer = Buffer::zeroed(5);
 	let received = executor
 		.block_on(receiver.recv_exact_with_fds(span(&buffer)))
 		.unwrap()
@@ -476,7 +474,7 @@ fn a_shutdown_write_half_closes_the_connection() {
 
 	// The receive side is open still: the peer's bytes arrive.
 	server.write_all(b"world").unwrap();
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buffer: Buffer = Buffer::zeroed(5);
 	assert_eq!(
 		executor
 			.block_on(socket.recv(span(&buffer)))
@@ -495,7 +493,7 @@ fn a_given_up_receive_reports_the_cancel() {
 	let (client, _server) = pair();
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::with_executor(client, &executor);
-	let buffer = Arc::new(Buffer::new(16));
+	let buffer = Buffer::zeroed(16);
 	let cancel = Cancel::new();
 	// The cancel fired before the receive was asked for, so the first poll gives
 	// it up without ever reaching the kernel.
@@ -534,7 +532,7 @@ fn a_cancel_ends_a_recv_exact_loop_mid_way() {
 	let mut executor = executor();
 	let socket: Facade<UnixStream> = Facade::with_executor(right, &executor);
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
+	let buffer: Buffer = Buffer::zeroed(8);
 	// Four bytes are one call: the loop takes them and comes back for the rest,
 	// which the peer never sends.
 	(&left).write_all(b"ABCD").unwrap();
@@ -588,7 +586,7 @@ fn a_cancel_ends_a_send_all_loop_with_its_progress() {
 
 	let len = 8 << 20;
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(&bytes));
+	let payload: Buffer = Buffer::from_slice(&bytes);
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
 	let thread = std::thread::spawn(move || {
@@ -632,7 +630,7 @@ fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 
 	let len = 8 << 20;
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(&bytes));
+	let payload: Buffer = Buffer::from_slice(&bytes);
 	let gone = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(100));
 		drop(server);
@@ -665,7 +663,7 @@ fn a_shutdown_read_ends_a_receive_in_flight() {
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::with_executor(client, &executor);
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(16));
+	let buffer: Buffer = Buffer::zeroed(16);
 	// The peer sends nothing, so the receive sits with the kernel and only a
 	// shutdown can end it.
 	let shutdown = socket.clone();
@@ -704,7 +702,7 @@ fn a_shutdown_write_ends_a_send_in_flight() {
 
 	let len = 8 << 20;
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(&bytes));
+	let payload: Buffer = Buffer::from_slice(&bytes);
 	// Buffers held to a slice of the payload with the peer not reading: the
 	// send is still pending when the write side goes.
 	let shutdown = socket.clone();
@@ -736,7 +734,7 @@ fn a_take_without_waiting_reports_a_receive_in_flight() {
 	let mut executor = executor();
 	let socket: Facade<TcpStream> = Facade::with_executor(client, &executor);
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buffer: Buffer = Buffer::zeroed(5);
 	let mut receive = Box::pin(socket.clone().recv(span(&buffer)));
 	let mut cx = Context::from_waker(Waker::noop());
 	assert!(receive.as_mut().poll(&mut cx).is_pending());

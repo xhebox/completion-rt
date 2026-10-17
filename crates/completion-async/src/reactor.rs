@@ -1,8 +1,4 @@
-//! The completion engine.
-//!
-//! A [`Reactor`] owns the target's [`Backend`], the operations in flight, and
-//! the timers among them. It keeps the table of entries the backend's ids name,
-//! waits for the nearest deadline, and hands each landed result to its holder.
+//! I/O reactor managing in-flight backend operations and timers.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -11,32 +7,25 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
-use completion_rt::{AsDescriptor, Backend, Config, Error, ErrorKind, Response};
+use completion_backend::{AsDescriptor, Backend, Config, Error, ErrorKind, Response};
 
 mod entries;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use completion_rt::Op;
+pub(crate) use completion_backend::Op;
 
 use entries::{Entries, Entry};
 
-/// Names one operation or timer the reactor holds, until its result is taken or
-/// it is released.
-///
-/// The key is plain data: dropping or forgetting it does nothing. The holder ends
-/// it with [`Reactor::release`]; until then it names the same operation, and once
-/// that operation is gone the key names nothing.
+/// Key identifying an in-flight operation or timer in [`Reactor`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Key(u64);
 
-/// The operations in flight, the timers among them, and the mechanism that
-/// runs them.
+/// Internal state of a [`Reactor`], owning the operation table, timer queue,
+/// and OS [`Backend`].
 ///
-/// One `RefCell` in the reactor holds all of it, so a drive pass borrows the
-/// table, the timer set, and the backend together for the whole pass: a waker
-/// that drops an operation runs into that borrow instead of freeing memory the
-/// kernel can still write into.
+/// Wrapped in a single `RefCell` so a `poll` pass borrows the table, timers, and
+/// backend only while draining completions, before waking tasks.
 struct Driver {
 	/// Set by teardown: refusing new submissions and timers, and making a second
 	/// teardown a no-op.
@@ -46,7 +35,6 @@ struct Driver {
 	timers: BTreeSet<(Instant, u64)>,
 	entries: Entries,
 	backend: Backend,
-	completed: Vec<(u64, Result<Response, Error>)>,
 }
 
 impl Driver {
@@ -56,7 +44,6 @@ impl Driver {
 			timers: BTreeSet::new(),
 			entries: Entries::new(),
 			backend: Backend::new(&config)?,
-			completed: Vec::new(),
 		})
 	}
 
@@ -64,13 +51,12 @@ impl Driver {
 	/// pass runs on `&mut self`, so a waker that re-enters the reactor panics
 	/// instead of touching the driver mid-flight.
 	fn poll(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
-		self.backend.poll(timeout, &mut self.completed)?;
-		for (id, response) in self.completed.drain(..) {
-			if let Some(waker) = self.entries.land(id, response) {
+		let entries = &mut self.entries;
+		self.backend.poll(timeout, |id, response| {
+			if let Some(waker) = entries.land(id, response) {
 				waker.wake();
 			}
-		}
-		Ok(())
+		})
 	}
 
 	/// Whether every operation the driver holds has landed. An armed timer counts
@@ -174,57 +160,41 @@ impl Drop for Driver {
 	}
 }
 
-/// The completion backend, the operations in flight, and the timers among them.
-///
-/// A handle: every clone drives and submits through the same reactor. Transfers
-/// may complete short; use the facade's `*_exact` and `*_all` methods to fill a
-/// range.
+/// Shared handle to the single-threaded I/O driver and timer queue.
 #[derive(Clone)]
 pub(crate) struct Reactor(Rc<RefCell<Driver>>);
 
 impl Reactor {
-	/// Each reactor has its own state, they can coexist but [`Reactor::drive`] will block.
 	pub(crate) fn new(config: Config) -> Result<Self, Error> {
 		Ok(Reactor(Rc::new(RefCell::new(Driver::new(config)?))))
 	}
 
-	/// Send and Sync [`Waker`] that wakes a blocked [`Reactor::drive`].
+	/// Returns a thread-safe [`Waker`] that wakes a blocking [`Reactor::drive`].
 	pub(crate) fn waker(&self) -> Waker {
 		self.0.borrow().backend.waker()
 	}
 
-	/// Drives the [`Reactor`].
+	/// Polls the backend and fires expired timers, waiting up to `timeout`.
 	pub(crate) fn drive(&self, timeout: Option<Duration>) -> Result<(), Error> {
 		self.0.borrow_mut().wait(timeout)
 	}
 
-	/// Refuses new submissions and returns once the backend holds nothing.
-	/// With `force`, in-flight submissions are cancelled.
+	/// Stops accepting new submissions and drives all in-flight operations to
+	/// completion (cancelling them first if `force` is true).
 	pub(crate) fn shutdown(&self, force: bool) -> Result<(), Error> {
 		self.0.borrow_mut().shutdown(force)
 	}
 
-	/// Whether the backend holds nothing: every operation it still holds has
-	/// landed, and a result waiting for its holder still counts as held.
+	/// Returns `true` if no backend operations are currently in flight.
 	#[cfg(test)]
 	pub(crate) fn idle(&self) -> bool {
 		self.0.borrow().is_idle()
 	}
 
-	/// Submits `op` on `fd`, holding `fd`'s resource until the operation's entry goes.
-	/// The entry goes once its result is taken or [`Reactor::release`] lets it go.
-	///
-	/// The request reaches the backend before this returns; one the backend
-	/// refuses lands as the operation's own result.
-	///
-	/// A transfer's extents are resolved here: one outside its space fails the
-	/// submission with [`InvalidInput`](std::io::ErrorKind::InvalidInput).
-	///
-	/// # Panics
-	/// If the driver is busy: the call came from a waker the reactor is running.
-	/// A waker only schedules; the poll that follows submits.
+	/// Submits `op` on `fd`, keeping `fd` and any referenced [`Buffer`](completion_backend::Buffer)
+	/// alive until the operation completes and its entry is removed.
 	pub(crate) fn submit(&self, fd: Arc<dyn AsDescriptor>, op: Op) -> Result<Key, Error> {
-		let space = op.space();
+		let buffer = op.buffer();
 		let entry = Entry {
 			response: None,
 			waker: None,
@@ -232,7 +202,7 @@ impl Reactor {
 			cancelled: false,
 			timer: None,
 			_descriptor: Some(Arc::clone(&fd)),
-			space,
+			buffer,
 		};
 		// The entry goes in first, and the id it gets is what the backend files
 		// the operation under, so a refusal rolls the slot straight back out.
@@ -248,8 +218,7 @@ impl Reactor {
 		Ok(Key(id))
 	}
 
-	/// Arms a timer for `deadline`, holding nothing but the deadline itself until
-	/// the timer fires or is released.
+	/// Registers a timer expiring at `deadline`.
 	pub(crate) fn submit_timer(&self, deadline: Instant) -> Result<Key, Error> {
 		let entry = Entry {
 			response: None,
@@ -258,7 +227,7 @@ impl Reactor {
 			cancelled: false,
 			timer: Some(deadline),
 			_descriptor: None,
-			space: None,
+			buffer: None,
 		};
 		let mut driver = self.0.borrow_mut();
 		if driver.stopped {
@@ -269,11 +238,8 @@ impl Reactor {
 		Ok(Key(id))
 	}
 
-	/// The result of the operation or timer `key` if it has landed, which takes it
-	/// and ends the entry; otherwise `waker` is woken when it lands.
-	///
-	/// A key whose result was taken, or that was released, names nothing and
-	/// reports [`ErrorKind::Cancelled`].
+	/// Takes the completed result for `key` if ready, or registers `waker` and
+	/// returns `None`.
 	pub(crate) fn poll(&self, key: Key, waker: &Waker) -> Option<Result<Response, Error>> {
 		let mut driver = self.0.borrow_mut();
 		// The id names the entry's own slot: one the driver let go of names
@@ -295,20 +261,16 @@ impl Reactor {
 		Some(response)
 	}
 
-	/// Asks the operation or timer `key` to give up, without waiting for it. An
-	/// operation's result still lands, and a cancel lands as
-	/// [`ErrorKind::Cancelled`]; a timer is disarmed at once, fired or not.
+	/// Requests asynchronous cancellation of the operation or timer `key`.
 	pub(crate) fn cancel(&self, key: Key) {
 		self.0.borrow_mut().cancel(key.0);
 	}
 
-	/// Lets the operation or timer `key` go without its result. Releasing a key
-	/// whose result was already taken does nothing.
+	/// Detaches `key` when its future is dropped.
 	///
-	/// An operation still in flight is cancelled and detached without blocking:
-	/// the reactor keeps its [`Space`](completion_rt::Space) and descriptor alive
-	/// until the backend reports its completion, though the span's byte range
-	/// remains in flight until then.
+	/// If the operation is still in flight, requests cancellation and keeps its
+	/// [`Buffer`](completion_backend::Buffer) and descriptor alive until the backend
+	/// reports completion.
 	pub(crate) fn release(&self, key: Key) {
 		let id = key.0;
 		let mut driver = self.0.borrow_mut();

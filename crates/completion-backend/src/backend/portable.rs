@@ -1,28 +1,31 @@
 //! Readiness polling for sockets and a thread pool for regular files.
 //!
-//! The reactor files each operation under an id, and this backend carries that
-//! id as a poller key and as a pool job's name: a wait the poller answers and a
-//! job the pool finishes both report the same id back.
+//! The reactor files each operation under an id; this backend files it again
+//! under a key of its own tables — one for the operations waiting on the
+//! poller, one for the jobs on the pool — and each entry names the reactor's
+//! id. The poller names a source by a key of the `sources` slot map, which a
+//! readiness set carries alongside the operations waiting on it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::num::NonZeroUsize;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::sync::Arc;
 use std::task::{Context, Poll as TaskPoll, Wake, Waker};
 use std::time::Duration;
 
 use blocking::{Task, unblock};
 use polling::{Event as Ready, Events, Poller};
+use slotmap::{DefaultKey, Key, KeyData, SlotMap};
+use smallvec::SmallVec;
 
 use super::Op;
-use crate::OwnedDescriptor;
-use crate::desc::RawHandle;
+use crate::desc::{BorrowedDescriptor, OwnedDescriptor};
 use crate::error::Error;
-use crate::memory::IoVecs;
+use crate::memory::{IoVec, Span};
 
-use super::{Config, Mechanism, Response};
+use super::{Config, Response};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Direction {
@@ -31,6 +34,12 @@ enum Direction {
 }
 
 const EVENTS: usize = 64;
+
+/// The most bytes one call names: the calls take a signed length, and a unix
+/// that refuses a length above `ssize_t` would fail the whole transfer. The
+/// kernel caps a single call at its own limit anyway, so a longer buffer moves
+/// what fits and reports a short count, which the exact wrappers repeat.
+const MAX_TRANSFER: usize = i32::MAX as usize;
 
 /// The most descriptors one control message carries.
 const MAX_FDS: usize = 8;
@@ -70,19 +79,24 @@ impl Wake for PollerWake {
 
 pub(crate) struct Portable {
 	poller: Arc<Poller>,
-	readers: HashMap<RawHandle, HashSet<u64>>,
-	writers: HashMap<RawHandle, HashSet<u64>>,
-	keys: HashMap<RawHandle, usize>,
-	sources: HashMap<usize, RawHandle>,
-	next_key: usize,
-	/// The operations waiting on the poller, with the descriptor and the operation
-	/// to run when the poller reports that descriptor ready, named by the id the
-	/// poller carries as a key.
-	waiting: HashMap<u64, (RawHandle, Op<IoVecs>)>,
-	/// The jobs running on the pool, named by the id the pool reports a job by.
-	/// A worker cannot be interrupted, so a job stays here until it lands; the
-	/// reactor's entry may already be gone.
-	pool: HashMap<u64, Task<(u64, io::Result<Response>)>>,
+	/// The key of the source each descriptor the poller knows is registered
+	/// under.
+	keys: HashMap<RawFd, DefaultKey>,
+	/// Each source the poller knows, named by the key it reports readiness
+	/// under, with the operations waiting on it.
+	sources: SlotMap<DefaultKey, Source>,
+	/// The operations waiting on the poller, named by a key the readiness sets
+	/// carry: the reactor's id, the descriptor, the operation to run when the
+	/// poller reports that descriptor ready, and the iovec array it reads
+	/// through. The array is resolved once, when the operation is submitted.
+	waiting: SlotMap<DefaultKey, Waiting>,
+	/// The jobs running on the pool, named by a key of this map; each job names
+	/// the id the pool reports it by. A worker cannot be interrupted, so a job
+	/// stays here until it lands; the reactor's entry may already be gone.
+	pool: SlotMap<DefaultKey, Job>,
+	/// The iovec arrays no waiting operation reads any more, each with its
+	/// allocation kept for the next one.
+	iovecs: Vec<Vec<IoVec>>,
 	/// Completions that landed outside `poll`'s wait — a submission answered here
 	/// and now, a cancel, or a job the pool finished — kept until the next `poll`
 	/// hands them over.
@@ -90,6 +104,78 @@ pub(crate) struct Portable {
 	waker: Waker,
 	events: Events,
 	scratch: Vec<Ready>,
+}
+
+/// One descriptor the poller reports readiness for, and the operations waiting
+/// on it in each direction, named by a key of the `waiting` slot map.
+struct Source {
+	fd: RawFd,
+	readers: SmallVec<[DefaultKey; 2]>,
+	writers: SmallVec<[DefaultKey; 2]>,
+}
+
+impl Source {
+	/// Files an operation waiting for `direction`; the same key is filed once.
+	fn add(&mut self, direction: Direction, key: DefaultKey) {
+		let keys = self.waiting_in(direction);
+		if !keys.contains(&key) {
+			keys.push(key);
+		}
+	}
+
+	/// Takes an operation waiting for `direction` back out.
+	fn remove(&mut self, direction: Direction, key: DefaultKey) {
+		self.waiting_in(direction).retain(|waiting| *waiting != key);
+	}
+
+	/// Whether no operation waits on the source any more.
+	fn idle(&self) -> bool {
+		self.readers.is_empty() && self.writers.is_empty()
+	}
+
+	/// The operations waiting in `direction`.
+	fn waiting_in(&mut self, direction: Direction) -> &mut SmallVec<[DefaultKey; 2]> {
+		match direction {
+			Direction::Readable => &mut self.readers,
+			Direction::Writable => &mut self.writers,
+		}
+	}
+
+	/// The poller interest for the source, which the poller names by `key`.
+	fn interest(&self, key: DefaultKey) -> Ready {
+		match (self.readers.is_empty(), self.writers.is_empty()) {
+			(false, false) => Ready::all(event_key(key)),
+			(false, true) => Ready::readable(event_key(key)),
+			(true, false) => Ready::writable(event_key(key)),
+			(true, true) => Ready::none(event_key(key)),
+		}
+	}
+}
+
+/// One operation waiting for the poller to report its descriptor ready.
+struct Waiting {
+	id: u64,
+	fd: RawFd,
+	op: Op,
+	buffers: Vec<IoVec>,
+}
+
+/// One job the pool is running.
+struct Job {
+	id: u64,
+	task: Task<(u64, io::Result<Response>)>,
+}
+
+/// The poller key a slot map key is reported under. `polling` names an event
+/// by a `usize`; on the targets this backend serves that holds the key's FFI
+/// form whole, so a key handed out again cannot alias a stale event.
+fn event_key(key: DefaultKey) -> usize {
+	key.data().as_ffi() as usize
+}
+
+/// The slot map key an event's poller key names.
+fn source(key: usize) -> DefaultKey {
+	DefaultKey::from(KeyData::from_ffi(key as u64))
 }
 
 impl Portable {
@@ -103,13 +189,11 @@ impl Portable {
 		let poller = Arc::new(Poller::new()?);
 		Ok(Portable {
 			poller: Arc::clone(&poller),
-			readers: HashMap::new(),
-			writers: HashMap::new(),
 			keys: HashMap::new(),
-			sources: HashMap::new(),
-			next_key: 0,
-			waiting: HashMap::new(),
-			pool: HashMap::new(),
+			sources: SlotMap::new(),
+			waiting: SlotMap::new(),
+			pool: SlotMap::new(),
+			iovecs: Vec::new(),
 			done: Vec::new(),
 			waker: Waker::from(Arc::new(PollerWake(poller))),
 			events: Events::with_capacity(NonZeroUsize::new(EVENTS).expect("a nonzero capacity")),
@@ -117,174 +201,151 @@ impl Portable {
 		})
 	}
 
-	fn arm(&mut self, fd: RawHandle) -> io::Result<()> {
-		if let Some(&key) = self.keys.get(&fd) {
-			// SAFETY: the descriptor stays open while the reactor holds it.
-			let source = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
-			// Level triggering reports a still-ready source again after rearming.
-			self.poller
-				.modify_with_mode(&source, self.interest(fd, key), polling::PollMode::Level)
+	/// Rearms the poller for a source it already holds, whose key is `key`:
+	/// level triggering reports a still-ready source again after rearming.
+	fn arm(&mut self, fd: RawFd, key: DefaultKey) -> io::Result<()> {
+		let interest = self.sources[key].interest(key);
+		// SAFETY: the descriptor stays open while the reactor holds it.
+		let source = unsafe { BorrowedFd::borrow_raw(fd) };
+		self.poller
+			.modify_with_mode(&source, interest, polling::PollMode::Level)
+	}
+
+	fn watch(&mut self, fd: RawFd, direction: Direction, key: DefaultKey) -> io::Result<()> {
+		if let Some(&source_key) = self.keys.get(&fd) {
+			self.sources[source_key].add(direction, key);
+			match self.arm(fd, source_key) {
+				Ok(()) => Ok(()),
+				Err(error) => {
+					// Nothing is registered for this operation, and the poller must not
+					// report the descriptor as waiting for it: the key goes back out.
+					let _ = self.unwatch(fd, direction, key);
+					Err(error)
+				}
+			}
 		} else {
 			// A readiness backend calls the operation when the poller says it
 			// is ready, and a socket the caller left in blocking mode would
 			// stall the reactor in that call. MSG_DONTWAIT does not cover it:
 			// XNU's sosendcheck only honours SS_NBIO.
 			// SAFETY: the descriptor stays open while the reactor holds it.
-			rustix::io::ioctl_fionbio(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }, true)?;
-			let key = self.next_key;
-			self.next_key += 1;
+			rustix::io::ioctl_fionbio(unsafe { BorrowedFd::borrow_raw(fd) }, true)?;
+			let mut entry = Source {
+				fd,
+				readers: SmallVec::new(),
+				writers: SmallVec::new(),
+			};
+			entry.add(direction, key);
+			let source_key = self.sources.insert(entry);
+			let interest = self.sources[source_key].interest(source_key);
 			// SAFETY: the descriptor stays open while the reactor holds it, and
 			// every source is `delete`d from the poller before the reactor goes.
-			let source = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
-			unsafe {
+			let source = unsafe { BorrowedFd::borrow_raw(fd) };
+			if let Err(error) = unsafe {
 				self.poller
-					.add_with_mode(&source, self.interest(fd, key), polling::PollMode::Level)
-			}?;
-			self.keys.insert(fd, key);
-			self.sources.insert(key, fd);
+					.add_with_mode(&source, interest, polling::PollMode::Level)
+			} {
+				// The poller never took the source, so nothing may name it.
+				self.sources.remove(source_key);
+				return Err(error);
+			}
+			self.keys.insert(fd, source_key);
 			Ok(())
 		}
 	}
 
-	/// The poller interest for `fd`, whose sources the poller names by `key`.
-	fn interest(&self, fd: RawHandle, key: usize) -> Ready {
-		match (
-			self.readers.contains_key(&fd),
-			self.writers.contains_key(&fd),
-		) {
-			(true, true) => Ready::all(key),
-			(true, false) => Ready::readable(key),
-			(false, true) => Ready::writable(key),
-			(false, false) => Ready::none(key),
-		}
-	}
-
-	fn watch(&mut self, fd: RawHandle, direction: Direction, token: u64) -> io::Result<()> {
-		match direction {
-			Direction::Readable => {
-				self.readers.entry(fd).or_default().insert(token);
-			}
-			Direction::Writable => {
-				self.writers.entry(fd).or_default().insert(token);
-			}
-		}
-		match self.arm(fd) {
-			Ok(()) => Ok(()),
-			Err(error) => {
-				// Nothing is registered for this operation, and the poller must not
-				// report the descriptor as waiting for it: the token goes back out.
-				let _ = self.unwatch(fd, direction, token);
-				Err(error)
-			}
-		}
-	}
-
-	fn unwatch(&mut self, fd: RawHandle, direction: Direction, token: u64) -> io::Result<()> {
-		match direction {
-			Direction::Readable => {
-				if let Some(tokens) = self.readers.get_mut(&fd) {
-					tokens.remove(&token);
-					if tokens.is_empty() {
-						self.readers.remove(&fd);
-					}
-				}
-			}
-			Direction::Writable => {
-				if let Some(tokens) = self.writers.get_mut(&fd) {
-					tokens.remove(&token);
-					if tokens.is_empty() {
-						self.writers.remove(&fd);
-					}
-				}
-			}
-		}
+	fn unwatch(&mut self, fd: RawFd, direction: Direction, key: DefaultKey) -> io::Result<()> {
+		let Some(&source_key) = self.keys.get(&fd) else {
+			return Ok(());
+		};
+		self.sources[source_key].remove(direction, key);
 		self.rearm(fd)
 	}
 
-	fn rearm(&mut self, fd: RawHandle) -> io::Result<()> {
-		let waited = self.readers.contains_key(&fd) || self.writers.contains_key(&fd);
-		if waited {
-			self.arm(fd)
-		} else if let Some(key) = self.keys.remove(&fd) {
-			self.sources.remove(&key);
-			self.poller
-				.delete(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
-				.inspect_err(
-					|error| log::warn!(fd:? = fd, error:% = error; "the poller refused a deregistration"),
-				)
-		} else {
-			Ok(())
+	fn rearm(&mut self, fd: RawFd) -> io::Result<()> {
+		let Some(&key) = self.keys.get(&fd) else {
+			return Ok(());
+		};
+		if !self.sources[key].idle() {
+			return self.arm(fd, key);
 		}
+		self.keys.remove(&fd);
+		self.sources.remove(key);
+		self.poller
+			.delete(unsafe { BorrowedFd::borrow_raw(fd) })
+			.inspect_err(
+				|error| log::warn!(fd:? = fd, error:% = error; "the poller refused a deregistration"),
+			)
 	}
 
 	fn deliver(&mut self, event: &Ready) -> io::Result<()> {
-		let Some(fd) = self.sources.get(&event.key).copied() else {
+		let Some(registered) = self.sources.get(source(event.key)) else {
 			return Ok(());
 		};
-		let mut ids: Vec<u64> = Vec::new();
-		if event.readable
-			&& let Some(waiters) = self.readers.get(&fd)
-		{
-			ids.extend(waiters.iter().copied());
+		// Taken first: answering a key takes it out of the source it came from.
+		let mut keys: SmallVec<[DefaultKey; 4]> = SmallVec::new();
+		if event.readable {
+			keys.extend(registered.readers.iter().copied());
 		}
-		if event.writable
-			&& let Some(waiters) = self.writers.get(&fd)
-		{
-			ids.extend(waiters.iter().copied());
+		if event.writable {
+			keys.extend(registered.writers.iter().copied());
 		}
-		for id in ids {
-			self.run_ready(id)?;
+		for key in keys {
+			self.run_ready(key)?;
 		}
 		Ok(())
 	}
 
 	/// Calls the operation the poller reported ready. One still blocked stays
 	/// registered, and a level-triggered poller reports it again.
-	fn run_ready(&mut self, id: u64) -> io::Result<()> {
-		let (fd, direction, outcome) = {
-			let Some((fd, op)) = self.waiting.get_mut(&id) else {
+	fn run_ready(&mut self, key: DefaultKey) -> io::Result<()> {
+		let (id, fd, direction, outcome) = {
+			let Some(waiting) = self.waiting.get_mut(key) else {
 				// Gone, or a second report the first pass has already answered.
 				return Ok(());
 			};
-			let fd = *fd;
-			let Some(direction) = direction(op) else {
+			let fd = waiting.fd;
+			let Some(direction) = direction(&waiting.op) else {
 				return Ok(());
 			};
-			(fd, direction, run_op(fd, op))
+			(
+				waiting.id,
+				fd,
+				direction,
+				run_op(fd, &mut waiting.op, &mut waiting.buffers),
+			)
 		};
-		match outcome {
+		let landed = match outcome {
 			// The call would block after all: the registration stays, and the
 			// poller reports the descriptor again.
-			Ok(Progress::Blocked) => Ok(()),
-			Ok(Progress::Done(response)) => {
-				self.unwatch(fd, direction, id)?;
-				self.waiting.remove(&id);
-				self.done.push((id, Ok(response)));
-				Ok(())
-			}
-			Err(error) => {
-				self.unwatch(fd, direction, id)?;
-				self.waiting.remove(&id);
-				self.done.push((id, Err(Error::from(error))));
-				Ok(())
-			}
-		}
+			Ok(Progress::Blocked) => return Ok(()),
+			Ok(Progress::Done(response)) => Ok(response),
+			Err(error) => Err(Error::from(error)),
+		};
+		self.unwatch(fd, direction, key)?;
+		let waiting = self
+			.waiting
+			.remove(key)
+			.expect("the operation was just run");
+		release(&mut self.iovecs, waiting.buffers);
+		self.done.push((id, landed));
+		Ok(())
 	}
 
 	fn submit_pool(
 		&mut self,
 		id: u64,
-		fd: RawHandle,
+		fd: RawFd,
 		fdoff: u64,
 		kind: Kind,
-		buffers: IoVecs,
+		buffers: Vec<IoVec>,
 	) -> io::Result<()> {
 		if matches!(kind, Kind::Read | Kind::Write) && buffers.is_empty() {
 			self.done.push((id, Ok(Response::Count(0))));
 			return Ok(());
 		}
 		let task = unblock(move || (id, run_file(fd, fdoff, kind, buffers)));
-		self.pool.insert(id, task);
+		self.pool.insert(Job { id, task });
 		Ok(())
 	}
 
@@ -294,14 +355,16 @@ impl Portable {
 		}
 		let mut landed = Vec::new();
 		let waker = &self.waker;
-		for task in self.pool.values_mut() {
+		for (key, job) in &mut self.pool {
 			let mut context = Context::from_waker(waker);
-			if let TaskPoll::Ready((id, result)) = std::pin::Pin::new(task).poll(&mut context) {
-				landed.push((id, result));
+			if let TaskPoll::Ready((id, result)) =
+				std::pin::Pin::new(&mut job.task).poll(&mut context)
+			{
+				landed.push((key, id, result));
 			}
 		}
-		for (id, result) in landed {
-			self.pool.remove(&id);
+		for (key, id, result) in landed {
+			self.pool.remove(key);
 			self.done.push((id, result.map_err(Error::from)));
 		}
 	}
@@ -310,10 +373,10 @@ impl Portable {
 impl Drop for Portable {
 	fn drop(&mut self) {
 		// The poller requires deregistration before descriptors are closed.
-		for (_, fd) in std::mem::take(&mut self.sources) {
+		for (_, source) in std::mem::take(&mut self.sources) {
 			let _ = self
 				.poller
-				.delete(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) });
+				.delete(unsafe { BorrowedFd::borrow_raw(source.fd) });
 		}
 		// Workers cannot be interrupted; wait until no job can access the caller's resources.
 		while !self.pool.is_empty() {
@@ -323,38 +386,44 @@ impl Drop for Portable {
 	}
 }
 
-impl Mechanism for Portable {
-	fn submit(&mut self, id: u64, fd: RawHandle, op: Op<IoVecs>) -> Result<(), Error> {
+impl Portable {
+	pub(super) fn submit(
+		&mut self,
+		id: u64,
+		fd: BorrowedDescriptor<'_>,
+		op: Op,
+	) -> Result<(), Error> {
+		let fd = fd.as_raw_fd();
 		match op {
 			Op::Read { offset, span } if takes_pool(fd) => self
-				.submit_pool(id, fd, offset, Kind::Read, span)
+				.submit_pool(id, fd, offset, Kind::Read, resolve(&span)?)
 				.map_err(Error::from),
 			Op::Write { offset, span } if takes_pool(fd) => self
-				.submit_pool(id, fd, offset, Kind::Write, span)
+				.submit_pool(id, fd, offset, Kind::Write, resolve(&span)?)
 				.map_err(Error::from),
 			Op::Fsync if takes_pool(fd) => self
-				.submit_pool(id, fd, 0, Kind::Fsync, IoVecs::new())
+				.submit_pool(id, fd, 0, Kind::Fsync, Vec::new())
 				.map_err(Error::from),
 			Op::Flush if takes_pool(fd) => self
-				.submit_pool(id, fd, 0, Kind::Flush, IoVecs::new())
+				.submit_pool(id, fd, 0, Kind::Flush, Vec::new())
 				.map_err(Error::from),
 			Op::Allocate { offset, len } => self
-				.submit_pool(id, fd, 0, Kind::Allocate { offset, len }, IoVecs::new())
+				.submit_pool(id, fd, 0, Kind::Allocate { offset, len }, Vec::new())
 				.map_err(Error::from),
 			Op::Punch { offset, len } => self
-				.submit_pool(id, fd, 0, Kind::Punch { offset, len }, IoVecs::new())
+				.submit_pool(id, fd, 0, Kind::Punch { offset, len }, Vec::new())
 				.map_err(Error::from),
 			// A descriptor that is no regular file cannot be synced or flushed
 			// by the pool: the call is made here.
 			Op::Fsync => {
-				let result = rustix::fs::fsync(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
+				let result = rustix::fs::fsync(unsafe { BorrowedFd::borrow_raw(fd) })
 					.map(|()| Response::Done)
 					.map_err(io::Error::from);
 				self.done.push((id, result.map_err(Error::from)));
 				Ok(())
 			}
 			Op::Flush => {
-				let result = flush_handle(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
+				let result = flush_handle(unsafe { BorrowedFd::borrow_raw(fd) })
 					.map(|()| Response::Done)
 					.map_err(Error::from);
 				self.done.push((id, result));
@@ -376,11 +445,26 @@ impl Mechanism for Portable {
 						"this operation is not implemented on this backend",
 					)));
 				};
-				self.waiting.insert(id, (fd, other));
-				if let Err(error) = self.watch(fd, direction, id) {
-					// The poller never took the operation, so it never was: the token
+				// Resolved before the operation is queued, so an extent out of
+				// bounds refuses the submission.
+				let buffers = match other.span() {
+					Some(span) => resolve_into(&mut self.iovecs, span)?,
+					None => Vec::new(),
+				};
+				let key = self.waiting.insert(Waiting {
+					id,
+					fd,
+					op: other,
+					buffers,
+				});
+				if let Err(error) = self.watch(fd, direction, key) {
+					// The poller never took the operation, so it never was: the key
 					// goes back out with it.
-					self.waiting.remove(&id);
+					let waiting = self
+						.waiting
+						.remove(key)
+						.expect("the operation was just filed");
+					release(&mut self.iovecs, waiting.buffers);
 					return Err(Error::from(error));
 				}
 				Ok(())
@@ -388,24 +472,34 @@ impl Mechanism for Portable {
 		}
 	}
 
-	fn cancel(&mut self, id: u64) {
-		if self.pool.contains_key(&id) {
-			// A worker already inside a syscall must finish before its buffers can be released.
+	pub(super) fn cancel(&mut self, id: u64) {
+		// A worker already inside a syscall must finish before its buffers can be released.
+		if self.pool.values().any(|job| job.id == id) {
 			return;
 		}
-		let Some((fd, op)) = self.waiting.remove(&id) else {
+		let Some(key) = self
+			.waiting
+			.iter()
+			.find(|(_, waiting)| waiting.id == id)
+			.map(|(key, _)| key)
+		else {
 			return;
 		};
-		if let Some(direction) = direction(&op) {
-			let _ = self.unwatch(fd, direction, id);
+		let waiting = self
+			.waiting
+			.remove(key)
+			.expect("the operation was just found");
+		if let Some(direction) = direction(&waiting.op) {
+			let _ = self.unwatch(waiting.fd, direction, key);
 		}
+		release(&mut self.iovecs, waiting.buffers);
 		self.done.push((id, Err(Error::cancelled())));
 	}
 
-	fn poll(
+	pub(super) fn poll(
 		&mut self,
 		timeout: Option<Duration>,
-		completed: &mut Vec<(u64, Result<Response, Error>)>,
+		mut complete: impl FnMut(u64, Result<Response, Error>),
 	) -> Result<(), Error> {
 		// Collect finished jobs before sleeping so their completions do not wait
 		// for the timeout.
@@ -415,7 +509,9 @@ impl Mechanism for Portable {
 		// before this poll — and the reactor has not settled it: sleeping now
 		// would wait out a timeout on news already in hand.
 		if !self.done.is_empty() {
-			completed.append(&mut self.done);
+			for (id, response) in self.done.drain(..) {
+				complete(id, response);
+			}
 			return Ok(());
 		}
 		self.events.clear();
@@ -427,18 +523,20 @@ impl Mechanism for Portable {
 		self.scratch = batch;
 		result?;
 		self.collect_pool();
-		completed.append(&mut self.done);
+		for (id, response) in self.done.drain(..) {
+			complete(id, response);
+		}
 		Ok(())
 	}
 
-	fn waker(&self) -> Waker {
+	pub(super) fn waker(&self) -> Waker {
 		self.waker.clone()
 	}
 }
 
 /// The direction an operation waits on for the poller to report it ready;
 /// `None` for one that never waits.
-fn direction(op: &Op<IoVecs>) -> Option<Direction> {
+fn direction(op: &Op) -> Option<Direction> {
 	match op {
 		Op::Read { .. } | Op::Recv { .. } | Op::RecvWithFds { .. } | Op::Accept | Op::Readable => {
 			Some(Direction::Readable)
@@ -448,15 +546,49 @@ fn direction(op: &Op<IoVecs>) -> Option<Direction> {
 	}
 }
 
-fn takes_pool(fd: RawHandle) -> bool {
-	let Ok(stat) = rustix::fs::fstat(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }) else {
+/// The iovec array a span resolves to before its operation is queued, so one of
+/// its extents out of bounds refuses the submission.
+fn resolve(span: &Span) -> io::Result<Vec<IoVec>> {
+	let mut buffers = Vec::new();
+	span.resolve_into(&mut buffers)?;
+	Ok(buffers)
+}
+
+/// An iovec array to fill: one no waiting operation reads any more, or a new
+/// one.
+fn lease(iovecs: &mut Vec<Vec<IoVec>>) -> Vec<IoVec> {
+	iovecs.pop().unwrap_or_default()
+}
+
+/// Takes an array back once nothing reads it, keeping the allocation for the
+/// next operation.
+fn release(iovecs: &mut Vec<Vec<IoVec>>, mut buffers: Vec<IoVec>) {
+	buffers.clear();
+	iovecs.push(buffers);
+}
+
+/// Resolves `span` into an array from the pool, so an extent out of bounds
+/// refuses the submission before the operation is queued.
+fn resolve_into(iovecs: &mut Vec<Vec<IoVec>>, span: &Span) -> io::Result<Vec<IoVec>> {
+	let mut buffers = lease(iovecs);
+	match span.resolve_into(&mut buffers) {
+		Ok(()) => Ok(buffers),
+		Err(error) => {
+			release(iovecs, buffers);
+			Err(error)
+		}
+	}
+}
+
+fn takes_pool(fd: RawFd) -> bool {
+	let Ok(stat) = rustix::fs::fstat(unsafe { BorrowedFd::borrow_raw(fd) }) else {
 		return false;
 	};
 	rustix::fs::FileType::from_raw_mode(stat.st_mode as _) == rustix::fs::FileType::RegularFile
 }
 
-fn run_file(fd: RawHandle, fdoff: u64, kind: Kind, buffers: IoVecs) -> io::Result<Response> {
-	let fd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+fn run_file(fd: RawFd, fdoff: u64, kind: Kind, buffers: Vec<IoVec>) -> io::Result<Response> {
+	let fd = unsafe { BorrowedFd::borrow_raw(fd) };
 	match kind {
 		Kind::Fsync => rustix::fs::fsync(fd)
 			.map(|()| Response::Done)
@@ -470,14 +602,11 @@ fn run_file(fd: RawHandle, fdoff: u64, kind: Kind, buffers: IoVecs) -> io::Resul
 			};
 			// SAFETY: the reactor holds the memory backing this iovec until the job lands; the syscall copies through its pointer without forming a Rust reference.
 			let offset = fdoff as libc::off_t;
+			let len = span.len().min(MAX_TRANSFER);
 			count(unsafe {
 				match kind {
-					Kind::Read => {
-						libc::pread(fd.as_raw_fd(), span.as_ptr().cast(), span.len(), offset)
-					}
-					Kind::Write => {
-						libc::pwrite(fd.as_raw_fd(), span.as_ptr().cast(), span.len(), offset)
-					}
+					Kind::Read => libc::pread(fd.as_raw_fd(), span.as_ptr().cast(), len, offset),
+					Kind::Write => libc::pwrite(fd.as_raw_fd(), span.as_ptr().cast(), len, offset),
 					_ => unreachable!("handled above"),
 				}
 			})
@@ -649,11 +778,11 @@ fn call(result: libc::ssize_t) -> io::Result<Call> {
 
 // The socket calls pass MSG_DONTWAIT: the caller's socket may be in blocking
 // mode, and a call that blocked would stall the reactor thread behind it.
-fn run_op(fd: RawHandle, op: &mut Op<IoVecs>) -> io::Result<Progress> {
+fn run_op(fd: RawFd, op: &mut Op, buffers: &mut Vec<IoVec>) -> io::Result<Progress> {
 	// SAFETY: the descriptor stays open for the operation's flight.
-	let fd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+	let fd = unsafe { BorrowedFd::borrow_raw(fd) };
 	match op {
-		Op::Read { span: buffers, .. } => {
+		Op::Read { .. } => {
 			let Some((ptr, len)) = first_buffer(buffers) else {
 				return Ok(Progress::Done(Response::Count(0)));
 			};
@@ -663,7 +792,7 @@ fn run_op(fd: RawHandle, op: &mut Op<IoVecs>) -> io::Result<Progress> {
 				Call::Blocked => Ok(Progress::Blocked),
 			}
 		}
-		Op::Write { span: buffers, .. } => {
+		Op::Write { .. } => {
 			let Some((ptr, len)) = first_buffer(buffers) else {
 				return Ok(Progress::Done(Response::Count(0)));
 			};
@@ -683,7 +812,7 @@ fn run_op(fd: RawHandle, op: &mut Op<IoVecs>) -> io::Result<Progress> {
 			Err(rustix::io::Errno::AGAIN) => Ok(Progress::Blocked),
 			Err(error) => Err(error.into()),
 		},
-		Op::Recv { span: buffers, .. } => {
+		Op::Recv { .. } => {
 			let (ptr, len) = one_buffer(buffers)?;
 			match call(unsafe { libc::recv(fd.as_raw_fd(), ptr.cast(), len, libc::MSG_DONTWAIT) })?
 			{
@@ -691,7 +820,7 @@ fn run_op(fd: RawHandle, op: &mut Op<IoVecs>) -> io::Result<Progress> {
 				Call::Blocked => Ok(Progress::Blocked),
 			}
 		}
-		Op::RecvWithFds { span: buffers, .. } => {
+		Op::RecvWithFds { .. } => {
 			let (ptr, len) = one_buffer(buffers)?;
 			// The received descriptors are this call's own: nothing waits on
 			// them after the response carries them out.
@@ -714,7 +843,7 @@ fn run_op(fd: RawHandle, op: &mut Op<IoVecs>) -> io::Result<Progress> {
 				Call::Blocked => Ok(Progress::Blocked),
 			}
 		}
-		Op::Send { span: buffers, fds } => send_socket(fd, buffers, fds),
+		Op::Send { fds, .. } => send_socket(fd, buffers, fds),
 		// A wait for readiness is answered by the poller itself.
 		Op::Readable | Op::Writable => return Ok(Progress::Done(Response::Done)),
 		// Everything else runs on the pool.
@@ -727,7 +856,7 @@ fn run_op(fd: RawHandle, op: &mut Op<IoVecs>) -> io::Result<Progress> {
 /// the bytes, so they go with the call.
 fn send_socket(
 	fd: BorrowedFd<'_>,
-	buffers: &mut IoVecs,
+	buffers: &[IoVec],
 	fds: &mut Vec<OwnedDescriptor>,
 ) -> io::Result<Progress> {
 	if fds.len() > MAX_FDS {
@@ -774,18 +903,20 @@ fn send_socket(
 	}
 }
 
-fn one_buffer(buffers: &IoVecs) -> io::Result<(*mut u8, usize)> {
-	let [buf] = buffers.as_slice() else {
+fn one_buffer(buffers: &[IoVec]) -> io::Result<(*mut u8, usize)> {
+	let [buf] = buffers else {
 		return Err(io::Error::new(
 			io::ErrorKind::Unsupported,
 			"a socket transfer needs exactly one buffer",
 		));
 	};
-	Ok((buf.as_ptr(), buf.len()))
+	Ok((buf.as_ptr(), buf.len().min(MAX_TRANSFER)))
 }
 
-fn first_buffer(buffers: &IoVecs) -> Option<(*mut u8, usize)> {
-	buffers.first().map(|buf| (buf.as_ptr(), buf.len()))
+fn first_buffer(buffers: &[IoVec]) -> Option<(*mut u8, usize)> {
+	buffers
+		.first()
+		.map(|buf| (buf.as_ptr(), buf.len().min(MAX_TRANSFER)))
 }
 
 fn take_fds(msg: &libc::msghdr, out: &mut Vec<OwnedDescriptor>) {
@@ -821,20 +952,20 @@ mod tests {
 	fn a_deregistration_of_a_closed_descriptor_leaves_no_key_behind() {
 		let mut backend = Portable::new(&Config::default()).unwrap();
 		let (reader, _writer) = std::io::pipe().unwrap();
-		let token = 7;
-		let fd = RawHandle::from_descriptor(reader.as_descriptor());
-		backend.watch(fd, Direction::Readable, token).unwrap();
-		let key = backend.keys[&fd];
+		let fd = reader.as_descriptor().as_raw_fd();
+		let key = backend.waiting.insert(Waiting {
+			id: 7,
+			fd,
+			op: Op::Readable,
+			buffers: Vec::new(),
+		});
+		backend.watch(fd, Direction::Readable, key).unwrap();
+		let registered = backend.keys[&fd];
 		drop(reader);
-		let _ = backend.unwatch(fd, Direction::Readable, token);
+		let _ = backend.unwatch(fd, Direction::Readable, key);
 		assert!(!backend.keys.contains_key(&fd));
-		assert!(!backend.sources.contains_key(&key));
-		assert!(
-			backend
-				.readers
-				.get(&fd)
-				.is_none_or(|tokens| !tokens.contains(&token))
-		);
+		assert!(!backend.sources.contains_key(registered));
+		assert!(backend.sources.is_empty());
 	}
 
 	/// Simulate a poller that lost the source before deregistration; stale readiness must not retain or dispatch the old key.
@@ -842,22 +973,22 @@ mod tests {
 	fn a_refused_deregistration_leaves_no_key_behind() {
 		let mut backend = Portable::new(&Config::default()).unwrap();
 		let (reader, _writer) = std::io::pipe().unwrap();
-		let token = 7;
-		let fd = RawHandle::from_descriptor(reader.as_descriptor());
-		backend.watch(fd, Direction::Readable, token).unwrap();
-		let key = backend.keys[&fd];
+		let fd = reader.as_descriptor().as_raw_fd();
+		let key = backend.waiting.insert(Waiting {
+			id: 7,
+			fd,
+			op: Op::Readable,
+			buffers: Vec::new(),
+		});
+		backend.watch(fd, Direction::Readable, key).unwrap();
+		let registered = backend.keys[&fd];
 		backend
 			.poller
 			.delete(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
 			.unwrap();
-		assert!(backend.unwatch(fd, Direction::Readable, token).is_err());
+		assert!(backend.unwatch(fd, Direction::Readable, key).is_err());
 		assert!(!backend.keys.contains_key(&fd));
-		assert!(!backend.sources.contains_key(&key));
-		assert!(
-			backend
-				.readers
-				.get(&fd)
-				.is_none_or(|tokens| !tokens.contains(&token))
-		);
+		assert!(!backend.sources.contains_key(registered));
+		assert!(backend.sources.is_empty());
 	}
 }

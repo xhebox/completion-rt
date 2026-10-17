@@ -13,8 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use common::Buffer;
-use completion_async::{Cancel, Config, ErrorKind, Executor, Facade, File, Space};
+use completion_async::{Buffer, Cancel, Config, ErrorKind, Executor, Facade, File};
 
 fn executor() -> Executor {
 	common::init_logging();
@@ -88,14 +87,13 @@ fn a_hangup_survives_a_poll_the_kernel_ends_early() {
 	let mut hangup = Box::pin(stream.hangup());
 	assert!(hangup.as_mut().poll(&mut cx).is_pending());
 	let scratch = common::tempdir("completion-hangup-ended").unwrap();
-	let buf: Arc<Buffer> = Arc::new(Buffer::new(24));
-	let space = Space::new(buf.clone());
+	let buf: Buffer = Buffer::zeroed(24);
 	let mut reads = Vec::new();
 	for index in 0..24 {
 		let path = scratch.path().join(format!("data{index}"));
 		std::fs::write(&path, b"hello").unwrap();
 		let file: File = Facade::with_executor(common::open(&path).unwrap(), &executor);
-		let mut read = Box::pin(file.read_at(space.span(index, 1), 0));
+		let mut read = Box::pin(file.read_at(buf.span(index, 1), 0));
 		assert!(read.as_mut().poll(&mut cx).is_pending());
 		// Held: dropping a transfer releases the operation behind it.
 		reads.push(read);

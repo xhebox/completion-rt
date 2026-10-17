@@ -1,34 +1,34 @@
-//! The error every reactor operation reports, and the async layer over it.
+//! Error types for completion operations.
 
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 
-/// What the caller does next. Matching on it is the decision.
+/// Category of an [`Error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorKind {
-	/// The caller gave up on the operation.
+	/// The operation was cancelled.
 	Cancelled,
-	/// The executor was dropped, so nothing will run the task.
+	/// The executor was dropped before the task could be spawned.
 	ExecutorClosed,
-	/// The kernel or backend failed the call; the error is its [`source`](StdError::source).
+	/// An OS or I/O failure occurred; see [`Error::source`](StdError::source) for the underlying [`io::Error`].
 	Failed,
-	/// The reactor has been shut down, so nothing new can be armed or submitted.
+	/// The reactor has been shut down and no longer accepts work.
 	Stopped,
 }
 
-/// Whether repeating the same call can succeed.
+/// Whether retrying the operation may succeed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Status {
-	/// Repeating the call cannot succeed as issued.
+	/// Retrying the same call will fail again.
 	Permanent,
-	/// Repeating the call may succeed.
+	/// The failure is transient (`Interrupted`, `WouldBlock`, or `TimedOut`) and the call can be retried.
 	Temporary,
 }
 
-/// An error from a reactor operation.
+/// An error returned by a completion operation or runtime call.
 #[derive(Debug)]
 pub struct Error {
 	kind: ErrorKind,
@@ -36,7 +36,6 @@ pub struct Error {
 }
 
 impl Error {
-	/// The caller gave up on the operation.
 	#[doc(hidden)]
 	pub fn cancelled() -> Error {
 		Error {
@@ -45,7 +44,6 @@ impl Error {
 		}
 	}
 
-	/// The executor was dropped. Only the async layer, which owns executors, builds this.
 	#[doc(hidden)]
 	pub fn executor_closed() -> Error {
 		Error {
@@ -54,8 +52,6 @@ impl Error {
 		}
 	}
 
-	/// The reactor has been shut down; only the layer that owns the shutdown
-	/// builds this.
 	#[doc(hidden)]
 	pub fn stopped() -> Error {
 		Error {
@@ -64,10 +60,12 @@ impl Error {
 		}
 	}
 
+	/// Returns the [`ErrorKind`] for this error.
 	pub fn kind(&self) -> ErrorKind {
 		self.kind
 	}
 
+	/// Returns whether the error is [`Status::Temporary`] or [`Status::Permanent`].
 	pub fn status(&self) -> Status {
 		match self.source.as_ref().map(io::Error::kind) {
 			Some(

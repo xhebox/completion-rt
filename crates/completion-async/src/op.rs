@@ -1,8 +1,5 @@
-//! The facade, the results its operations yield, and the futures driving them.
-//!
-//! [`Flow`] is a transfer's round-by-round state: each round submits one
-//! [`LowOp`] and adds up what it moved. [`Gate`] is the one-round form, for an
-//! operation with nothing to add up.
+//! Resource wrapper ([`Facade`]), operation futures ([`Transfer`], [`Receive`],
+//! [`Op`]), and result types ([`Outcome`], [`Received`]).
 
 use std::future::Future;
 use std::io;
@@ -10,19 +7,29 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use completion_rt::{AsDescriptor, Error, Op as LowOp, OwnedDescriptor, Response, Span, Status};
+use completion_backend::{
+	AsDescriptor, Error, Op as LowOp, OwnedDescriptor, Response, Span, Status,
+};
 
 use crate::Executor;
 use crate::completion::{Cancel, Completion, submit};
 use crate::global;
 use crate::reactor::Reactor;
 
-/// An owned resource with async operations submitted through its
-/// [`Executor`](crate::Executor).
+/// Shared handle to an I/O resource bound to an [`Executor`](crate::Executor).
 ///
-/// Which operations a facade has is its resource type, named where the
-/// operations are: a `File` is read at an offset and synced, a `TcpStream` is
-/// received and sent on. A socket is not read at an offset or synced:
+/// Cloning a `Facade` is cheap (`Arc` clone) and refers to the same underlying
+/// resource and reactor. Available I/O methods depend on the resource type `S`:
+///
+/// - [`std::fs::File`] (`File`): positional reads/writes (`read_at`, `read_exact_at`,
+///   `write_at`, `write_all_at`) and file maintenance (`sync`, `flush`, `allocate`, `punch`).
+/// - Pipes, stdio, and raw owned descriptors: positional reads/writes.
+/// - [`SocketHandle`](crate::SocketHandle) / [`StreamHandle`](crate::StreamHandle):
+///   `recv`, `send`, fd-passing variants, `shutdown`, and `hangup`.
+/// - [`ListenerHandle`](crate::ListenerHandle): `accept`.
+/// - [`Signal`](crate::Signal): `wait_readable` and `wait_writable`.
+///
+/// Unsupported operations are rejected at compile time:
 ///
 /// ```compile_fail
 /// # use completion_async::Facade;
@@ -38,18 +45,12 @@ use crate::reactor::Reactor;
 /// }
 /// ```
 ///
-/// Nor is a pipe synced:
-///
 /// ```compile_fail
 /// # use completion_async::Facade;
 /// fn sync(pipe: &Facade<std::io::PipeWriter>) {
 /// 	let _ = pipe.sync();
 /// }
 /// ```
-///
-/// Nor does a resource with a transfer have a readiness wait: the backend arms
-/// the readiness itself when a call would block. Only [`Signal`](crate::Signal)
-/// waits.
 ///
 /// ```compile_fail
 /// # use completion_async::Facade;
@@ -63,22 +64,22 @@ pub struct Facade<S> {
 }
 
 impl<S> Facade<S> {
-	/// Wraps `resource`, its operations going to this thread's global
-	/// executor.
+	/// Wraps `resource` and binds it to the current thread's default [`Executor`].
 	///
-	/// See [`Facade::with_executor`] for the resource's requirements.
+	/// See [`Facade::with_executor`] for platform-specific resource requirements.
 	#[fastrace::trace]
 	pub fn new(resource: impl Into<S>) -> Facade<S> {
 		Self::from_parts(Arc::new(resource.into()), global::reactor())
 	}
 
-	/// Wraps `resource`, its operations going to `executor`.
+	/// Wraps `resource` and binds it to `executor`.
 	///
-	/// On Windows the resource must be opened for overlapped I/O: a file
-	/// through [`OpenOptions`](crate::OpenOptions), which asks for
-	/// `FILE_FLAG_OVERLAPPED`. A handle opened without that flag cannot be owned
-	/// by a completion port, so its operations fail with the invalid-parameter
-	/// error the association gives.
+	/// # Platform notes
+	/// - **Windows**: Files must be opened with `FILE_FLAG_OVERLAPPED` (use
+	///   [`OpenOptions`](crate::OpenOptions)), or IOCP submissions will fail with
+	///   invalid-parameter errors.
+	/// - **Portable Unix** (non-Linux): Non-file descriptors (sockets, pipes, etc.)
+	///   must be configured in non-blocking mode.
 	#[fastrace::trace]
 	pub fn with_executor(resource: impl Into<S>, executor: &Executor) -> Facade<S> {
 		Self::from_parts(Arc::new(resource.into()), executor.reactor().clone())
@@ -96,8 +97,10 @@ impl<S> Facade<S> {
 		&self.resource
 	}
 
-	/// Gives the resource back if nothing else names it: `Err(self)` while
-	/// another facade clone or an operation still holds it.
+	/// Unwraps the inner resource if this `Facade` is the only reference to it.
+	///
+	/// Returns `Err(self)` if another `Facade` clone or an in-flight operation
+	/// still holds a reference.
 	pub fn try_take(self) -> Result<S, Facade<S>> {
 		let Facade { resource, reactor } = self;
 		match Arc::try_unwrap(resource) {
@@ -124,10 +127,14 @@ impl<S> Clone for Facade<S> {
 	}
 }
 
-/// A value and whether the operation completed; partial progress is retained on error or cancellation.
+/// Result of a transfer operation, preserving any partial progress (`value`)
+/// alongside the completion status (`result`).
 #[derive(Debug)]
 pub struct Outcome<T> {
+	/// Progress accumulated before the operation finished, failed, or was cancelled
+	/// (e.g. number of bytes transferred or [`Received`]).
 	pub value: T,
+	/// `Ok(())` if the operation completed in full, or `Err` if it stopped early.
 	pub result: Result<(), Error>,
 }
 
@@ -136,7 +143,8 @@ impl<T> Outcome<T> {
 		Self { value, result }
 	}
 
-	/// Discards partial progress on failure.
+	/// Converts the outcome into a standard `Result`, returning `self.value` on
+	/// `Ok` and discarding partial progress on `Err`.
 	pub fn into_result(self) -> Result<T, Error> {
 		self.result.map(|()| self.value)
 	}
@@ -431,7 +439,8 @@ impl Gate {
 	}
 }
 
-/// A byte transfer whose [`Outcome`] retains partial progress on error or cancellation.
+/// Future for a byte transfer operation, resolving to `Outcome<usize>` with the
+/// number of bytes transferred.
 pub struct Transfer {
 	flow: Flow,
 	finished: bool,
@@ -461,7 +470,8 @@ impl Transfer {
 		}
 	}
 
-	/// Cancels the transfer while retaining bytes already transferred.
+	/// Attaches a [`Cancel`] token to abort the transfer while preserving the count
+	/// of bytes transferred before cancellation in [`Outcome::value`].
 	pub fn until(self, cancel: &Cancel) -> Transfer {
 		let Transfer { flow, .. } = self;
 		Self {
@@ -487,10 +497,13 @@ impl Future for Transfer {
 	}
 }
 
-/// Bytes received and descriptors passed in control messages.
+/// Payload of [`Receive`], containing both the byte count and any ancillary
+/// descriptors received.
 #[derive(Debug)]
 pub struct Received {
+	/// Number of payload bytes received.
 	pub bytes: usize,
+	/// Descriptors received via ancillary control messages (`SCM_RIGHTS`).
 	pub fds: Vec<OwnedDescriptor>,
 }
 
@@ -500,7 +513,8 @@ impl Received {
 	}
 }
 
-/// A receive that also takes the descriptors a control message carries.
+/// Future for a socket receive operation that also accepts ancillary file
+/// descriptors, resolving to `Outcome<Received>`.
 pub struct Receive {
 	flow: Flow,
 	finished: bool,
@@ -518,7 +532,8 @@ impl Receive {
 		}
 	}
 
-	/// Cancels the receive while retaining bytes and descriptors already received.
+	/// Attaches a [`Cancel`] token to abort the receive while preserving any bytes
+	/// and descriptors received before cancellation in [`Outcome::value`].
 	pub fn until(self, cancel: &Cancel) -> Receive {
 		let Receive { flow, .. } = self;
 		Self {
@@ -545,7 +560,8 @@ impl Future for Receive {
 	}
 }
 
-/// An operation with nothing to hand back: a wait for readiness, or a sync.
+/// Future for a non-transfer operation (such as `sync`, `flush`, `allocate`,
+/// `punch`, `hangup`, or readiness waits on [`Signal`](crate::Signal)).
 pub struct Op {
 	gate: Gate,
 	finished: bool,
@@ -559,7 +575,7 @@ impl Op {
 		}
 	}
 
-	/// Gives the operation up when `cancel` fires.
+	/// Cancels the operation when `cancel` is triggered.
 	pub fn until(self, cancel: &Cancel) -> Op {
 		let Op { gate, .. } = self;
 		Self {

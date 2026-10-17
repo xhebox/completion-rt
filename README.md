@@ -3,23 +3,21 @@
 Completion-model async I/O for Rust: io_uring on Linux, IOCP on Windows, and a readiness-based emulation (`polling`, with file I/O on `blocking`'s pool) on other unix.
 
 ```rust
-use std::sync::Arc;
-
-use completion_async::{Cancel, Config, Executor, Facade, Space};
+use completion_async::{Buffer, Cancel, Config, Executor, Facade};
 
 let mut executor = Executor::new(Config::default())?;
 let file = Facade::with_executor(std::fs::File::open("data")?, &executor);
-let space = Space::new(Arc::new(memory)); // 5 bytes: a `Memory` you implement
+let buffer = Buffer::zeroed(5); // or `Buffer::new(Arc::new(memory))` for your own `Memory`
 let cancel = Cancel::new();
 
-let read = executor.block_on(file.read_exact_at(space.whole(), 0).until(&cancel))?;
+let read = executor.block_on(file.read_exact_at(buffer.whole(), 0).until(&cancel))?;
 assert_eq!(read.into_result()?, 5);
 ```
 
 ## Semantics
 
-- Dropping an operation's future cancels and detaches it without blocking: the reactor keeps its Space and descriptor alive until the kernel finishes, but the Span's bytes stay in flight until then. Cancel first with a Cancel and until when the range is to be read or reused right away.
-- Memory is shared, not moved: a `Space` holds an `Arc` of it (`Space::new(Arc::new(memory))`), and each operation names one `Span` of that space — `space.span(offset, len)`, or `space.gather(ranges)` for several. A range outside the memory fails the operation; it does not panic.
+- Dropping an operation's future cancels and detaches it without blocking: the reactor keeps its Buffer and descriptor alive until the kernel finishes, but the Span's bytes stay in flight until then. Cancel first with a Cancel and until when the range is to be read or reused right away.
+- Memory is shared, not moved: a `Buffer` is a cheap reference-counted handle (`Buffer::zeroed`, `Buffer::from_slice`, or `Buffer::new(Arc::new(memory))` for a `Memory` you implement), and each operation names one `Span` of that buffer — `buffer.span(offset, len)`, or `buffer.gather(ranges)` for several. A range outside the memory fails the operation; it does not panic. `BufferPool` hands out pre-faulted, page-aligned buffers from a fixed set of blocks, for repeated I/O.
 - `Facade::read_at`, `write_at`, `recv` and `send` make exactly one system call, so they can move fewer bytes than asked. `Facade`'s `read_exact_at`, `write_all_at`, `recv_exact` and `send_all` repeat the call until everything is moved; if one stops early, on an error or a cancel, `Outcome::value` still says how many bytes it moved.
 - A `Reactor` and everything bound to it stay on the thread that built it. Only its waker and a `Cancel` cross threads.
 

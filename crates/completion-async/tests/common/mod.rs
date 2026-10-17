@@ -1,4 +1,4 @@
-//! What the completion-rt tests share.
+//! What the completion-backend tests share.
 //!
 //! Which helpers a binary uses depends on which target's tests it builds —
 //! windows compiles the socket tests away — so the module as a whole opts out
@@ -9,10 +9,12 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Once};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
+
+use completion_async::{Buffer, Extent, IoVec, Memory};
 
 /// Runs a future to completion on this thread, woken by whoever completes it.
 ///
@@ -151,71 +153,58 @@ pub(crate) fn tempdir(tag: &str) -> io::Result<Scratch> {
 	})
 }
 
-/// Bytes a test binds to a space. Atomic, so the backend may write them through
-/// an iovec while the buffer is shared.
-pub(crate) struct Buffer(std::sync::Arc<[std::sync::atomic::AtomicU8]>);
+/// A zeroed [`Buffer`] whose memory reports when the last handle to it drops.
+///
+/// A test that watches a reactor let go of a buffer cannot count an `Arc` it no
+/// longer holds one of; the memory's own drop is the same fact, seen from the
+/// other side.
+pub(crate) fn tracked(len: usize) -> (Buffer, Tracked) {
+	let alive = Arc::new(AtomicBool::new(true));
+	let memory = TrackedMemory {
+		bytes: vec![0; len],
+		alive: Arc::clone(&alive),
+	};
+	(Buffer::new(Arc::new(memory)), Tracked(alive))
+}
 
-impl Buffer {
-	/// `len` zeroed bytes.
-	pub(crate) fn new(len: usize) -> Buffer {
-		Buffer::from_slice(&vec![0; len])
-	}
+/// Whether the memory behind a [`tracked`] buffer is still alive.
+pub(crate) struct Tracked(Arc<AtomicBool>);
 
-	pub(crate) fn from_slice(bytes: &[u8]) -> Buffer {
-		Buffer(
-			bytes
-				.iter()
-				.map(|&byte| std::sync::atomic::AtomicU8::new(byte))
-				.collect(),
-		)
-	}
-
-	pub(crate) fn len(&self) -> usize {
-		self.0.len()
-	}
-
-	pub(crate) fn is_empty(&self) -> bool {
-		self.0.is_empty()
-	}
-
-	/// Copies `out.len()` bytes at `offset` out of the buffer.
-	pub(crate) fn copy_to(&self, offset: usize, out: &mut [u8]) {
-		for (index, byte) in out.iter_mut().enumerate() {
-			*byte = self.0[offset + index].load(Relaxed);
-		}
-	}
-
-	/// Copies `bytes` into the buffer at `offset`.
-	pub(crate) fn copy_from(&self, offset: usize, bytes: &[u8]) {
-		for (index, byte) in bytes.iter().enumerate() {
-			self.0[offset + index].store(*byte, Relaxed);
-		}
-	}
-
-	pub(crate) fn to_vec(&self) -> Vec<u8> {
-		self.0.iter().map(|byte| byte.load(Relaxed)).collect()
+impl Tracked {
+	/// True while any `Buffer` or `Span` naming the memory is alive.
+	pub(crate) fn alive(&self) -> bool {
+		self.0.load(Relaxed)
 	}
 }
 
-// SAFETY: the bytes are atomics, so a write through the pointer races on bytes
-// only, never on a reference; `iovec` checks the extent against the length.
-unsafe impl completion_async::Memory for Buffer {
-	fn len(&self) -> usize {
-		self.0.len()
+/// Plain bytes that note their own end: the last handle dropping is what a test
+/// watches to see the reactor let go.
+struct TrackedMemory {
+	bytes: Vec<u8>,
+	alive: Arc<AtomicBool>,
+}
+
+impl Drop for TrackedMemory {
+	fn drop(&mut self) {
+		self.alive.store(false, Relaxed);
+	}
+}
+
+// SAFETY: the bytes are owned outright and only reached through `iovec`, which
+// checks every extent against them.
+unsafe impl Memory for TrackedMemory {
+	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
+		let start = usize::try_from(extent.offset)
+			.map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+		let end = start
+			.checked_add(extent.len)
+			.filter(|&end| end <= self.bytes.len())
+			.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+		// SAFETY: `start..end` is inside the vector, which the buffer keeps alive.
+		Ok(unsafe { IoVec::new(self.bytes.as_ptr().add(start).cast_mut(), end - start) })
 	}
 
-	fn iovec(&self, extent: completion_async::Extent) -> io::Result<completion_async::IoVec> {
-		let end = usize::try_from(extent.offset)
-			.ok()
-			.and_then(|offset| offset.checked_add(extent.len));
-		if !end.is_some_and(|end| end <= self.0.len()) {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"range outside the buffer",
-			));
-		}
-		let base = self.0.as_ptr() as *mut u8;
-		// SAFETY: in bounds, checked above.
-		Ok(unsafe { completion_async::IoVec::new(base.add(extent.offset as usize), extent.len) })
+	fn len(&self) -> usize {
+		self.bytes.len()
 	}
 }

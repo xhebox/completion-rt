@@ -7,7 +7,6 @@
 //! it reached the wait the driver is parked in.
 
 mod common;
-use common::Buffer;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -16,7 +15,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use completion_async::{Config, ErrorKind, Executor, File, Space, Timeout};
+use completion_async::{Buffer, Config, ErrorKind, Executor, File, Timeout};
 
 fn executor() -> Executor {
 	common::init_logging();
@@ -165,8 +164,8 @@ fn an_operation_after_the_executor_drops_is_refused() {
 
 	let executor = executor();
 	let file = File::with_executor(common::open(&path).unwrap(), &executor);
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let payload = Space::new(buffer.clone()).whole();
+	let buffer: Buffer = Buffer::zeroed(5);
+	let payload = buffer.whole();
 	drop(executor);
 
 	let mut read = std::pin::pin!(file.read_at(payload, 0));
@@ -190,8 +189,8 @@ fn a_local_executor_reads_a_real_file() {
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
 	let file = File::with_executor(common::open(&path).unwrap(), &executor);
-	let buffer = Arc::new(Buffer::new(5));
-	let payload = Space::new(buffer.clone()).whole();
+	let buffer = Buffer::zeroed(5);
+	let payload = buffer.whole();
 	let outcome = executor.block_on(file.read_at(payload, 0)).unwrap();
 	assert_eq!(outcome.into_result().unwrap(), 5);
 	assert_eq!(buffer.to_vec(), b"hello");
@@ -262,8 +261,8 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 			}
 		}));
 		let file = File::with_executor(common::open(&path).unwrap(), &executor);
-		let buffer = Arc::new(Buffer::new(5));
-		let payload = Space::new(buffer.clone()).whole();
+		let buffer = Buffer::zeroed(5);
+		let payload = buffer.whole();
 		let timeout = Timeout::with_executor(Duration::from_millis(1), &executor);
 		executor
 			.block_on(async {
@@ -299,10 +298,10 @@ fn socket_pair(
 
 fn stalled_task(
 	executor: &mut Executor,
-	buffer: &Arc<Buffer>,
+	buffer: &Buffer,
 ) -> (std::net::TcpStream, impl Future<Output = ()> + use<>) {
 	let (peer, socket) = socket_pair(&executor);
-	let payload = Space::new(buffer.clone()).whole();
+	let payload = buffer.whole();
 	let task = executor.spawner().spawn(async move {
 		socket.recv(payload).await.into_result().unwrap();
 	});
@@ -349,13 +348,11 @@ fn a_timer_armed_before_a_stop_reports_stopped_from_the_poll() {
 #[test]
 fn dropping_a_task_defers_cancellation_and_returns_its_io_buffer() {
 	let mut executor = executor();
-	let buffer = Arc::new(Buffer::new(8));
+	let (buffer, live) = common::tracked(8);
 	let (_peer, task) = stalled_task(&mut executor, &buffer);
 	drop(task);
-	assert!(
-		Arc::strong_count(&buffer) > 1,
-		"Task::drop destroyed its future inline"
-	);
+	drop(buffer);
+	assert!(live.alive(), "Task::drop destroyed its future inline");
 	// A pass over the executor drops the task's future, which releases its I/O
 	// as a detached cancel; a pass over the reactor then reaps that cancel.
 	executor.block_on(async {}).unwrap();
@@ -363,11 +360,7 @@ fn dropping_a_task_defers_cancellation_and_returns_its_io_buffer() {
 		.block_on(Timeout::with_executor(Duration::from_millis(10), &executor))
 		.unwrap()
 		.unwrap();
-	assert_eq!(
-		Arc::strong_count(&buffer),
-		1,
-		"cancelled I/O kept the buffer"
-	);
+	assert!(!live.alive(), "cancelled I/O kept the buffer");
 }
 
 #[test]
@@ -377,8 +370,9 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 
 	let mut executor = executor();
 	let (_peer, socket) = socket_pair(&executor);
-	let buffer = Arc::new(Buffer::new(8));
-	let payload = Space::new(buffer.clone()).whole();
+	let (buffer, live) = common::tracked(8);
+	let payload = buffer.whole();
+	drop(buffer);
 	let mut receive = Box::pin(socket.recv(payload));
 	let handle = Rc::new(RefCell::new(None::<completion_async::Task<()>>));
 	let cancel = Rc::new(Cell::new(false));
@@ -408,11 +402,7 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 		.block_on(Timeout::with_executor(Duration::from_millis(10), &executor))
 		.unwrap()
 		.unwrap();
-	assert_eq!(
-		Arc::strong_count(&buffer),
-		1,
-		"self-cancellation kept the I/O buffer"
-	);
+	assert!(!live.alive(), "self-cancellation kept the I/O buffer");
 }
 
 #[test]
@@ -422,8 +412,9 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 
 	let mut executor = executor();
 	let (_peer, socket) = socket_pair(&executor);
-	let buffer = Arc::new(Buffer::new(8));
-	let payload = Space::new(buffer.clone()).whole();
+	let (buffer, live) = common::tracked(8);
+	let payload = buffer.whole();
+	drop(buffer);
 	let mut receive = Box::pin(socket.recv(payload));
 	let panic_next = Rc::new(Cell::new(false));
 	let flag = Rc::clone(&panic_next);
@@ -455,11 +446,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		.block_on(Timeout::with_executor(Duration::from_millis(10), &executor))
 		.unwrap()
 		.unwrap();
-	assert_eq!(
-		Arc::strong_count(&buffer),
-		1,
-		"unwinding kept the I/O buffer"
-	);
+	assert!(!live.alive(), "unwinding kept the I/O buffer");
 	let gone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
 		std::pin::Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()))
 	}));
@@ -516,14 +503,11 @@ fn task_destructors_observe_other_joins_as_gone_during_executor_teardown() {
 #[test]
 fn dropping_the_executor_returns_a_tasks_in_flight_io_buffer() {
 	let mut executor = executor();
-	let buffer = Arc::new(Buffer::new(8));
+	let (buffer, live) = common::tracked(8);
 	let (_peer, task) = stalled_task(&mut executor, &buffer);
 	drop(executor);
-	assert_eq!(
-		Arc::strong_count(&buffer),
-		1,
-		"executor teardown kept the buffer"
-	);
+	drop(buffer);
+	assert!(!live.alive(), "executor teardown kept the buffer");
 	drop(task);
 }
 

@@ -1,12 +1,10 @@
 //! Direct I/O: whether the open asks the kernel for it, and the error shape
 //! when the filesystem refuses.
 mod common;
-use common::Buffer;
 
 use std::io;
-use std::sync::Arc;
 
-use completion_async::{Config, ErrorKind, Executor, Facade, File, OpenOptions, Space};
+use completion_async::{Buffer, Config, ErrorKind, Executor, Facade, File, OpenOptions};
 
 /// The async driver the file operations run on: it owns the reactor, so
 /// `block_on` both polls the operation and drives the backend under it.
@@ -58,8 +56,8 @@ fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 	let reader: Facade<std::io::PipeReader> = Facade::with_executor(reader, &executor);
 	let writer: Facade<std::io::PipeWriter> = Facade::with_executor(writer, &executor);
 
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
-	let memory = Space::new(payload.clone()).whole();
+	let payload: Buffer = Buffer::from_slice(b"hello");
+	let memory = payload.whole();
 	let moved = executor
 		.block_on(writer.write_at(memory.take(5), 0))
 		.unwrap()
@@ -67,8 +65,8 @@ fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
 		.unwrap();
 	assert_eq!(moved, 5);
 
-	let read: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let memory = Space::new(read.clone()).whole();
+	let read: Buffer = Buffer::zeroed(5);
+	let memory = read.whole();
 	let moved = executor
 		.block_on(reader.read_at(memory.take(5), 0))
 		.unwrap()
@@ -96,8 +94,8 @@ fn the_vector_path_goes_through_the_backing() {
 		&executor,
 	);
 
-	let source: Arc<Buffer> = Arc::new(Buffer::from_slice(b"payload"));
-	let memory = Space::new(source.clone()).whole();
+	let source: Buffer = Buffer::from_slice(b"payload");
+	let memory = source.whole();
 	assert_eq!(
 		executor
 			.block_on(file.write_at(memory, 0))
@@ -107,8 +105,8 @@ fn the_vector_path_goes_through_the_backing() {
 		7
 	);
 
-	let sink: Arc<Buffer> = Arc::new(Buffer::new(7));
-	let memory = Space::new(sink.clone()).whole();
+	let sink: Buffer = Buffer::zeroed(7);
+	let memory = sink.whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -118,7 +116,7 @@ fn the_vector_path_goes_through_the_backing() {
 		7
 	);
 
-	let memory = Space::new(sink.clone()).whole();
+	let memory = sink.whole();
 	assert_eq!(
 		executor
 			.block_on(file.write_at(memory, 7))
@@ -127,8 +125,8 @@ fn the_vector_path_goes_through_the_backing() {
 			.unwrap(),
 		7
 	);
-	let whole: Arc<Buffer> = Arc::new(Buffer::new(14));
-	let memory = Space::new(whole.clone()).whole();
+	let whole: Buffer = Buffer::zeroed(14);
+	let memory = whole.whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -151,9 +149,9 @@ fn read_exact_at_reports_the_file_ending_first() {
 	let mut executor = executor();
 	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
+	let buffer: Buffer = Buffer::zeroed(8);
 	// One call: five bytes are left, and that is what it reports.
-	let memory = Space::new(buffer.clone()).whole();
+	let memory = buffer.whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -164,10 +162,10 @@ fn read_exact_at_reports_the_file_ending_first() {
 	);
 	assert_eq!(&buffer.to_vec()[..5], b"hello");
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
+	let buffer: Buffer = Buffer::zeroed(8);
 	// The loop stops where the file does, and the progress it made is the
 	// bytes it did bring back, not the whole buffer.
-	let memory = Space::new(buffer.clone()).whole();
+	let memory = buffer.whole();
 	let outcome = executor.block_on(file.read_exact_at(memory, 0)).unwrap();
 	assert_eq!(outcome.value, 5);
 	assert_eq!(&buffer.to_vec()[..5], b"hello", "what did arrive stays");
@@ -201,8 +199,8 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 
 	let len = 4 << 20;
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(&bytes));
-	let memory = Space::new(payload.clone()).whole();
+	let payload: Buffer = Buffer::from_slice(&bytes);
+	let memory = payload.whole();
 	executor
 		.block_on(file.write_all_at(memory, 0))
 		.unwrap()
@@ -210,8 +208,8 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 		.unwrap();
 	executor.block_on(file.sync()).unwrap().unwrap();
 
-	let read: Arc<Buffer> = Arc::new(Buffer::new(len));
-	let memory = Space::new(read.clone()).whole();
+	let read: Buffer = Buffer::zeroed(len);
+	let memory = read.whole();
 	executor
 		.block_on(file.read_exact_at(memory, 0))
 		.unwrap()
@@ -235,8 +233,8 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 		.unwrap();
 	let file: File = Facade::with_executor(file, &executor);
 
-	let written: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
-	let memory = Space::new(written.clone()).whole();
+	let written: Buffer = Buffer::from_slice(b"hello");
+	let memory = written.whole();
 	assert_eq!(
 		executor
 			.block_on(file.write_at(memory, 0))
@@ -247,8 +245,8 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	);
 	executor.block_on(file.sync()).unwrap().unwrap();
 
-	let read: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let memory = Space::new(read.clone()).whole();
+	let read: Buffer = Buffer::zeroed(5);
+	let memory = read.whole();
 	assert_eq!(
 		executor
 			.block_on(file.read_at(memory, 0))
@@ -293,8 +291,8 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	let mut executor = executor();
 	let file = File::with_executor(common::open(&path).unwrap(), &executor);
 
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let memory = Space::new(buffer.clone()).whole();
+	let buffer: Buffer = Buffer::zeroed(5);
+	let memory = buffer.whole();
 	let read = assert_static(file.read_at(memory, 0));
 	let mut reading = Reading {
 		file: Some(file),
@@ -332,8 +330,8 @@ fn flush_leaves_the_facade_usable() {
 		&executor,
 	);
 
-	let first: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
-	let memory = Space::new(first.clone()).whole();
+	let first: Buffer = Buffer::from_slice(b"hello");
+	let memory = first.whole();
 	executor
 		.block_on(file.write_all_at(memory, 0))
 		.unwrap()
@@ -343,16 +341,16 @@ fn flush_leaves_the_facade_usable() {
 
 	// The duplicate the flush closed was not the facade's descriptor: the same
 	// facade still writes and reads.
-	let second: Arc<Buffer> = Arc::new(Buffer::from_slice(b"world"));
-	let memory = Space::new(second.clone()).whole();
+	let second: Buffer = Buffer::from_slice(b"world");
+	let memory = second.whole();
 	executor
 		.block_on(file.write_all_at(memory, 5))
 		.unwrap()
 		.into_result()
 		.unwrap();
 
-	let read: Arc<Buffer> = Arc::new(Buffer::new(10));
-	let memory = Space::new(read.clone()).whole();
+	let read: Buffer = Buffer::zeroed(10);
+	let memory = read.whole();
 	executor
 		.block_on(file.read_exact_at(memory, 0))
 		.unwrap()

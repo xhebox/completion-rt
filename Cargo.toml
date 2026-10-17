@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/completion-rt", "crates/completion-async"]
+members = ["crates/completion-backend", "crates/completion-async"]
 resolver = "3"

@@ -122,6 +122,15 @@ impl Bytes {
 			len,
 		}
 	}
+
+	/// The bytes as a `Vec`, taking the allocation rather than dropping it.
+	fn into_vec(self) -> Vec<u8> {
+		let this = std::mem::ManuallyDrop::new(self);
+		// SAFETY: `ptr` and `len` come from `Box::<[u8]>::into_raw`, and the
+		// box is rebuilt here instead of being freed by `Drop`, which the
+		// `ManuallyDrop` above skips.
+		unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(this.ptr, this.len)).into_vec() }
+	}
 }
 
 // SAFETY: the allocation is owned outright and never handed out as a slice;
@@ -162,12 +171,32 @@ unsafe impl Memory for Bytes {
 /// [`Buffer::new`]. Use [`Buffer::span`], [`Buffer::whole`], or
 /// [`Buffer::gather`] to select byte ranges for an I/O operation.
 #[derive(Clone)]
-pub struct Buffer(Arc<dyn Memory>);
+pub struct Buffer(Inner);
+
+/// What a [`Buffer`] holds.
+///
+/// A block this crate allocated is kept apart from a caller's [`Memory`] so the
+/// bytes can be handed back whole once nothing else holds them
+/// ([`Buffer::try_into_vec`]); a caller's memory has no such shape to recover.
+#[derive(Clone)]
+enum Inner {
+	Owned(Arc<Bytes>),
+	Custom(Arc<dyn Memory>),
+}
+
+impl Inner {
+	fn memory(&self) -> &dyn Memory {
+		match self {
+			Inner::Owned(bytes) => bytes.as_ref(),
+			Inner::Custom(memory) => memory.as_ref(),
+		}
+	}
+}
 
 impl Buffer {
 	/// Wraps `memory` in a [`Buffer`].
 	pub fn new(memory: Arc<dyn Memory>) -> Buffer {
-		Buffer(memory)
+		Buffer(Inner::Custom(memory))
 	}
 
 	/// Allocates `len` zeroed bytes.
@@ -180,9 +209,26 @@ impl Buffer {
 		Buffer::from(bytes.to_vec())
 	}
 
+	/// The bytes of a block this crate allocated, once this is the last holder.
+	///
+	/// `Err(self)` when another `Buffer`, or a [`Span`] taken from one, is still
+	/// alive — the bytes are still theirs — and also for a buffer wrapped around
+	/// a caller's [`Memory`], whose shape cannot be handed back as a `Vec`.
+	/// Nothing is copied on the way out: this is how a transfer's bytes leave
+	/// without a second trip through memory that a read already filled.
+	pub fn try_into_vec(self) -> Result<Vec<u8>, Buffer> {
+		match self.0 {
+			Inner::Owned(bytes) => match Arc::try_unwrap(bytes) {
+				Ok(bytes) => Ok(bytes.into_vec()),
+				Err(bytes) => Err(Buffer(Inner::Owned(bytes))),
+			},
+			custom @ Inner::Custom(_) => Err(Buffer(custom)),
+		}
+	}
+
 	/// Total byte length of the underlying [`Memory`].
 	pub fn len(&self) -> usize {
-		self.0.len()
+		self.0.memory().len()
 	}
 
 	pub fn is_empty(&self) -> bool {
@@ -233,6 +279,7 @@ impl Buffer {
 	pub fn copy_to(&self, offset: usize, dst: &mut [u8]) {
 		let iovec = self
 			.0
+			.memory()
 			.iovec(self.extent(offset, dst.len()))
 			.expect("the memory resolves the extent just checked");
 		// SAFETY: `iovec` names `dst.len()` readable bytes, in bounds and alive
@@ -247,6 +294,7 @@ impl Buffer {
 	pub fn copy_from(&self, offset: usize, src: &[u8]) {
 		let iovec = self
 			.0
+			.memory()
 			.iovec(self.extent(offset, src.len()))
 			.expect("the memory resolves the extent just checked");
 		// SAFETY: `iovec` names `src.len()` writable bytes, in bounds and alive
@@ -301,7 +349,7 @@ impl From<Vec<u8>> for Buffer {
 
 impl From<Box<[u8]>> for Buffer {
 	fn from(bytes: Box<[u8]>) -> Buffer {
-		Buffer::new(Arc::new(Bytes::new(bytes)))
+		Buffer(Inner::Owned(Arc::new(Bytes::new(bytes))))
 	}
 }
 
@@ -355,7 +403,7 @@ impl Span {
 				.map(|buf| out.push(buf)),
 			extents => {
 				out.reserve(extents.len());
-				let memory = self.buffer.0.as_ref();
+				let memory = self.buffer.0.memory();
 				for extent in extents {
 					out.push(memory.iovec(*extent)?);
 				}
@@ -371,7 +419,7 @@ impl Span {
 		match self.extents.as_slice() {
 			// SAFETY: a null pointer with a zero length names no bytes.
 			[] => Some(Ok(unsafe { IoVec::new(ptr::null_mut(), 0) })),
-			[extent] => Some(self.buffer.0.iovec(*extent)),
+			[extent] => Some(self.buffer.0.memory().iovec(*extent)),
 			_ => None,
 		}
 	}
@@ -752,6 +800,7 @@ mod tests {
 	fn address(buffer: &Buffer) -> usize {
 		buffer
 			.0
+			.memory()
 			.iovec(Extent { offset: 0, len: 1 })
 			.unwrap()
 			.as_ptr() as usize
@@ -773,5 +822,52 @@ mod tests {
 			start,
 			"the block the pool took back is the one it hands out"
 		);
+	}
+
+	#[test]
+	fn a_buffer_gives_its_bytes_back_once_it_is_the_only_holder() {
+		let buffer = Buffer::from_slice(b"hello");
+		let held = buffer.clone();
+		let buffer = buffer
+			.try_into_vec()
+			.expect_err("a clone still holds the bytes");
+		drop(held);
+		assert_eq!(buffer.try_into_vec().ok(), Some(b"hello".to_vec()));
+
+		let buffer = Buffer::from_slice(b"pooled");
+		let span = buffer.span(0, 6);
+		let buffer = buffer
+			.try_into_vec()
+			.expect_err("a span still names the bytes");
+		assert_eq!(span.to_vec(), b"pooled", "the span still reads them");
+		drop(span);
+		assert_eq!(buffer.try_into_vec().ok(), Some(b"pooled".to_vec()));
+	}
+
+	#[test]
+	fn a_caller_s_memory_has_no_bytes_to_hand_back() {
+		/// A [`Memory`] the test owns, in no shape this crate can recover.
+		struct Custom(Vec<u8>);
+
+		// SAFETY: the bytes outlive the memory, and `check_extent` refuses an
+		// extent that does not fit them.
+		unsafe impl Memory for Custom {
+			fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
+				let (start, len) = check_extent(extent, self.0.len())?;
+				// SAFETY: `start..start + len` is inside the vector, which the
+				// buffer keeps alive.
+				Ok(unsafe { IoVec::new(self.0.as_ptr().add(start).cast_mut(), len) })
+			}
+
+			fn len(&self) -> usize {
+				self.0.len()
+			}
+		}
+
+		let buffer = Buffer::new(Arc::new(Custom(b"custom".to_vec())));
+		let buffer = buffer
+			.try_into_vec()
+			.expect_err("a caller's memory is not a block to hand back");
+		assert_eq!(buffer.to_vec(), b"custom");
 	}
 }

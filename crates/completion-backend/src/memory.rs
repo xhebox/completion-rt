@@ -42,11 +42,23 @@ impl IoVec {
 		Self { ptr, len }
 	}
 
-	pub(crate) fn len(&self) -> usize {
+	/// Number of bytes this range names.
+	pub fn len(&self) -> usize {
 		self.len
 	}
 
-	pub(crate) fn as_ptr(&self) -> *mut u8 {
+	/// Whether the range names no bytes. A zero-length range is a normal
+	/// boundary — an empty span resolves to one — not an error.
+	pub fn is_empty(&self) -> bool {
+		self.len == 0
+	}
+
+	/// The first byte of the range.
+	///
+	/// Reading or writing through it races a kernel, another thread, or a guest
+	/// while a transfer is in flight: a caller copies to or from memory of its
+	/// own, and only while the [`Memory`] the range came from is alive.
+	pub fn as_ptr(&self) -> *mut u8 {
 		self.ptr
 	}
 }
@@ -75,6 +87,12 @@ pub unsafe trait Memory: Send + Sync {
 	fn iovec(&self, extent: Extent) -> io::Result<IoVec>;
 
 	fn len(&self) -> usize;
+
+	/// Whether the memory holds no bytes. A zero-length memory is a normal
+	/// boundary, not an error.
+	fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
 }
 
 /// `extent` as a `(start, len)` pair inside `bound`, or an `InvalidInput` error

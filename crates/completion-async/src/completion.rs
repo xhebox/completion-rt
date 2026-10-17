@@ -1,19 +1,22 @@
-//! The completion future: a [`Completion`] that resolves when the reactor lands
-//! its operation, or reports the cancel that beat it to the kernel.
+//! Cancellation tokens ([`Cancel`]) and reactor completion futures.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use completion_backend::{AsDescriptor, Error, ErrorKind, Op, Response};
+use slotmap::{DefaultKey, SlotMap};
 
 use crate::reactor::{Key, Reactor};
 
-/// A clonable cancellation signal. Clones share the signal; [`Cancel::child`] creates a signal also cancelled by its parent.
+/// A thread-safe, cloneable cancellation token.
+///
+/// Cloning a `Cancel` shares the same underlying state. Use [`Cancel::child`] to
+/// create a derived token that is cancelled when its parent is cancelled without
+/// affecting the parent.
 #[derive(Clone)]
 pub struct Cancel {
 	inner: Arc<CancelInner>,
@@ -21,8 +24,7 @@ pub struct Cancel {
 
 struct CancelInner {
 	cancelled: AtomicBool,
-	wakers: Mutex<HashMap<u64, Waker>>,
-	next: AtomicU64,
+	wakers: Mutex<SlotMap<DefaultKey, Waker>>,
 	children: Mutex<Vec<Weak<CancelInner>>>,
 }
 
@@ -30,8 +32,7 @@ impl CancelInner {
 	fn new() -> CancelInner {
 		Self {
 			cancelled: AtomicBool::new(false),
-			wakers: Mutex::new(HashMap::new()),
-			next: AtomicU64::new(0),
+			wakers: Mutex::new(SlotMap::new()),
 			children: Mutex::new(Vec::new()),
 		}
 	}
@@ -64,7 +65,7 @@ impl CancelInner {
 }
 
 impl Cancel {
-	/// A fresh cancel, unraised.
+	/// Creates a new, uncancelled token.
 	#[fastrace::trace]
 	pub fn new() -> Cancel {
 		Self {
@@ -72,18 +73,19 @@ impl Cancel {
 		}
 	}
 
-	/// Raises the cancel. Idempotent.
+	/// Triggers cancellation and wakes all waiting operations and child tokens. Idempotent.
 	pub fn cancel(&self) {
 		self.inner.fire();
 	}
 
-	/// Whether the cancel has fired.
+	/// Returns `true` if [`Cancel::cancel`] has been called on this token or an ancestor.
 	pub fn is_cancelled(&self) -> bool {
 		self.inner.cancelled.load(Ordering::Acquire)
 	}
 
-	/// A cancel that fires when this one does; cancelling the child leaves the
-	/// parent alone. A child of an already-raised `Cancel` starts out raised.
+	/// Creates a child token that is cancelled when `self` is cancelled, while
+	/// cancelling the child leaves `self` unaffected. If `self` is already
+	/// cancelled, the returned child starts cancelled.
 	pub fn child(&self) -> Cancel {
 		let child = Cancel::new();
 		if self.is_cancelled() {
@@ -106,8 +108,8 @@ impl Cancel {
 		child
 	}
 
-	/// Resolves once the cancel fires, at once if it already has. Dropping the
-	/// future before then takes its waker out of the cancel.
+	/// Waits until [`Cancel::cancel`] is called, or resolves immediately if
+	/// already cancelled.
 	pub fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
 		Wait::new(Arc::clone(&self.inner))
 	}
@@ -139,18 +141,14 @@ impl Default for Cancel {
 
 struct Wait {
 	inner: Arc<CancelInner>,
-	key: u64,
-	registered: bool,
+	/// The slot the waker is filed in, taken on the first poll: building a
+	/// `Wait` touches no lock at all.
+	key: Option<DefaultKey>,
 }
 
 impl Wait {
 	fn new(inner: Arc<CancelInner>) -> Wait {
-		let key = inner.next.fetch_add(1, Ordering::Relaxed);
-		Wait {
-			inner,
-			key,
-			registered: false,
-		}
+		Wait { inner, key: None }
 	}
 }
 
@@ -159,34 +157,51 @@ impl Future for Wait {
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
 		let this = self.get_mut();
+		if this.inner.cancelled.load(Ordering::Acquire) {
+			return Poll::Ready(());
+		}
 		let mut wakers = this
 			.inner
 			.wakers
 			.lock()
 			.expect("the cancel's wakers were poisoned");
+		// Rechecked under the lock: `fire` takes the map, so a waiter that
+		// missed it there has to see the cancellation here instead.
 		if this.inner.cancelled.load(Ordering::Acquire) {
-			this.registered = false;
+			if let Some(key) = this.key.take() {
+				wakers.remove(key);
+			}
 			return Poll::Ready(());
 		}
-		wakers.insert(this.key, cx.waker().clone());
-		this.registered = true;
+		if let Some(key) = this.key
+			&& let Some(existing) = wakers.get_mut(key)
+		{
+			// A poll with the same waker does not even clone it.
+			if !existing.will_wake(cx.waker()) {
+				*existing = cx.waker().clone();
+			}
+			return Poll::Pending;
+		}
+		// No slot yet, or none any more because `fire` took the map: file the
+		// waker afresh.
+		this.key = Some(wakers.insert(cx.waker().clone()));
 		Poll::Pending
 	}
 }
 
 impl Drop for Wait {
 	fn drop(&mut self) {
-		if self.registered {
+		if let Some(key) = self.key.take() {
 			self.inner
 				.wakers
 				.lock()
 				.expect("the cancel's wakers were poisoned")
-				.remove(&self.key);
+				.remove(key);
 		}
 	}
 }
 
-/// Submits `op` on `fd`, racing it against `cancel` when one is given.
+/// Submits `op` on `fd` with optional cancellation.
 pub(crate) fn submit(
 	reactor: &Reactor,
 	fd: Arc<dyn AsDescriptor>,
@@ -197,7 +212,7 @@ pub(crate) fn submit(
 	Ok(Completion::new(reactor.clone(), key, cancel))
 }
 
-/// Arms a timer for `deadline`, racing it against `cancel` when one is given.
+/// Submits a timer for `deadline` with optional cancellation.
 pub(crate) fn submit_timer(
 	reactor: &Reactor,
 	deadline: Instant,
@@ -207,16 +222,12 @@ pub(crate) fn submit_timer(
 	Ok(Completion::new(reactor.clone(), key, cancel))
 }
 
-/// Resolves to the response the reactor lands for one operation or timer, or to
-/// `None` when a cancel it was given won.
+/// Tracks a single submitted reactor operation or timer.
 ///
-/// Dropping an in-flight operation is predictable and does not block: the drop
-/// cancels the operation and detaches it, and the reactor keeps its
-/// [`Space`](completion_backend::Space) and descriptor alive until the kernel
-/// finishes with it, though the span's bytes stay in flight until then. A
-/// range that is to be read or reused right away is waited for by naming a
-/// [`Cancel`]: the completion then resolves to `None` only once the kernel has
-/// let go of the [`Span`](completion_backend::Span).
+/// Dropping a `Completion` detaches and cancels the operation without blocking
+/// while keeping the [`Buffer`](completion_backend::Buffer) and descriptor alive
+/// until the kernel finishes. When paired with a [`Cancel`] token, `poll` waits
+/// for the kernel completion and returns `None` once the buffer is safe to reuse.
 pub(crate) struct Completion {
 	reactor: Reactor,
 	key: Key,

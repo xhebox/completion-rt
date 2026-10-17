@@ -11,6 +11,7 @@ repository = "https://github.com/xhebox/completion-rt"
 completion-backend = { path = "../completion-backend" }
 fastrace = "0.7.19"
 log ={ version = "0.4.34", features = ["std", "kv"] }
+slotmap = "1"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["event", "fs", "net"] }

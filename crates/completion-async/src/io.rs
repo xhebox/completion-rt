@@ -1,4 +1,4 @@
-//! File operations: the read, write, and sync.
+//! File and positional descriptor operations.
 
 use std::fs;
 use std::io;
@@ -8,14 +8,18 @@ use completion_backend::Span;
 
 use crate::op::{Action, Facade, Kind, Op, Transfer};
 
-/// `std::fs::OpenOptions` plus direct I/O, and on Windows the overlapped flag
-/// the iocp backend needs.
+/// Builder for opening files with optional direct I/O (`O_DIRECT` / `F_NOCACHE` /
+/// `FILE_FLAG_NO_BUFFERING`).
+///
+/// On Windows, [`OpenOptions::open`] always sets `FILE_FLAG_OVERLAPPED`, which is
+/// required before wrapping a [`std::fs::File`] in [`Facade`].
 pub struct OpenOptions {
 	inner: std::fs::OpenOptions,
 	direct: bool,
 }
 
 impl OpenOptions {
+	/// Creates a blank set of options.
 	pub fn new() -> OpenOptions {
 		OpenOptions {
 			inner: std::fs::OpenOptions::new(),
@@ -23,41 +27,50 @@ impl OpenOptions {
 		}
 	}
 
+	/// Sets the option for read access.
 	pub fn read(mut self, read: bool) -> OpenOptions {
 		self.inner.read(read);
 		self
 	}
 
+	/// Sets the option for write access.
 	pub fn write(mut self, write: bool) -> OpenOptions {
 		self.inner.write(write);
 		self
 	}
 
+	/// Sets the option for append mode.
 	pub fn append(mut self, append: bool) -> OpenOptions {
 		self.inner.append(append);
 		self
 	}
 
+	/// Sets the option for truncating a previous file.
 	pub fn truncate(mut self, truncate: bool) -> OpenOptions {
 		self.inner.truncate(truncate);
 		self
 	}
 
+	/// Sets the option to create a new file if it does not exist.
 	pub fn create(mut self, create: bool) -> OpenOptions {
 		self.inner.create(create);
 		self
 	}
 
+	/// Sets the option to create a new file, failing if it already exists.
 	pub fn create_new(mut self, create_new: bool) -> OpenOptions {
 		self.inner.create_new(create_new);
 		self
 	}
 
+	/// Enables direct I/O, bypassing the OS page cache (`O_DIRECT` on Linux/Android,
+	/// `F_NOCACHE` on Apple platforms, `FILE_FLAG_NO_BUFFERING` on Windows).
 	pub fn direct(mut self) -> OpenOptions {
 		self.direct = true;
 		self
 	}
 
+	/// Opens a file at `path` with the configured options.
 	pub fn open(self, path: &Path) -> io::Result<fs::File> {
 		let OpenOptions { inner, direct } = self;
 		#[cfg(not(any(
@@ -106,45 +119,41 @@ impl OpenOptions {
 	}
 }
 
+/// Type alias for a [`Facade`] wrapping [`std::fs::File`].
 pub type File = Facade<fs::File>;
 
-/// The four read and write methods of a resource read and written at an
-/// offset, expanded one impl per resource type named at the invocation.
-///
-/// A macro rather than a bound: the types are a closed list, and naming one
-/// here is what gives it these methods. A resource type of the caller's own
-/// converts into one of them — [`Facade::new`] takes a value that converts
-/// into the resource.
 macro_rules! positional {
 	($($resource:ty),* $(,)?) => {
 		$(
 			impl Facade<$resource> {
-				/// Reads into `span` at `fdoff`, in one call: a short count is what the
-				/// call moved, not an error. [`read_exact_at`](Self::read_exact_at)
-				/// loops.
+				/// Performs a single read into `span` at byte offset `fdoff`.
+				///
+				/// May transfer fewer bytes than `span.len()`; use [`read_exact_at`](Self::read_exact_at)
+				/// to read until `span` is full.
 				pub fn read_at(&self, span: Span, fdoff: u64) -> Transfer {
 					Transfer::new(self, Kind::Read { fdoff }, span)
 				}
 
-				/// Reads into `span` at `fdoff`, over as many calls as it takes to fill
-				/// it.
+				/// Reads into `span` starting at `fdoff` until `span` is completely filled.
 				///
-				/// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) when the file ends
-				/// first.
+				/// Fails with [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) if EOF is
+				/// reached before `span` is full.
 				pub fn read_exact_at(&self, span: Span, fdoff: u64) -> Transfer {
 					Transfer::new(self, Kind::ReadAll { fdoff }, span)
 				}
 
-				/// Writes `span` at `fdoff`, in one call: a short count is what the call
-				/// moved, not an error. [`write_all_at`](Self::write_all_at) loops.
+				/// Performs a single write from `span` at byte offset `fdoff`.
+				///
+				/// May transfer fewer bytes than `span.len()`; use [`write_all_at`](Self::write_all_at)
+				/// to write the entire span.
 				pub fn write_at(&self, span: Span, fdoff: u64) -> Transfer {
 					Transfer::new(self, Kind::Write { fdoff }, span)
 				}
 
-				/// Writes `span` at `fdoff`, over as many calls as it takes to write it
-				/// all.
+				/// Writes all bytes in `span` starting at `fdoff`.
 				///
-				/// [`WriteZero`](io::ErrorKind::WriteZero) when a call writes nothing.
+				/// Fails with [`WriteZero`](io::ErrorKind::WriteZero) if a single write
+				/// call transfers zero bytes.
 				pub fn write_all_at(&self, span: Span, fdoff: u64) -> Transfer {
 					Transfer::new(self, Kind::WriteAll { fdoff }, span)
 				}
@@ -177,32 +186,32 @@ positional!(
 );
 
 impl Facade<fs::File> {
+	/// Flushes all modified file data and metadata to disk (`fsync` / `FlushFileBuffers`).
 	pub fn sync(&self) -> Op {
 		Op::new(self, Action::Fsync)
 	}
 
-	/// Reports the resource's pending deferred write-back errors — `ENOSPC`,
-	/// `EIO` and the like — without forcing anything to disk.
+	/// Checks for deferred write-back errors (such as `ENOSPC` or `EIO`) without
+	/// forcing data to disk.
 	///
-	/// This is not [`Write::flush`](std::io::Write::flush): it names no buffer
-	/// of the caller's, and it does not make the data durable — [`sync`](Self::sync)
-	/// is what does that. What it reports is the error the filesystem had
-	/// deferred and would otherwise surface at the resource's next close.
+	/// Unlike [`sync`](Self::sync), this does not guarantee durability; it surfaces
+	/// filesystem write-back errors that would otherwise be reported at close.
 	pub fn flush(&self) -> Op {
 		Op::new(self, Action::Flush)
 	}
 
-	/// Backs `len` bytes at `offset` with storage, so a write there does not
-	/// fail for space. A range past the end grows the file to the range's end,
-	/// reading as zeros; the file never shrinks.
+	/// Preallocates disk space for `len` bytes starting at `offset`.
+	///
+	/// Extends the file with zeros if `offset + len` exceeds the current file length;
+	/// never shrinks the file.
 	pub fn allocate(&self, offset: u64, len: u64) -> Op {
 		Op::new(self, Action::Allocate { offset, len })
 	}
 
-	/// Zeroes `len` bytes at `offset`, freeing their storage where the
-	/// filesystem can; the length stays.
+	/// Deallocates storage for `len` bytes at `offset` and zeroes the range while
+	/// keeping the file's length unchanged (hole punching).
 	///
-	/// On Windows the storage is freed only in a file marked sparse.
+	/// On Windows, storage is only reclaimed if the file is marked sparse.
 	pub fn punch(&self, offset: u64, len: u64) -> Op {
 		Op::new(self, Action::Punch { offset, len })
 	}

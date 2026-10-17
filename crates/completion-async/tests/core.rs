@@ -6,18 +6,16 @@
 //! under it. The reactor's own mechanics, such as the poll timeout, live in the
 //! low crate's tests.
 mod common;
-use common::Buffer;
 
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io;
 use std::pin::pin;
-use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 #[cfg(unix)]
 use completion_async::Facade;
-use completion_async::{Config, ErrorKind, Executor, File, Space, Span};
+use completion_async::{Buffer, Config, ErrorKind, Executor, File, Span};
 
 /// The async driver the operations run on: it owns the reactor, and `block_on`
 /// drives both the future and the backend beneath it.
@@ -35,10 +33,10 @@ fn seeded(executor: &Executor, contents: &[u8]) -> File {
 	File::with_executor(common::open(path).unwrap(), executor)
 }
 
-/// The whole of `buf` in its own space: the space holds a second handle on it,
-/// so it outlives the operation.
-fn span(buf: &Arc<Buffer>) -> Span {
-	Space::new(buf.clone()).whole()
+/// The whole of `buf` in a span: the span holds its own handle on the buffer,
+/// so it outlives the operation even when the caller's handle goes.
+fn span(buf: &Buffer) -> Span {
+	buf.whole()
 }
 
 /// A read completes with the bytes its one call moved: the file has five, the
@@ -48,7 +46,7 @@ fn span(buf: &Arc<Buffer>) -> Span {
 fn a_read_short_of_the_buffer_completes_with_its_count() {
 	let mut executor = executor();
 	let file = seeded(&executor, b"hello");
-	let buf: Arc<Buffer> = Arc::new(Buffer::new(8));
+	let buf: Buffer = Buffer::zeroed(8);
 	let n = executor
 		.block_on(file.read_at(span(&buf), 0))
 		.unwrap()
@@ -77,7 +75,7 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 	let plain = std::fs::File::open(&first).unwrap();
 	let number: RawFd = plain.as_raw_fd();
 	let facade = File::with_executor(plain, &executor);
-	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buf: Buffer = Buffer::zeroed(5);
 	let read = facade.read_at(span(&buf), 0);
 	// The facade goes before anything reaches the kernel; the read names the
 	// file through the entry's own clone of the resource.
@@ -107,14 +105,15 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 fn a_dropped_operation_releases_an_unsubmitted_request() {
 	let mut executor = executor();
 	let file = seeded(&executor, b"data");
-	let buf = Arc::new(Buffer::new(4));
-	let read = file.read_at(span(&buf), 0);
-	assert_eq!(Arc::strong_count(&buf), 2, "the request holds the buffer");
+	let (buf, live) = common::tracked(4);
+	let read = file.read_at(buf.whole(), 0);
+	drop(buf);
+	assert!(live.alive(), "the request holds the buffer");
 	// Nothing polled: the request is still unsubmitted, so it goes with the drop.
 	drop(read);
-	assert_eq!(Arc::strong_count(&buf), 1, "the request goes with it");
+	assert!(!live.alive(), "the request goes with it");
 	executor.block_on(async {}).unwrap();
-	assert_eq!(Arc::strong_count(&buf), 1, "and nothing held it after");
+	assert!(!live.alive(), "and nothing held it after");
 }
 
 /// `until` returns `Cancelled` only after the kernel has let go of the buffer:
@@ -134,7 +133,7 @@ fn cancelling_waits_for_the_kernel() {
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
 	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-	let buf = Arc::new(Buffer::new(8));
+	let buf = Buffer::zeroed(8);
 	let cancel = Cancel::new();
 	let raiser = cancel.clone();
 	std::thread::spawn(move || {
@@ -150,8 +149,6 @@ fn cancelling_waits_for_the_kernel() {
 			.as_ref()
 			.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
 	);
-	// The kernel is done, so only the caller's handle remains.
-	assert_eq!(Arc::strong_count(&buf), 1);
 	// A write after the cancel lands nowhere: the kernel is no longer reading
 	// into the buffer.
 	(&left).write_all(b"late data").unwrap();
@@ -165,8 +162,8 @@ fn concurrent_submits_all_complete() {
 	let mut tasks = Vec::new();
 	for i in 0..8u8 {
 		let file = seeded(&executor, &[i; 64]);
-		let buf: Arc<Buffer> = Arc::new(Buffer::new(64));
-		let read = Arc::clone(&buf);
+		let buf: Buffer = Buffer::zeroed(64);
+		let read = buf.clone();
 		let span = span(&read);
 		tasks.push(executor.spawner().spawn(async move {
 			let n = file.read_at(span, 0).await.into_result().unwrap();
@@ -192,8 +189,8 @@ fn many_transfers_all_complete() {
 	let file = seeded(&executor, &[7u8; 4096]);
 	let mut tasks = Vec::new();
 	for _ in 0..4096 {
-		let buf: Arc<Buffer> = Arc::new(Buffer::new(4096));
-		let read = Arc::clone(&buf);
+		let buf: Buffer = Buffer::zeroed(4096);
+		let read = buf.clone();
 		let span = span(&read);
 		let file = file.clone();
 		tasks.push(executor.spawner().spawn(async move {
@@ -222,7 +219,7 @@ fn a_socket_send_lands_in_the_receive_buffer() {
 	let left: Facade<UnixStream> = Facade::with_executor(left, &executor);
 	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
 
-	let sent: Arc<Buffer> = Arc::new(Buffer::from_slice(b"over the socket"));
+	let sent: Buffer = Buffer::from_slice(b"over the socket");
 	assert_eq!(
 		executor
 			.block_on(left.send(span(&sent)))
@@ -232,7 +229,7 @@ fn a_socket_send_lands_in_the_receive_buffer() {
 		15
 	);
 
-	let received: Arc<Buffer> = Arc::new(Buffer::new(15));
+	let received: Buffer = Buffer::zeroed(15);
 	assert_eq!(
 		executor
 			.block_on(right.recv(span(&received)))
@@ -262,7 +259,7 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
 	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
+	let buffer: Buffer = Buffer::zeroed(8);
 
 	// Nothing has been sent yet, so the receive stays in flight until the peer
 	// writes: the non-blocking descriptor does not turn it into a short count.
@@ -305,7 +302,7 @@ fn sqpoll_rings_complete_too() {
 		}
 	};
 	let file = seeded(&executor, b"hello");
-	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buf: Buffer = Buffer::zeroed(5);
 	let n = executor
 		.block_on(file.read_at(span(&buf), 0))
 		.unwrap()
@@ -363,7 +360,7 @@ fn allocate_is_refused_on_an_iopoll_ring() {
 fn a_submission_after_the_executor_drops_is_refused() {
 	let executor = executor();
 	let file = seeded(&executor, b"hello");
-	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buf: Buffer = Buffer::zeroed(5);
 	let span = span(&buf);
 	drop(executor);
 	let mut read = pin!(file.read_at(span, 0));

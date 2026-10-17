@@ -1,46 +1,37 @@
-//! Completion-model async I/O, experimental.
+//! Async I/O runtime built on OS completion backends (`io_uring`, IOCP, and
+//! `polling`).
 //!
-//! [`Executor`] is the start point: use [`block_on`] from the global executor to
-//! run a root async task.
+//! Run futures on the current thread's default executor with [`block_on`] and
+//! [`spawn`], or create a dedicated [`Executor`].
 //!
-//! A [`Facade`] provides a set of methods over an owned resource behind an
-//! `Arc`. Each method returns a future: [`Transfer`], [`Receive`], [`Op`], or [`Accept`],
-//!  which resolves to [`Outcome`], [`Received`], plain `Result`, whatever.
-//!
-//! Which methods a facade has follows from its resource type:
+//! Wrap an I/O resource in [`Facade`] to issue async operations. Each operation
+//! returns a future ([`Transfer`], [`Receive`], [`Op`], or [`Accept`]) whose
+//! available methods depend on the resource type:
 //!
 //! | Resource | Operations |
 //! |---|---|
-//! | `File` | `read_at`, `read_exact_at`, `write_at`, `write_all_at`, `sync`, `flush`, `allocate`, `punch` |
-//! | pipes, stdio, `OwnedFd` | the four read and write methods of a file, and no more |
-//! | `UdpSocket`, `UnixDatagram` | `recv`, `recv_with_fds`, `send`, `send_with_fds`, `take_error` |
-//! | `TcpStream`, `UnixStream` | a datagram's five, plus `recv_exact`, `recv_exact_with_fds`, `send_all`, `send_all_with_fds`, `shutdown`, `hangup` |
-//! | `TcpListener`, `UnixListener` | `accept` |
+//! | `std::fs::File` ([`File`]) | `read_at`, `read_exact_at`, `write_at`, `write_all_at`, `sync`, `flush`, `allocate`, `punch` |
+//! | Pipes, stdio, `OwnedFd`, `OwnedHandle` | `read_at`, `read_exact_at`, `write_at`, `write_all_at` |
+//! | `UdpSocket`, `UnixDatagram` ([`SocketHandle`]) | `recv`, `recv_with_fds`, `send`, `send_with_fds`, `take_error` |
+//! | `TcpStream`, `UnixStream` ([`StreamHandle`]) | All [`SocketHandle`] methods, plus `recv_exact`, `recv_exact_with_fds`, `send_all`, `send_all_with_fds`, `shutdown`, `hangup` |
+//! | `TcpListener`, `UnixListener` ([`ListenerHandle`]) | `accept` |
 //! | [`Signal`] | `wait_readable`, `wait_writable` |
 //!
-//! The four a file and a descriptor share are the reads `read_at` and
-//! `read_exact_at`, and the writes `write_at` and `write_all_at`.
+//! Custom socket types can implement [`SocketHandle`], [`StreamHandle`], or
+//! [`ListenerHandle`], or convert into a supported resource via [`Into`] when
+//! calling [`Facade::new`] / [`Facade::with_executor`].
 //!
-//! A transfer names its memory as one [`Span`]: ranges of a [`Space`].
-//! [`Space::gather`] makes one span of several ranges.
+//! Data transfers operate on [`Span`]s sliced from a [`Buffer`] (use
+//! [`Buffer::gather`] for scatter/gather I/O). A [`BufferPool`] hands out
+//! pre-faulted, page-aligned buffers for repeated transfers.
 //!
-//! A readiness wait is only [`Signal`]'s. A resource with a transfer has none
-//! to offer: the backend arms the readiness itself when a call would block, and
-//! the completion reports how much moved. A stream's `hangup` is not readiness
-//! for a transfer but the end of the connection, which no transfer reports
-//! while the stream is idle.
-//!
-//! A resource type of the caller's own gets the same methods by converting into
-//! one of these: [`Facade::new`] takes a value that converts into the resource
-//! the facade names.
-//!
-//! An operation is given a cancel with the [`until`](Transfer::until) on its
-//! future, which then yields [`ErrorKind::Cancelled`] if the cancel wins:
+//! Attach a [`Cancel`] token to any operation or [`Timeout`] with `.until(&cancel)`
+//! to abort it and wait until the kernel releases its buffers:
 //!
 //! ```no_run
-//! # use completion_async::{Cancel, Facade, Space};
-//! # async fn example(socket: Facade<std::net::TcpStream>, space: Space, cancel: Cancel) {
-//! let outcome = socket.send_all(space.span(0, 512)).until(&cancel).await;
+//! # use completion_async::{Buffer, Cancel, Facade};
+//! # async fn example(socket: Facade<std::net::TcpStream>, buffer: Buffer, cancel: Cancel) {
+//! let outcome = socket.send_all(buffer.span(0, 512)).until(&cancel).await;
 //! # }
 //! ```
 
@@ -54,13 +45,10 @@ mod reactor;
 mod signal;
 mod timer;
 
-// The low layer's data types and its descriptor trait, re-exported so a user of
-// this crate needs one name for them: the memory, the extents and iovecs, and
-// the descriptors.
 pub use completion::Cancel;
 pub use completion_backend::{
-	AsDescriptor, BorrowedDescriptor, Config, Error, ErrorKind, Extent, IoVec, Memory,
-	OwnedDescriptor, OwnedSocket, Space, Span, Status,
+	AsDescriptor, BorrowedDescriptor, Buffer, BufferPool, Config, Error, ErrorKind, Extent, IoVec,
+	Memory, OwnedDescriptor, OwnedSocket, Span, Status,
 };
 pub use executor::{Executor, Spawner, Task};
 pub use global::{block_on, spawn, try_spawn};

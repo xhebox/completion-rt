@@ -1,4 +1,4 @@
-//! The timer future.
+//! Timer future ([`Timeout`]).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -12,12 +12,10 @@ use crate::completion::{Cancel, Completion, submit_timer};
 use crate::global;
 use crate::reactor::Reactor;
 
-/// Resolves to `Ok(())` once `duration` has elapsed.
+/// Future that resolves to `Ok(())` after a specified [`Duration`].
 ///
-/// The deadline is fixed on construction: it is `Instant::now() + duration`, and
-/// the poll that arms it names it, so a `Timeout` that sits unpolled for a
-/// while still fires on time. The constructor cannot fail; a reactor that has
-/// already stopped is reported by the poll.
+/// The deadline (`Instant::now() + duration`) is recorded when `Timeout::new` or
+/// `Timeout::with_executor` is called, and registered with the reactor on first poll.
 pub struct Timeout {
 	reactor: Reactor,
 	deadline: Instant,
@@ -27,14 +25,14 @@ pub struct Timeout {
 }
 
 impl Timeout {
-	/// A timer that fires `duration` from now, armed on this thread's global
-	/// executor.
+	/// Creates a timer that expires after `duration` on the current thread's
+	/// default [`Executor`].
 	#[fastrace::trace]
 	pub fn new(duration: Duration) -> Timeout {
 		Timeout::arm(duration, global::reactor())
 	}
 
-	/// A timer that fires `duration` from now, armed on `executor`.
+	/// Creates a timer that expires after `duration` on `executor`.
 	#[fastrace::trace]
 	pub fn with_executor(duration: Duration, executor: &Executor) -> Timeout {
 		Timeout::arm(duration, executor.reactor().clone())
@@ -50,7 +48,7 @@ impl Timeout {
 		}
 	}
 
-	/// Gives the timer up when `cancel` fires.
+	/// Cancels the timer when `cancel` is triggered.
 	pub fn until(mut self, cancel: &Cancel) -> Timeout {
 		self.cancel = Some(cancel.clone());
 		self

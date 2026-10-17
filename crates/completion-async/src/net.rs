@@ -1,5 +1,4 @@
-//! Socket operations: the methods a facade over a socket has, and the accept
-//! that makes one more.
+//! Socket traits and async networking operations.
 
 use std::future::Future;
 use std::io;
@@ -14,7 +13,8 @@ use crate::Error;
 use crate::completion::Cancel;
 use crate::op::{Action, Facade, Gate, Kind, Op, Receive, Transfer};
 
-/// An accept: the connection the kernel made, in a facade of its own.
+/// Future returned by [`Facade::accept`] that resolves to an accepted stream
+/// wrapped in a [`Facade`].
 pub struct Accept<S> {
 	gate: Gate,
 	finished: bool,
@@ -30,8 +30,7 @@ impl<S> Accept<S> {
 		}
 	}
 
-	/// Gives the accept up when `cancel` fires. A connection the kernel made
-	/// anyway goes with the future, and is closed with it.
+	/// Cancels the accept when `cancel` is triggered.
 	pub fn until(self, cancel: &Cancel) -> Accept<S> {
 		let Accept { gate, .. } = self;
 		Self {
@@ -66,13 +65,10 @@ impl<S: ListenerHandle> Future for Accept<S> {
 	}
 }
 
-/// A socket: a resource that sends and receives, with message boundaries
-/// ([`UdpSocket`](std::net::UdpSocket), `UnixDatagram`) or as a byte stream.
+/// Marker trait for datagram and stream sockets.
 ///
-/// Implementing this is what gives a facade [`recv`](Facade::recv),
-/// [`send`](Facade::send) and their `_with_fds` forms. The descriptor has to be
-/// a socket: on anything else these fail with the OS's `ENOTSOCK` (or
-/// `WSAENOTSOCK`).
+/// Implementing `SocketHandle` enables [`Facade::recv`], [`Facade::recv_with_fds`],
+/// [`Facade::send`], [`Facade::send_with_fds`], and [`Facade::take_error`].
 pub trait SocketHandle: AsDescriptor + Send + Sync + 'static {}
 
 impl SocketHandle for std::net::UdpSocket {}
@@ -86,15 +82,11 @@ impl SocketHandle for std::os::unix::net::UnixStream {}
 #[cfg(windows)]
 impl SocketHandle for OwnedSocket {}
 
-/// A connected byte-stream socket: TCP, `AF_UNIX` `SOCK_STREAM`, `AF_VSOCK`.
+/// Marker trait for connected byte-stream sockets (such as `TcpStream` and `UnixStream`).
 ///
-/// Implementing this is what gives a facade [`recv_exact`](Facade::recv_exact),
-/// [`send_all`](Facade::send_all), [`shutdown`](Facade::shutdown) and
-/// [`hangup`](Facade::hangup). The socket has no message boundaries, so a
-/// receive that comes back short can be repeated for the rest; a zero-byte
-/// receive is the peer's EOF; and `shutdown(Write)` sends this side's EOF. A
-/// datagram socket has none of that: its exact forms would split or drop
-/// messages, and its hangup would never come.
+/// Extends [`SocketHandle`] with [`Facade::recv_exact`], [`Facade::recv_exact_with_fds`],
+/// [`Facade::send_all`], [`Facade::send_all_with_fds`], [`Facade::shutdown`], and
+/// [`Facade::hangup`].
 pub trait StreamHandle: SocketHandle {}
 
 impl StreamHandle for std::net::TcpStream {}
@@ -103,90 +95,89 @@ impl StreamHandle for std::net::TcpStream {}
 impl StreamHandle for std::os::unix::net::UnixStream {}
 
 impl<S: SocketHandle> Facade<S> {
-	/// Receives into `span`, in one call: a short count is what arrived, not
-	/// an error. [`recv_exact`](Facade::recv_exact) loops.
+	/// Performs a single receive into `span`.
+	///
+	/// May read fewer bytes than `span.len()`; on stream sockets, use
+	/// [`recv_exact`](Facade::recv_exact) to fill the entire span.
 	pub fn recv(&self, span: Span) -> Transfer {
 		Transfer::new(self, Kind::Recv, span)
 	}
 
-	/// Receives into `span`, taking the descriptors the control messages
-	/// carry with the bytes.
+	/// Performs a single receive into `span`, also capturing any file descriptors
+	/// passed via ancillary control messages (`SCM_RIGHTS`).
 	pub fn recv_with_fds(&self, span: Span) -> Receive {
 		Receive::new(self, Kind::Recv, span)
 	}
 
-	/// Sends `span`, in one call: a short count is what the call took, not an
-	/// error. [`send_all`](Facade::send_all) loops.
+	/// Performs a single send from `span`.
+	///
+	/// May write fewer bytes than `span.len()`; on stream sockets, use
+	/// [`send_all`](Facade::send_all) to send the entire span.
 	pub fn send(&self, span: Span) -> Transfer {
 		Transfer::new(self, Kind::Send, span)
 	}
 
-	/// Sends `span`, carrying `fds` with the bytes.
-	///
-	/// One call carries the descriptors; see
-	/// [`send_all_with_fds`](Facade::send_all_with_fds) for a send that loops.
+	/// Performs a single send from `span`, attaching `fds` as ancillary control
+	/// messages (`SCM_RIGHTS`).
 	pub fn send_with_fds(&self, span: Span, fds: Vec<OwnedDescriptor>) -> Transfer {
 		Transfer::with_fds(self, Kind::Send, span, fds)
 	}
 
-	/// Takes and clears the socket's pending error. Failure to read the error is returned as the outer `Err`.
+	/// Retrieves and clears the socket's pending error (`SO_ERROR`).
 	pub fn take_error(&self) -> io::Result<Option<io::Error>> {
 		imp::take_error((**self.resource()).as_descriptor())
 	}
 }
 
 impl<S: StreamHandle> Facade<S> {
-	/// Receives into `span`, over as many calls as it takes to fill it.
+	/// Receives into `span` until it is completely filled.
 	///
-	/// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) when the peer closes
-	/// first.
+	/// Fails with [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) if the peer
+	/// closes the connection before `span` is full.
 	pub fn recv_exact(&self, span: Span) -> Transfer {
 		Transfer::new(self, Kind::RecvAll, span)
 	}
 
-	/// [`recv_with_fds`](Facade::recv_with_fds) over as many calls as it takes
-	/// to fill `span`, gathering the descriptors every call brings.
+	/// Receives into `span` until it is completely filled, collecting all file
+	/// descriptors received across calls.
 	pub fn recv_exact_with_fds(&self, span: Span) -> Receive {
 		Receive::new(self, Kind::RecvAll, span)
 	}
 
-	/// Sends `span`, over as many calls as it takes.
+	/// Sends all bytes in `span` across one or more calls.
 	///
-	/// [`WriteZero`](std::io::ErrorKind::WriteZero) when a call takes nothing.
+	/// Fails with [`WriteZero`](std::io::ErrorKind::WriteZero) if a call transfers
+	/// zero bytes.
 	pub fn send_all(&self, span: Span) -> Transfer {
 		Transfer::new(self, Kind::SendAll, span)
 	}
 
-	/// Sends all of `span`, attaching `fds` only to the first call's bytes.
+	/// Sends all bytes in `span`, attaching `fds` to the first send call.
 	pub fn send_all_with_fds(&self, span: Span, fds: Vec<OwnedDescriptor>) -> Transfer {
 		Transfer::with_fds(self, Kind::SendAll, span, fds)
 	}
 
-	/// Shuts down one or both directions. `Write` sends EOF to the peer without closing the receive side.
+	/// Shuts down the read, write, or both halves of the stream.
 	pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
 		imp::shutdown((**self.resource()).as_descriptor(), how)
 	}
 
-	/// Resolves once the connection is gone both ways, or has failed.
+	/// Waits until the connection is fully closed in both directions or reset.
 	///
-	/// A peer that shut only its write side has not hung up: the stream
-	/// still takes sends. On TCP a peer's close arrives as that same
-	/// half-close, so the hangup comes once this side shuts its write
-	/// side too, or the connection resets. io_uring only; the other
-	/// backends fail it with [`Unsupported`](std::io::ErrorKind::Unsupported).
+	/// A peer half-close (`SHUT_WR` / FIN) alone does not resolve this future while
+	/// the local write half remains open. Supported on `io_uring` (Linux 5.13+);
+	/// other backends fail with [`Unsupported`](std::io::ErrorKind::Unsupported).
 	pub fn hangup(&self) -> Op {
 		Op::new(self, Action::Hangup)
 	}
 }
 
-/// A listening socket whose accepted connections have a type of their own.
+/// Trait for listening sockets that accept incoming stream connections.
 ///
-/// Implementing this is what gives a listener [`Facade::accept`]; the stream it
-/// yields is the associated type, so an accepted connection is a facade over
-/// the concrete socket type rather than one the caller narrows. `Stream` has
-/// to be the type of the connections this listener accepts: the accepted
-/// socket goes to its `From<OwnedSocket>` as it is.
+/// Implementing `ListenerHandle` enables [`Facade::accept`], which wraps each
+/// accepted [`OwnedSocket`] into `Facade<Self::Stream>`.
 pub trait ListenerHandle: AsDescriptor + Send + Sync + 'static {
+	/// Connected stream type produced by [`Facade::accept`].
 	type Stream: StreamHandle + From<OwnedSocket>;
 }
 
@@ -200,7 +191,7 @@ impl ListenerHandle for std::os::unix::net::UnixListener {
 }
 
 impl<S: ListenerHandle> Facade<S> {
-	/// Takes the next connection in: the stream it made, in a facade of its own.
+	/// Accepts the next incoming connection on this listener.
 	pub fn accept(&self) -> Accept<S> {
 		Accept::new(Gate::new(self, Action::Accept))
 	}

@@ -6,14 +6,11 @@
 //! dropping an operation — none of which the facade, which owns its reactor
 //! inside an `Executor`, exposes.
 
-use std::io;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering::Relaxed;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use completion_backend::{AsDescriptor, Config, Error, ErrorKind, Extent, IoVec, Memory, Response};
+use completion_backend::{AsDescriptor, Buffer, Config, Error, ErrorKind, Response};
 
 #[cfg(target_os = "linux")]
 use completion_backend::Status;
@@ -24,53 +21,6 @@ use std::io::{Read, Write};
 use crate::completion::{Completion, submit, submit_timer};
 use crate::io::OpenOptions;
 use crate::reactor::{Op, Reactor};
-
-/// Bytes a test binds to a space. Atomic, so the backend may write them through
-/// an iovec while the buffer is shared.
-struct Buffer(Arc<[AtomicU8]>);
-
-impl Buffer {
-	fn new(len: usize) -> Buffer {
-		Buffer::from_slice(&vec![0; len])
-	}
-
-	fn from_slice(bytes: &[u8]) -> Buffer {
-		Buffer(bytes.iter().map(|&byte| AtomicU8::new(byte)).collect())
-	}
-
-	fn to_vec(&self) -> Vec<u8> {
-		self.0.iter().map(|byte| byte.load(Relaxed)).collect()
-	}
-}
-
-// SAFETY: the bytes are atomics, so a write through the pointer races on bytes
-// only, never on a reference; `iovec` checks the extent against the length.
-unsafe impl Memory for Buffer {
-	fn len(&self) -> usize {
-		self.0.len()
-	}
-
-	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
-		let end = usize::try_from(extent.offset)
-			.ok()
-			.and_then(|offset| offset.checked_add(extent.len));
-		if !end.is_some_and(|end| end <= self.0.len()) {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"range outside the buffer",
-			));
-		}
-		let base = self.0.as_ptr() as *mut u8;
-		// SAFETY: in bounds, checked above.
-		Ok(unsafe { IoVec::new(base.add(extent.offset as usize), extent.len) })
-	}
-}
-
-/// A second handle on `buf`, in the shape an operation names memory.
-fn memory(buf: &Arc<Buffer>) -> Arc<dyn Memory> {
-	let memory: Arc<dyn Memory> = buf.clone();
-	memory
-}
 
 /// The descriptor of `resource`, in the shape a submission names one.
 fn fd<S: AsDescriptor + 'static>(resource: &Arc<S>) -> Arc<dyn AsDescriptor> {
@@ -160,14 +110,14 @@ fn socket_pair() -> (
 fn stalled_recv(
 	reactor: &Reactor,
 	right: &Arc<std::os::unix::net::UnixStream>,
-	buf: &Arc<Buffer>,
+	buf: &Buffer,
 ) -> Completion {
 	submit(
 		reactor,
 		fd(right),
 		Op::Read {
 			offset: 0,
-			span: completion_backend::Space::new(memory(buf)).whole(),
+			span: buf.whole(),
 		},
 		None,
 	)
@@ -182,13 +132,13 @@ fn stalled_recv(
 fn a_landed_file_operation_does_not_wait_out_the_timeout() {
 	let reactor = Reactor::new(Config::default()).unwrap();
 	let file = seeded_file(b"hello");
-	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buf: Buffer = Buffer::zeroed(5);
 	let completion = submit(
 		&reactor,
 		fd(&file),
 		Op::Read {
 			offset: 0,
-			span: completion_backend::Space::new(memory(&buf)).whole(),
+			span: buf.whole(),
 		},
 		None,
 	)
@@ -347,13 +297,13 @@ fn a_cancelled_timer_before_shutdown_still_reads_as_a_cancel() {
 fn a_shutdown_lands_what_is_in_flight_and_refuses_new_work() {
 	let file = seeded_file(b"hello");
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buf: Buffer = Buffer::zeroed(5);
 	let completion = submit(
 		&reactor,
 		fd(&file),
 		Op::Read {
 			offset: 0,
-			span: completion_backend::Space::new(memory(&buf)).whole(),
+			span: buf.whole(),
 		},
 		None,
 	)
@@ -372,13 +322,13 @@ fn a_shutdown_lands_what_is_in_flight_and_refuses_new_work() {
 	assert!(reactor.idle());
 
 	// A reactor that has shut down takes no more work.
-	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
+	let buf: Buffer = Buffer::zeroed(5);
 	let error = submit(
 		&reactor,
 		fd(&file),
 		Op::Read {
 			offset: 0,
-			span: completion_backend::Space::new(memory(&buf)).whole(),
+			span: buf.whole(),
 		},
 		None,
 	)
@@ -396,7 +346,7 @@ fn a_shutdown_lands_what_is_in_flight_and_refuses_new_work() {
 fn a_dropped_in_flight_read_is_cancelled_and_reaped() {
 	let (mut peer, right) = socket_pair();
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(Buffer::new(8));
+	let buf = Buffer::zeroed(8);
 	let completion = stalled_recv(&reactor, &right, &buf);
 	reactor.drive(Some(Duration::ZERO)).unwrap();
 	assert!(!reactor.idle(), "the receive has to be in flight");
@@ -406,15 +356,13 @@ fn a_dropped_in_flight_read_is_cancelled_and_reaped() {
 		started.elapsed() < Duration::from_secs(1),
 		"the drop waited for the kernel"
 	);
-	assert_eq!(
-		Arc::strong_count(&buf),
-		2,
+	assert!(
+		!reactor.idle(),
 		"the detached receive holds the buffer until its cancellation lands"
 	);
 	drive_until_idle(&reactor);
-	assert_eq!(
-		Arc::strong_count(&buf),
-		1,
+	assert!(
+		reactor.idle(),
 		"the reactor released the buffer once the cancellation landed"
 	);
 	peer.write_all(b"later").unwrap();
@@ -454,12 +402,12 @@ fn a_dropped_readiness_wait_does_not_block() {
 fn a_reactor_drop_settles_what_is_in_flight() {
 	let (_left, right) = socket_pair();
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(Buffer::new(8));
+	let buf = Buffer::zeroed(8);
 	let completion = stalled_recv(&reactor, &right, &buf);
 	reactor.drive(Some(Duration::ZERO)).unwrap();
 	assert!(!reactor.idle(), "the receive is in flight");
 	reactor.shutdown(true).unwrap();
-	assert_eq!(Arc::strong_count(&buf), 1, "the reactor held the buffer");
+	assert!(reactor.idle(), "the shutdown reaped the receive");
 	let started = Instant::now();
 	drop(completion);
 	assert!(
@@ -475,7 +423,7 @@ fn a_reactor_drop_settles_what_is_in_flight() {
 fn a_graceful_shutdown_lets_an_operation_land_on_its_own() {
 	let (mut left, right) = socket_pair();
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(Buffer::new(8));
+	let buf = Buffer::zeroed(8);
 	let mut completion = stalled_recv(&reactor, &right, &buf);
 	reactor.drive(Some(Duration::ZERO)).unwrap();
 	let peer = std::thread::spawn(move || {
@@ -550,7 +498,7 @@ fn a_cancelled_receive_keeps_the_late_bytes_out() {
 	right.set_nonblocking(true).unwrap();
 	let right = Arc::new(right);
 	let reactor = Reactor::new(Config::default()).unwrap();
-	let buf = Arc::new(Buffer::new(8));
+	let buf = Buffer::zeroed(8);
 	let completion = stalled_recv(&reactor, &right, &buf);
 	// One pass puts the receive in flight, so the cancel reaches the kernel's op.
 	reactor.drive(Some(Duration::ZERO)).unwrap();
@@ -610,12 +558,12 @@ mod uring {
 	fn an_op_that_wins_the_race_keeps_its_bytes() {
 		let (mut left, right) = socket_pair();
 		let reactor = Reactor::new(Config::default()).unwrap();
-		let buf = Arc::new(Buffer::new(4));
+		let buf = Buffer::zeroed(4);
 		let mut completion = stalled_recv(&reactor, &right, &buf);
 		// The receive goes to the kernel with nothing to move, so it is in flight
 		// and unsettled when the completion is next looked at.
 		reactor.drive(Some(Duration::ZERO)).unwrap();
-		assert_eq!(Arc::strong_count(&buf), 2, "the kernel holds the buffer");
+		assert!(!reactor.idle(), "the receive is in flight in the kernel");
 		// The bytes are queued, and the kernel finishes the receive on its own.
 		left.write_all(b"wins").unwrap();
 		// The cancel fires before the outcome is looked at; the receive gets there
@@ -655,12 +603,12 @@ mod portable {
 	fn a_cancel_that_wins_the_race_leaves_the_bytes_with_the_peer() {
 		let (mut left, right) = socket_pair();
 		let reactor = Reactor::new(Config::default()).unwrap();
-		let buf = Arc::new(Buffer::new(4));
+		let buf = Buffer::zeroed(4);
 		let mut completion = stalled_recv(&reactor, &right, &buf);
 		// The receive is armed with nothing to move, so it is in flight and
 		// unsettled when the completion is next looked at.
 		reactor.drive(Some(Duration::ZERO)).unwrap();
-		assert_eq!(Arc::strong_count(&buf), 2, "the operation holds the buffer");
+		assert!(!reactor.idle(), "the receive is in flight");
 		// The bytes are queued, and no pass has run the receive over them.
 		left.write_all(b"wins").unwrap();
 		// The cancel fires before the outcome is looked at; the receive never
@@ -733,7 +681,7 @@ mod sockets {
 			match client.read(&mut byte) {
 				Ok(0) => return,
 				Ok(read) => panic!("the peer read {read} bytes, not the connection ending"),
-				Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+				Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
 					assert!(
 						Instant::now() < deadline,
 						"the peer never saw the connection end"
@@ -759,7 +707,7 @@ mod sockets {
 			reactor.drive(Some(Duration::from_millis(1))).unwrap();
 			match client.read(&mut byte) {
 				Ok(0) => return,
-				Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+				Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
 				other => panic!("the peer read {other:?}"),
 			}
 		}
@@ -983,14 +931,13 @@ mod hangup {
 		// The burst: reads that land at once, none of them reaped yet, and each
 		// held so its operation stays with the ring.
 		let scratch = tempdir("hangup-terminated");
-		let buf: Arc<Buffer> = Arc::new(Buffer::new(24));
-		let space = completion_backend::Space::new(memory(&buf));
+		let buf: Buffer = Buffer::zeroed(24);
 		let mut reads = Vec::new();
 		for index in 0..24u64 {
 			let path = scratch.path().join(format!("data{index}"));
 			std::fs::write(&path, b"hello").unwrap();
 			let file = Arc::new(OpenOptions::new().read(true).open(&path).unwrap());
-			let span = space.span(index, 1);
+			let span = buf.span(index, 1);
 			reads.push(submit(&reactor, fd(&file), Op::Read { offset: 0, span }, None).unwrap());
 		}
 		// Let every read land, and leave them in the queue: the poll's report has

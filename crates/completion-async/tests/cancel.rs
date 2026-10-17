@@ -1,10 +1,11 @@
 //! Cancellation through the async surface: the cooperative path ([`Cancel`] and
 //! `until`), and the [`Cancel`] tree and wait that the async API exposes.
 //!
-//! The drop fallback, which waits for the backend to let go of the caller's
-//! memory, is a reactor concern the async layer cannot reach: its tests live in
-//! the low crate. The tests wait on a socket pair, so the whole file is unix: a
-//! port that cannot be made to wait has nothing to cancel.
+//! What a drop does — cancel the operation and detach it, without waiting for
+//! the backend to let go of the caller's memory — is a reactor concern the
+//! async layer cannot reach: its tests live in the low crate. The tests wait on
+//! a socket pair, so the whole file is unix: a port that cannot be made to wait
+//! has nothing to cancel.
 #![cfg(unix)]
 
 mod common;
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use completion_async::{Cancel, Config, ErrorKind, Executor, Facade, File, Span};
+use completion_async::{Cancel, Config, ErrorKind, Executor, Facade, File, Space, Span, Timeout};
 
 /// The async driver the operations run on.
 fn executor() -> Executor {
@@ -26,10 +27,10 @@ fn executor() -> Executor {
 	Executor::new(Config::default()).unwrap()
 }
 
-/// The whole of `buf`, bound to `executor`: the space holds a second handle on
-/// it, so it outlives the operation.
-fn span(executor: &Executor, buf: &Arc<Buffer>) -> Span<'static> {
-	executor.bind(buf.clone()).whole()
+/// The whole of `buf` in its own space: the space holds a second handle on it,
+/// so it outlives the operation.
+fn span(buf: &Arc<Buffer>) -> Span {
+	Space::new(buf.clone()).whole()
 }
 
 /// `until` returns `Ok` when the operation completes first, even with a cancel
@@ -45,7 +46,7 @@ fn until_completes_when_the_op_lands_first() {
 	let buf = Arc::new(Buffer::new(5));
 	let cancel = Cancel::new();
 	let outcome = executor
-		.block_on(file.read_at(span(&executor, &buf), 0).until(&cancel))
+		.block_on(file.read_at(span(&buf), 0).until(&cancel))
 		.unwrap();
 	assert_eq!(outcome.value, 5, "the read completed first");
 	assert!(outcome.result.is_ok(), "the cancel never fired");
@@ -199,7 +200,7 @@ fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 	});
 	let started = Instant::now();
 	let outcome = executor
-		.block_on(right.recv(span(&executor, &buf)).until(&cancel))
+		.block_on(right.recv(span(&buf)).until(&cancel))
 		.unwrap();
 	thread.join().unwrap();
 	assert!(
@@ -249,7 +250,7 @@ fn a_cancel_shared_by_two_executors_wakes_both() {
 			let buf = Arc::new(Buffer::new(8));
 			let started = Instant::now();
 			let outcome = executor
-				.block_on(right.recv(span(&executor, &buf)).until(&cancel))
+				.block_on(right.recv(span(&buf)).until(&cancel))
 				.unwrap();
 			// `left` outlives the receive: a peer that went would end it with EOF,
 			// not leave it stalled for the cancel to reach.
@@ -312,7 +313,7 @@ fn a_cancel_from_another_thread_wakes_a_parked_reactor() {
 			raiser.cancel();
 		});
 		let outcome = executor
-			.block_on(right.recv(span(&executor, &buf)).until(&cancel))
+			.block_on(right.recv(span(&buf)).until(&cancel))
 			.unwrap();
 		raising.join().unwrap();
 		assert!(
@@ -336,4 +337,28 @@ fn a_cancel_from_another_thread_wakes_a_parked_reactor() {
 		 receive it gave up on never settled"
 	);
 	resolving.join().unwrap();
+}
+
+/// A timer given a cancel resolves with the cancel, not with its deadline: the
+/// reactor disarms it and the future reports `Cancelled` instead of waiting an
+/// hour.
+#[test]
+fn a_cancelled_timeout_reports_the_cancel() {
+	let mut executor = executor();
+	let cancel = Cancel::new();
+	let raiser = cancel.clone();
+	let raising = std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(50));
+		raiser.cancel();
+	});
+	let timeout = Timeout::with_executor(Duration::from_secs(3600), &executor);
+	let started = Instant::now();
+	let result = executor.block_on(timeout.until(&cancel)).unwrap();
+	raising.join().unwrap();
+	let error = result.expect_err("the cancelled timeout resolved instead of reporting the cancel");
+	assert_eq!(error.kind(), ErrorKind::Cancelled, "{error}");
+	assert!(
+		started.elapsed() < Duration::from_secs(5),
+		"the timeout slept to its deadline instead of taking the cancel"
+	);
 }

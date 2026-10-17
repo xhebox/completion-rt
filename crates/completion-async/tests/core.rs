@@ -8,8 +8,6 @@
 mod common;
 use common::Buffer;
 
-use common::block_on;
-
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io;
@@ -19,7 +17,7 @@ use std::task::{Context, Poll, Waker};
 
 #[cfg(unix)]
 use completion_async::Facade;
-use completion_async::{Config, ErrorKind, Executor, File, Handle, Span};
+use completion_async::{Config, ErrorKind, Executor, File, Space, Span};
 
 /// The async driver the operations run on: it owns the reactor, and `block_on`
 /// drives both the future and the backend beneath it.
@@ -37,10 +35,10 @@ fn seeded(executor: &Executor, contents: &[u8]) -> File {
 	File::with_executor(common::open(path).unwrap(), executor)
 }
 
-/// The whole of `buf`, bound to `executor`: the space holds a second handle on
-/// it, so it outlives the operation.
-fn span(executor: &Executor, buf: &Arc<Buffer>) -> Span<'static> {
-	executor.bind(buf.clone()).whole()
+/// The whole of `buf` in its own space: the space holds a second handle on it,
+/// so it outlives the operation.
+fn span(buf: &Arc<Buffer>) -> Span {
+	Space::new(buf.clone()).whole()
 }
 
 /// A read completes with the bytes its one call moved: the file has five, the
@@ -52,7 +50,7 @@ fn a_read_short_of_the_buffer_completes_with_its_count() {
 	let file = seeded(&executor, b"hello");
 	let buf: Arc<Buffer> = Arc::new(Buffer::new(8));
 	let n = executor
-		.block_on(file.read_at(span(&executor, &buf), 0))
+		.block_on(file.read_at(span(&buf), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
@@ -69,8 +67,6 @@ fn a_read_short_of_the_buffer_completes_with_its_count() {
 fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 	use std::os::fd::{AsRawFd, RawFd};
 
-	use completion_async::AsDescriptor as _;
-
 	let directory = common::tempdir("completion-fd-hold").unwrap();
 	let first = directory.path().join("first");
 	let second = directory.path().join("second");
@@ -78,15 +74,14 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 	std::fs::write(&second, b"second!").unwrap();
 	let mut executor = executor();
 
-	let handle = Handle::new(std::fs::File::open(&first).unwrap());
-	let number: RawFd = handle.as_descriptor().as_raw_fd();
-	let facade: Facade<std::fs::File> = Facade::bind_with_executor(handle.clone(), &executor);
+	let plain = std::fs::File::open(&first).unwrap();
+	let number: RawFd = plain.as_raw_fd();
+	let facade = File::with_executor(plain, &executor);
 	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let read = facade.read_at(span(&executor, &buf), 0);
-	// The caller's copies go before anything reaches the kernel; the read names
-	// the file through its own clone of the handle.
+	let read = facade.read_at(span(&buf), 0);
+	// The facade goes before anything reaches the kernel; the read names the
+	// file through the entry's own clone of the resource.
 	drop(facade);
-	drop(handle);
 
 	// `open` takes the lowest free number, so one pass over every number up to
 	// the operation's own fills anything below it: were the number free, a file
@@ -113,7 +108,7 @@ fn a_dropped_operation_releases_an_unsubmitted_request() {
 	let mut executor = executor();
 	let file = seeded(&executor, b"data");
 	let buf = Arc::new(Buffer::new(4));
-	let read = file.read_at(span(&executor, &buf), 0);
+	let read = file.read_at(span(&buf), 0);
 	assert_eq!(Arc::strong_count(&buf), 2, "the request holds the buffer");
 	// Nothing polled: the request is still unsubmitted, so it goes with the drop.
 	drop(read);
@@ -147,7 +142,7 @@ fn cancelling_waits_for_the_kernel() {
 		raiser.cancel();
 	});
 	let outcome = executor
-		.block_on(right.recv(span(&executor, &buf)).until(&cancel))
+		.block_on(right.recv(span(&buf)).until(&cancel))
 		.unwrap();
 	assert!(
 		outcome
@@ -172,7 +167,7 @@ fn concurrent_submits_all_complete() {
 		let file = seeded(&executor, &[i; 64]);
 		let buf: Arc<Buffer> = Arc::new(Buffer::new(64));
 		let read = Arc::clone(&buf);
-		let span = span(&executor, &read);
+		let span = span(&read);
 		tasks.push(executor.spawner().spawn(async move {
 			let n = file.read_at(span, 0).await.into_result().unwrap();
 			assert_eq!(n, 64);
@@ -199,7 +194,7 @@ fn many_transfers_all_complete() {
 	for _ in 0..4096 {
 		let buf: Arc<Buffer> = Arc::new(Buffer::new(4096));
 		let read = Arc::clone(&buf);
-		let span = span(&executor, &read);
+		let span = span(&read);
 		let file = file.clone();
 		tasks.push(executor.spawner().spawn(async move {
 			let n = file.read_at(span, 0).await.into_result().unwrap();
@@ -230,7 +225,7 @@ fn a_socket_send_lands_in_the_receive_buffer() {
 	let sent: Arc<Buffer> = Arc::new(Buffer::from_slice(b"over the socket"));
 	assert_eq!(
 		executor
-			.block_on(left.send(span(&executor, &sent)))
+			.block_on(left.send(span(&sent)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -240,7 +235,7 @@ fn a_socket_send_lands_in_the_receive_buffer() {
 	let received: Arc<Buffer> = Arc::new(Buffer::new(15));
 	assert_eq!(
 		executor
-			.block_on(right.recv(span(&executor, &received)))
+			.block_on(right.recv(span(&received)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -276,7 +271,7 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 		(&left).write_all(b"data").unwrap();
 	});
 	let n = executor
-		.block_on(right.recv(span(&executor, &buffer)))
+		.block_on(right.recv(span(&buffer)))
 		.unwrap()
 		.into_result()
 		.unwrap();
@@ -312,7 +307,7 @@ fn sqpoll_rings_complete_too() {
 	let file = seeded(&executor, b"hello");
 	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
 	let n = executor
-		.block_on(file.read_at(span(&executor, &buf), 0))
+		.block_on(file.read_at(span(&buf), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
@@ -369,7 +364,7 @@ fn a_submission_after_the_executor_drops_is_refused() {
 	let executor = executor();
 	let file = seeded(&executor, b"hello");
 	let buf: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let span = span(&executor, &buf);
+	let span = span(&buf);
 	drop(executor);
 	let mut read = pin!(file.read_at(span, 0));
 	let mut cx = Context::from_waker(Waker::noop());
@@ -382,99 +377,4 @@ fn a_submission_after_the_executor_drops_is_refused() {
 		Err(error) => assert_eq!(error.kind(), ErrorKind::Stopped, "{error}"),
 		Ok(count) => panic!("a gone reactor moved {count} bytes"),
 	}
-}
-
-thread_local! {
-	/// The take a rendezvous wake re-polls; one test drives it at a time.
-	static PENDING_TAKE: std::cell::RefCell<Option<std::pin::Pin<Box<dyn Future<Output = Option<usize>>>>>> =
-		std::cell::RefCell::new(None);
-	static TAKE_OUTCOME: std::cell::RefCell<Option<Option<usize>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Re-polls the parked take, so what the taker sees is the state at the wake
-/// rather than after it: this is what a release-before-wake ordering is
-/// observable through, and a wake raised one drop too early is not.
-fn repoll() {
-	// A wake may still arrive while the thread-locals this reaches into are
-	// being torn down, which a plain `with` would abort on.
-	let Some(mut take) = PENDING_TAKE
-		.try_with(|slot| slot.borrow_mut().take())
-		.ok()
-		.flatten()
-	else {
-		return;
-	};
-	let waker = Waker::from(Arc::new(Repoll));
-	let mut cx = Context::from_waker(&waker);
-	// The take is out of the slot while it is polled, so a release the poll
-	// raises cannot re-enter this with it borrowed.
-	match take.as_mut().poll(&mut cx) {
-		Poll::Ready(value) => {
-			let _ = TAKE_OUTCOME.try_with(|slot| *slot.borrow_mut() = Some(value));
-		}
-		Poll::Pending => {
-			let _ = PENDING_TAKE.try_with(|slot| *slot.borrow_mut() = Some(take));
-		}
-	}
-}
-
-struct Repoll;
-
-impl std::task::Wake for Repoll {
-	fn wake(self: Arc<Self>) {
-		repoll();
-	}
-}
-
-/// A take waits for a user clone exactly as long as it holds the value: it
-/// resolves on the wake the last drop raises, with the value already released.
-#[test]
-fn a_take_resolves_when_the_other_clone_is_dropped() {
-	let handle = Handle::new(0usize);
-	let other = handle.clone();
-	PENDING_TAKE.with(|slot| *slot.borrow_mut() = Some(Box::pin(handle.take())));
-
-	// The first poll parks the take: the clone still holds the value.
-	repoll();
-	assert_eq!(
-		TAKE_OUTCOME.with(|slot| slot.borrow().clone()),
-		None,
-		"the clone still names the value"
-	);
-
-	drop(other);
-	assert_eq!(
-		TAKE_OUTCOME.with(|slot| slot.borrow().clone()),
-		Some(Some(0)),
-		"the wake found the value still held: the release did not come first"
-	);
-}
-
-/// One taker at a time: a second take on the same handle gives up at once, and
-/// its clone is what frees the value for the take already waiting.
-#[test]
-fn a_second_take_gives_up_while_one_waits() {
-	let handle = Handle::new(1usize);
-	let other = handle.clone();
-	let mut first = Box::pin(handle.take());
-	let mut cx = Context::from_waker(Waker::noop());
-	assert!(first.as_mut().poll(&mut cx).is_pending());
-
-	assert_eq!(block_on(other.take()), None);
-
-	assert_eq!(first.as_mut().poll(&mut cx), Poll::Ready(Some(1)));
-}
-
-/// A resource becomes a handle through `From` as well as through `new`.
-#[test]
-fn a_handle_is_built_from_its_resource() {
-	let directory = common::tempdir("completion-from").unwrap();
-	let path = directory.path().join("data");
-	std::fs::write(&path, b"data").unwrap();
-	let file: Handle<std::fs::File> = Handle::from(std::fs::File::open(&path).unwrap());
-	let file = match file.try_take() {
-		Ok(file) => file,
-		Err(_) => panic!("nothing else names the file"),
-	};
-	assert_eq!(file.metadata().unwrap().len(), 4);
 }

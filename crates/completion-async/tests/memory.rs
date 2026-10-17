@@ -1,12 +1,12 @@
-//! Memory handed to an operation: a space bound to the executor once, or lent
-//! to a scope, and the span of it each operation names.
+//! Memory handed to an operation: a space, and the span of it each operation
+//! names.
 mod common;
 use common::Buffer;
 
 use std::io;
 use std::sync::Arc;
 
-use completion_async::{Config, ErrorKind, Executor, Facade, File, OpenOptions};
+use completion_async::{Config, ErrorKind, Executor, Facade, File, OpenOptions, Space};
 
 /// The async driver the file operations run on: it owns the reactor, so
 /// `block_on` both polls the operation and drives the backend under it.
@@ -38,8 +38,8 @@ fn a_bound_space_moves_bytes_through_a_file() {
 	let (_directory, path, file) = scratch("completion-memory-bind", &executor);
 	let source = Arc::new(Buffer::from_slice(b"payload"));
 	let sink = Arc::new(Buffer::new(7));
-	let source_space = executor.bind(source);
-	let sink_space = executor.bind(sink.clone());
+	let source_space = Space::new(source);
+	let sink_space = Space::new(sink.clone());
 
 	executor
 		.block_on(file.write_all_at(source_space.whole(), 0))
@@ -64,7 +64,7 @@ fn a_span_past_its_space_fails_as_invalid_input() {
 	let (_directory, path, file) = scratch("completion-memory-range", &executor);
 	std::fs::write(&path, b"hello").unwrap();
 	let buffer = Arc::new(Buffer::new(4));
-	let space = executor.bind(buffer.clone());
+	let space = Space::new(buffer.clone());
 
 	let outcome = executor
 		.block_on(file.read_at(space.span(2, 4), 0))
@@ -80,35 +80,13 @@ fn a_span_past_its_space_fails_as_invalid_input() {
 	assert_eq!(buffer.to_vec(), &[0u8; 4]);
 }
 
-/// A space belongs to the executor it was bound to: an operation on another
-/// executor's facade refuses it.
-#[test]
-fn a_space_bound_to_another_executor_is_refused() {
-	let mut executor = executor();
-	let other = self::executor();
-	let (_directory, path, file) = scratch("completion-memory-foreign", &executor);
-	std::fs::write(&path, b"hello").unwrap();
-	let buffer = Arc::new(Buffer::new(5));
-	let space = other.bind(buffer.clone());
-
-	let read = executor.block_on(file.read_at(space.whole(), 0)).unwrap();
-
-	match read.into_result() {
-		Err(error) if error.kind() == ErrorKind::Failed => {
-			assert_eq!(io::Error::from(error).kind(), io::ErrorKind::InvalidInput)
-		}
-		other => panic!("a foreign executor took the space: {other:?}"),
-	}
-	assert_eq!(buffer.to_vec(), &[0u8; 5]);
-}
-
 /// A gathered span reads and writes its ranges in order, as if they were one.
 #[test]
 fn a_gathered_span_moves_both_ranges() {
 	let mut executor = executor();
 	let (_directory, path, file) = scratch("completion-memory-gather", &executor);
 	let source = Arc::new(Buffer::from_slice(b"head....tail"));
-	let source = executor.bind(source);
+	let source = Space::new(source);
 
 	let written = executor
 		.block_on(file.write_all_at(source.gather([(0, 4), (8, 4)]), 0))
@@ -119,7 +97,7 @@ fn a_gathered_span_moves_both_ranges() {
 	assert_eq!(std::fs::read(&path).unwrap(), b"headtail");
 
 	let sink = Arc::new(Buffer::from_slice(&[b'.'; 12]));
-	let space = executor.bind(sink.clone());
+	let space = Space::new(sink.clone());
 	let read = executor
 		.block_on(file.read_exact_at(space.gather([(8, 4), (0, 4)]), 0))
 		.unwrap()
@@ -137,7 +115,7 @@ fn read_exact_at_fills_a_skipped_span() {
 	let (_directory, path, file) = scratch("completion-memory-skip", &executor);
 	std::fs::write(&path, b"world").unwrap();
 	let sink = Arc::new(Buffer::from_slice(b"hello, ....."));
-	let space = executor.bind(sink.clone());
+	let space = Space::new(sink.clone());
 
 	let read = executor
 		.block_on(file.read_exact_at(space.whole().skip(7), 0))

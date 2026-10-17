@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use completion_async::{
 	AsDescriptor, BorrowedDescriptor, Cancel, Config, ErrorKind, Executor, Facade, ListenerHandle,
-	OwnedSocket, SocketHandle, Span, StreamHandle,
+	OwnedSocket, SocketHandle, Space, Span, StreamHandle,
 };
 
 /// The async driver the socket operations run on.
@@ -23,10 +23,10 @@ fn executor() -> Executor {
 	Executor::new(Config::default()).unwrap()
 }
 
-/// The whole of `buf`, bound to `executor`: the space holds a second handle on
-/// it, so it outlives the operation.
-fn span(executor: &Executor, buf: &Arc<Buffer>) -> Span<'static> {
-	executor.bind(buf.clone()).whole()
+/// The whole of `buf` in its own space: the space holds a second handle on it,
+/// so it outlives the operation.
+fn span(buf: &Arc<Buffer>) -> Span {
+	Space::new(buf.clone()).whole()
 }
 
 /// A connected pair over loopback: the portable way to two real sockets.
@@ -108,7 +108,7 @@ fn send_all_moves_a_payload_larger_than_one_call() {
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(&bytes));
 	executor
-		.block_on(socket.send_all(span(&executor, &payload)))
+		.block_on(socket.send_all(span(&payload)))
 		.unwrap()
 		.into_result()
 		.unwrap();
@@ -144,7 +144,7 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(len));
 	executor
-		.block_on(socket.recv_exact(span(&executor, &buffer)))
+		.block_on(socket.recv_exact(span(&buffer)))
 		.unwrap()
 		.into_result()
 		.unwrap();
@@ -207,7 +207,7 @@ fn a_caller_socket_type_gets_the_socket_operations() {
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
 	assert_eq!(
 		executor
-			.block_on(socket.send_all(span(&executor, &payload)))
+			.block_on(socket.send_all(span(&payload)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -222,7 +222,7 @@ fn a_caller_socket_type_gets_the_socket_operations() {
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
 	assert_eq!(
 		executor
-			.block_on(socket.recv_exact(span(&executor, &buffer)))
+			.block_on(socket.recv_exact(span(&buffer)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -247,7 +247,7 @@ fn a_datagram_socket_takes_a_message_a_call() {
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
 	assert_eq!(
 		executor
-			.block_on(sender.send(span(&executor, &payload)))
+			.block_on(sender.send(span(&payload)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -257,7 +257,7 @@ fn a_datagram_socket_takes_a_message_a_call() {
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(8));
 	assert_eq!(
 		executor
-			.block_on(receiver.recv(span(&executor, &buffer)))
+			.block_on(receiver.recv(span(&buffer)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -289,7 +289,7 @@ fn an_accept_gives_a_stream_facade_of_its_own() {
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
 	assert_eq!(
 		executor
-			.block_on(stream.send(span(&executor, &payload)))
+			.block_on(stream.send(span(&payload)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -309,7 +309,7 @@ fn an_accept_gives_a_stream_facade_of_its_own() {
 	let received: Arc<Buffer> = Arc::new(Buffer::new(5));
 	assert_eq!(
 		executor
-			.block_on(stream.recv(span(&executor, &received)))
+			.block_on(stream.recv(span(&received)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -337,7 +337,7 @@ fn a_tcp_accept_gives_a_stream_facade_of_its_own() {
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
 	assert_eq!(
 		executor
-			.block_on(stream.send(span(&executor, &payload)))
+			.block_on(stream.send(span(&payload)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -356,7 +356,7 @@ fn a_tcp_accept_gives_a_stream_facade_of_its_own() {
 	let received: Arc<Buffer> = Arc::new(Buffer::new(5));
 	assert_eq!(
 		executor
-			.block_on(stream.recv(span(&executor, &received)))
+			.block_on(stream.recv(span(&received)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -384,13 +384,13 @@ fn recv_with_fds_hands_the_descriptors_back() {
 	let file = std::fs::File::open(&path).unwrap();
 	let payload: Arc<Buffer> = Arc::new(Buffer::from_slice(b"hello"));
 	let sent = executor
-		.block_on(sender.send_all_with_fds(span(&executor, &payload), vec![file.into()]))
+		.block_on(sender.send_all_with_fds(span(&payload), vec![file.into()]))
 		.unwrap();
 	assert!(sent.result.is_ok(), "the send failed: {:?}", sent.result);
 
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
 	let received = executor
-		.block_on(receiver.recv_exact_with_fds(span(&executor, &buffer)))
+		.block_on(receiver.recv_exact_with_fds(span(&buffer)))
 		.unwrap()
 		.into_result()
 		.expect("the receive failed");
@@ -479,7 +479,7 @@ fn a_shutdown_write_half_closes_the_connection() {
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
 	assert_eq!(
 		executor
-			.block_on(socket.recv(span(&executor, &buffer)))
+			.block_on(socket.recv(span(&buffer)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -502,7 +502,7 @@ fn a_given_up_receive_reports_the_cancel() {
 	cancel.cancel();
 
 	let outcome = executor
-		.block_on(socket.recv(span(&executor, &buffer)).until(&cancel))
+		.block_on(socket.recv(span(&buffer)).until(&cancel))
 		.unwrap();
 	assert!(
 		outcome
@@ -546,7 +546,7 @@ fn a_cancel_ends_a_recv_exact_loop_mid_way() {
 	});
 
 	let outcome = executor
-		.block_on(socket.recv_exact(span(&executor, &buffer)).until(&cancel))
+		.block_on(socket.recv_exact(span(&buffer)).until(&cancel))
 		.unwrap();
 	thread.join().unwrap();
 	assert_eq!(outcome.value, 4, "the loop kept the bytes it had taken");
@@ -597,7 +597,7 @@ fn a_cancel_ends_a_send_all_loop_with_its_progress() {
 	});
 
 	let outcome = executor
-		.block_on(socket.send_all(span(&executor, &payload)).until(&cancel))
+		.block_on(socket.send_all(span(&payload)).until(&cancel))
 		.unwrap();
 	thread.join().unwrap();
 	assert!(
@@ -640,9 +640,7 @@ fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 
 	// The peer goes away, and the reset reaches the send: what it had taken off
 	// the memory is still the progress it reports.
-	let outcome = executor
-		.block_on(socket.send_all(span(&executor, &payload)))
-		.unwrap();
+	let outcome = executor.block_on(socket.send_all(span(&payload))).unwrap();
 	gone.join().unwrap();
 	assert!(outcome.value > 0, "the failed send dropped its progress");
 	assert!(
@@ -671,15 +669,13 @@ fn a_shutdown_read_ends_a_receive_in_flight() {
 	// The peer sends nothing, so the receive sits with the kernel and only a
 	// shutdown can end it.
 	let shutdown = socket.clone();
-	let timeout = Timeout::with_executor(Duration::from_millis(50), &executor).unwrap();
+	let timeout = Timeout::with_executor(Duration::from_millis(50), &executor);
 	let task = executor.spawner().spawn(async move {
 		timeout.await.unwrap();
 		shutdown.shutdown(Shutdown::Read).unwrap();
 	});
 
-	let outcome = executor
-		.block_on(socket.recv(span(&executor, &buffer)))
-		.unwrap();
+	let outcome = executor.block_on(socket.recv(span(&buffer))).unwrap();
 	executor.block_on(task).unwrap();
 	assert!(
 		outcome.result.is_ok(),
@@ -712,15 +708,13 @@ fn a_shutdown_write_ends_a_send_in_flight() {
 	// Buffers held to a slice of the payload with the peer not reading: the
 	// send is still pending when the write side goes.
 	let shutdown = socket.clone();
-	let timeout = Timeout::with_executor(Duration::from_millis(50), &executor).unwrap();
+	let timeout = Timeout::with_executor(Duration::from_millis(50), &executor);
 	let task = executor.spawner().spawn(async move {
 		timeout.await.unwrap();
 		shutdown.shutdown(Shutdown::Write).unwrap();
 	});
 
-	let outcome = executor
-		.block_on(socket.send_all(span(&executor, &payload)))
-		.unwrap();
+	let outcome = executor.block_on(socket.send_all(span(&payload))).unwrap();
 	executor.block_on(task).unwrap();
 	assert!(
 		outcome.value > 0,
@@ -730,55 +724,6 @@ fn a_shutdown_write_ends_a_send_in_flight() {
 		outcome.result.is_err(),
 		"a send whose write side was shut down reports an error, not a write left waiting"
 	);
-}
-
-/// A take waits for an operation that still names the socket: the receive's
-/// future holds its own clone of the handle, so the socket comes back only
-/// once that future is dropped.
-#[test]
-fn a_take_waits_for_a_receive_in_flight() {
-	use std::io::Write;
-	use std::task::Poll;
-
-	let (client, mut server) = pair();
-	let mut executor = executor();
-	let socket: Facade<TcpStream> = Facade::with_executor(client, &executor);
-
-	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let mut receive = Box::pin(socket.clone().recv(span(&executor, &buffer)));
-	let mut take = Box::pin(socket.take());
-	let mut cx = Context::from_waker(Waker::noop());
-
-	// The peer has sent nothing, so the receive sits with the kernel and names
-	// the socket.
-	assert!(receive.as_mut().poll(&mut cx).is_pending());
-	assert!(
-		take.as_mut().poll(&mut cx).is_pending(),
-		"the receive still names the socket"
-	);
-
-	// The peer's bytes settle the receive, but the settled future keeps its
-	// clone until it is dropped: the take stays pending.
-	let writer = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(50));
-		server.write_all(b"hello").unwrap();
-	});
-	{
-		let receive = &mut receive;
-		executor
-			.block_on(std::future::poll_fn(|cx| receive.as_mut().poll(cx)))
-			.unwrap();
-	}
-	writer.join().unwrap();
-	assert_eq!(buffer.to_vec(), b"hello");
-	assert!(
-		take.as_mut().poll(&mut cx).is_pending(),
-		"the settled receive still holds the socket"
-	);
-
-	// Dropping the settled future lets the take through.
-	drop(receive);
-	assert!(matches!(take.as_mut().poll(&mut cx), Poll::Ready(Some(_))));
 }
 
 /// A take that cannot wait reports what still names the socket, and the
@@ -792,7 +737,7 @@ fn a_take_without_waiting_reports_a_receive_in_flight() {
 	let socket: Facade<TcpStream> = Facade::with_executor(client, &executor);
 
 	let buffer: Arc<Buffer> = Arc::new(Buffer::new(5));
-	let mut receive = Box::pin(socket.clone().recv(span(&executor, &buffer)));
+	let mut receive = Box::pin(socket.clone().recv(span(&buffer)));
 	let mut cx = Context::from_waker(Waker::noop());
 	assert!(receive.as_mut().poll(&mut cx).is_pending());
 

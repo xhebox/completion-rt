@@ -8,7 +8,6 @@ license = "MIT"
 repository = "https://github.com/xhebox/completion-rt"
 
 [dependencies]
-enum_dispatch = "0.3.13"
 log = { version = "0.4.34", features = ["std", "kv"] }
 smallvec = "1"
 

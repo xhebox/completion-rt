@@ -1,137 +1,100 @@
 //! Linux `io_uring` backend.
+//!
+//! The reactor files each operation under an id, and this backend carries that
+//! id as the request's `user_data`: the completion queue gives it straight
+//! back. What the kernel still reads through — the iovec array a `readv` or
+//! `writev` points at, a control message — is what this backend holds, in its
+//! own `active` table, until the completion arrives.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 
-use crate::OwnedDescriptor;
-use crate::desc::{RawHandle, from_raw_socket};
+use super::Op;
+use crate::desc::{OwnedDescriptor, OwnedSocket, RawHandle};
 use crate::error::Error;
 use crate::memory::{IoVec, IoVecs};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue, types};
 use rustix::io::Errno;
 
-use super::park::{Doorbell, PARKED, Park};
-use super::{Backend, Response};
-use crate::backend::Config;
+use super::{Config, Mechanism, Response};
 
 const MIN_RING_ENTRIES: u32 = 2;
 
 /// Maximum descriptors per control message.
 const MAX_FDS: usize = 8;
 
-fn readable_mask() -> u32 {
-	rustix::event::PollFlags::IN.bits() as u32
-}
-
-fn writable_mask() -> u32 {
-	rustix::event::PollFlags::OUT.bits() as u32
-}
-
-/// The token a cancel is reported under: no completion waits for it. Ids
-/// handed to operations start at one.
+/// The token a cancel is reported under: no completion waits for it, so it is
+/// the one id no operation can have.
 const CANCEL_TOKEN: u64 = 0;
 
-/// The token the futex wait on the park's state word is reported under. Ids
-/// handed to operations start at one and would have to wrap the counter to
-/// reach this.
+/// The token the futex wait on the signal's state word is reported under. An
+/// operation's id packs a generation above a slot index, and a generation never
+/// reaches the high half's top, so no operation can be given this one either.
 const FUTEX_TOKEN: u64 = u64::MAX;
 
 /// `FUTEX2_SIZE_U32`: the state word is a 32-bit futex (`include/uapi/linux/futex.h`).
 const FUTEX2_SIZE_U32: u32 = 0x02;
 
-/// Wakes a park sleeping on its state word through the ring's `FUTEX_WAIT`:
-/// `FUTEX_WAKE` on the word completes that wait, so `enter` returns.
-struct FutexWake;
+/// No wait is outstanding.
+const EMPTY: u32 = 0;
+/// A wait is between its compare-exchange and its return.
+const PARKED: u32 = 1;
+/// A wake arrived with no wait to take it.
+const NOTIFIED: u32 = 2;
 
-impl Doorbell for FutexWake {
-	fn ring(&self, word: &std::sync::atomic::AtomicU32) {
-		// Shared, not private: the ring queues its `FUTEX_WAIT` on this same
-		// address, and a private wake would not match it.
-		let _ = rustix::thread::futex::wake(word, rustix::thread::futex::Flags::empty(), 1);
+/// The futex word a blocking wait sleeps on and a cross-thread wake flips.
+struct Signal {
+	state: AtomicU32,
+	/// An IOPOLL ring spins instead of sleeping and reads the word itself, so
+	/// waking it has no futex to ring.
+	iopoll: bool,
+}
+
+impl Wake for Signal {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		if self.state.swap(NOTIFIED, Ordering::AcqRel) == PARKED && !self.iopoll {
+			// Shared, not private: the ring queues its `FUTEX_WAIT` on this same
+			// address, and a private wake would not match it.
+			let _ =
+				rustix::thread::futex::wake(&self.state, rustix::thread::futex::Flags::empty(), 1);
+		}
 	}
 }
 
-/// An IOPOLL ring spins instead of sleeping, and its spin reads the state
-/// word itself (`Park::woke`), so there is nothing to ring.
-struct Spin;
-
-impl Doorbell for Spin {
-	fn ring(&self, _word: &std::sync::atomic::AtomicU32) {}
-}
-
+/// What a completion reports.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Kind {
 	Count,
 	CountWithFds,
 	Accepted,
 	Done,
+	/// A multishot poll waiting for a hangup: a completion it reports without
+	/// one is a temporary failure rather than the result.
+	Hangup,
 }
 
-enum Step {
-	Read {
-		fd: RawHandle,
-		fdoff: u64,
-		buffers: IoVecs,
-	},
-	Write {
-		fd: RawHandle,
-		fdoff: u64,
-		buffers: IoVecs,
-	},
-	Recv {
-		fd: RawHandle,
-		buffers: IoVecs,
-	},
-	RecvWithFds {
-		fd: RawHandle,
-		buffers: IoVecs,
-	},
-	Send {
-		fd: RawHandle,
-		buffers: IoVecs,
-		fds: Vec<OwnedDescriptor>,
-	},
-	Fsync {
-		fd: RawHandle,
-	},
-	Flush {
-		fd: RawHandle,
-	},
-	Fallocate {
-		fd: RawHandle,
-		offset: u64,
-		len: u64,
-		mode: i32,
-	},
-	Accept {
-		fd: RawHandle,
-	},
-	Readable {
-		fd: RawHandle,
-	},
-	Writable {
-		fd: RawHandle,
-	},
-	Hangup {
-		fd: RawHandle,
-	},
-}
-
-impl Step {
-	fn kind(&self) -> Kind {
-		match self {
-			Step::RecvWithFds { .. } => Kind::CountWithFds,
-			Step::Accept { .. } => Kind::Accepted,
-			Step::Fsync { .. }
-			| Step::Flush { .. }
-			| Step::Fallocate { .. }
-			| Step::Readable { .. }
-			| Step::Writable { .. }
-			| Step::Hangup { .. } => Kind::Done,
+impl Kind {
+	fn of(op: &Op<IoVecs>) -> Kind {
+		match op {
+			Op::RecvWithFds { .. } => Kind::CountWithFds,
+			Op::Accept => Kind::Accepted,
+			Op::Hangup => Kind::Hangup,
+			Op::Fsync
+			| Op::Flush
+			| Op::Allocate { .. }
+			| Op::Punch { .. }
+			| Op::Readable
+			| Op::Writable => Kind::Done,
 			_ => Kind::Count,
 		}
 	}
@@ -153,14 +116,6 @@ unsafe impl Send for Control {}
 
 impl Control {
 	fn receive(buf: *mut u8, len: usize) -> Control {
-		Control::new(buf, len, Vec::new(), true)
-	}
-
-	fn send(buf: *const u8, len: usize, fds: Vec<OwnedDescriptor>) -> Control {
-		Control::new(buf.cast_mut(), len, fds, false)
-	}
-
-	fn new(buf: *mut u8, len: usize, fds: Vec<OwnedDescriptor>, receiving: bool) -> Control {
 		let mut iov = Box::new(libc::iovec {
 			iov_base: buf.cast(),
 			iov_len: len,
@@ -171,33 +126,51 @@ impl Control {
 		let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
 		msg.msg_iov = iov.as_mut() as *mut libc::iovec;
 		msg.msg_iovlen = 1;
-		let control_len = if fds.is_empty() {
-			cmsg.len()
-		} else {
-			(unsafe { libc::CMSG_LEN((fds.len() * size_of::<libc::c_int>()) as u32) }) as usize
-		};
-		if receiving || !fds.is_empty() {
-			msg.msg_control = cmsg.as_mut_ptr().cast();
-			msg.msg_controllen = control_len as _;
-		}
-		if !fds.is_empty() {
-			unsafe {
-				let header = cmsg.as_mut_ptr().cast::<libc::cmsghdr>();
-				(*header).cmsg_level = libc::SOL_SOCKET;
-				(*header).cmsg_type = libc::SCM_RIGHTS;
-				(*header).cmsg_len = msg.msg_controllen as _;
-				let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
-				for (index, fd) in fds.iter().enumerate() {
-					*data.add(index) = fd.as_raw_fd();
-				}
-			}
-		}
+		msg.msg_control = cmsg.as_mut_ptr().cast();
+		msg.msg_controllen = cmsg.len() as _;
 		Control {
 			msg,
 			_iov: iov,
 			_cmsg: cmsg,
-			_fds: fds,
+			_fds: Vec::new(),
 		}
+	}
+
+	fn send(buf: *const u8, len: usize, fds: Vec<OwnedDescriptor>) -> io::Result<Control> {
+		if fds.len() > MAX_FDS {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"too many descriptors",
+			));
+		}
+		let mut iov = Box::new(libc::iovec {
+			iov_base: buf.cast_mut().cast(),
+			iov_len: len,
+		});
+		let bytes = fds.len() * size_of::<libc::c_int>();
+		let space = (unsafe { libc::CMSG_SPACE(bytes as u32) }) as usize;
+		let mut cmsg = vec![0u8; space].into_boxed_slice();
+		let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+		msg.msg_iov = iov.as_mut() as *mut libc::iovec;
+		msg.msg_iovlen = 1;
+		msg.msg_control = cmsg.as_mut_ptr().cast();
+		msg.msg_controllen = (unsafe { libc::CMSG_LEN(bytes as u32) }) as _;
+		unsafe {
+			let header = cmsg.as_mut_ptr().cast::<libc::cmsghdr>();
+			(*header).cmsg_level = libc::SOL_SOCKET;
+			(*header).cmsg_type = libc::SCM_RIGHTS;
+			(*header).cmsg_len = msg.msg_controllen as _;
+			let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
+			for (index, fd) in fds.iter().enumerate() {
+				*data.add(index) = fd.as_raw_fd();
+			}
+		}
+		Ok(Control {
+			msg,
+			_iov: iov,
+			_cmsg: cmsg,
+			_fds: fds,
+		})
 	}
 
 	fn message(&mut self) -> *mut libc::msghdr {
@@ -228,26 +201,79 @@ impl Control {
 	}
 }
 
-struct Active {
-	step: Step,
-	/// The SQE points to this allocation until completion.
-	_buffers: IoVecs,
-	control: Option<Control>,
-	fds: Vec<OwnedDescriptor>,
-}
-
 pub(crate) struct Uring {
 	ring: IoUring,
+	/// Whether the ring reports completions only while polling; such a ring has
+	/// no futex wake to ring.
 	iopoll: bool,
+	/// The word a blocking wait sleeps on and a cross-thread [`Waker`] flips.
+	signal: Arc<Signal>,
+	/// The operations the ring is running, named by the id the reactor gave:
+	/// what the kernel still reads for each, held until its completion arrives.
 	active: HashMap<u64, Active>,
-	ready: VecDeque<(u64, Result<Response, Error>)>,
 	/// Whether the kernel takes `IORING_ENTER_NO_IOWAIT` (Linux 6.15+). A kernel that does not still blocks in `io_uring_enter`, and that sleep counts as iowait.
 	no_iowait: bool,
 	/// Whether the futex wait is queued and has not completed.
 	futex_armed: bool,
 	sqpoll: bool,
-	/// Hangup polls already reported, still armed until their last completion.
-	retiring: HashSet<u64>,
+}
+
+/// What the kernel still holds for one operation, and what its completion
+/// reports, kept until the completion arrives.
+struct Active {
+	/// The iovec array a `readv` or `writev` request points at: the kernel reads
+	/// the addresses from it at execution, so it lives until the completion. The
+	/// `Vec`'s buffer keeps its address when the value moves into the table.
+	_buffers: IoVecs,
+	/// The message area an operation carrying descriptors reads through, and
+	/// where a receive's descriptors land.
+	control: Option<Control>,
+	/// What the completion reports.
+	kind: Kind,
+}
+
+/// What the mechanism reported, as the operation's own result.
+fn completion(kind: Kind, result: i32, control: Option<Control>) -> Result<Response, Error> {
+	if result < 0 {
+		let errno = -result;
+		return Err(if errno == Errno::CANCELED.raw_os_error() {
+			Error::cancelled()
+		} else {
+			Error::from(io::Error::from_raw_os_error(errno))
+		});
+	}
+	let moved = result as usize;
+	Ok(match kind {
+		Kind::Count => Response::Count(moved),
+		Kind::CountWithFds => Response::CountWithFds(
+			moved,
+			control.map_or_else(Vec::new, |mut area| area.take_fds()),
+		),
+		Kind::Accepted => Response::Accepted(unsafe { OwnedSocket::from_raw_fd(result) }),
+		Kind::Done | Kind::Hangup => Response::Done,
+	})
+}
+
+/// Whether a poll's result mask names the peer gone or the socket failed.
+fn hung(result: i32) -> bool {
+	let gone = rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR;
+	result >= 0 && (result as u32) & (gone.bits() as u32) != 0
+}
+
+fn count(bufs: &[IoVec]) -> io::Result<u32> {
+	u32::try_from(bufs.len())
+		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many buffers"))
+}
+
+/// The one buffer a transfer names, with its length, when the transfer can go
+/// through a plain `read` or `write`: the kernel takes that buffer's address
+/// and length from the SQE itself, so no iovec array has to outlive the
+/// request. A span of any other shape, or one buffer too long to name, needs
+/// the vectored form.
+fn single(span: &[IoVec]) -> Option<(&IoVec, u32)> {
+	let [buf] = span else { return None };
+	let len = u32::try_from(buf.len()).ok()?;
+	Some((buf, len))
 }
 
 impl Uring {
@@ -266,23 +292,25 @@ impl Uring {
 		Ok(Uring {
 			ring,
 			iopoll,
+			signal: Arc::new(Signal {
+				state: AtomicU32::new(EMPTY),
+				iopoll,
+			}),
 			active: HashMap::new(),
-			ready: VecDeque::new(),
 			no_iowait,
 			futex_armed: false,
 			sqpoll,
-			retiring: HashSet::new(),
 		})
 	}
 
-	/// Queues a wait on the park's state word. A wake that flips the word and
+	/// Queues a wait on the signal's state word. A wake that flips the word and
 	/// calls `FUTEX_WAKE` completes it, so `enter` returns. The word is `PARKED`
-	/// here: `Park::park` set it before polling.
-	fn arm_futex(&mut self, park: &Park) -> io::Result<()> {
+	/// here: `poll` set it before the wait.
+	fn arm_futex(&mut self) -> io::Result<()> {
 		if self.futex_armed {
 			return Ok(());
 		}
-		let word = park.state().as_ptr().cast_const();
+		let word = self.signal.state.as_ptr().cast_const();
 		let entry = opcode::FutexWait::new(
 			word,
 			u64::from(PARKED),
@@ -291,7 +319,7 @@ impl Uring {
 		)
 		.build()
 		.user_data(FUTEX_TOKEN);
-		push(&mut self.ring, entry)?;
+		self.push(entry)?;
 		self.futex_armed = true;
 		Ok(())
 	}
@@ -339,17 +367,21 @@ impl Uring {
 	}
 
 	/// IOPOLL must actively poll the device; without a timeout, spin until completion.
-	fn poll_devices(&mut self, timeout: Option<Duration>, park: &Park) -> io::Result<()> {
+	fn poll_devices(
+		&mut self,
+		timeout: Option<Duration>,
+		completed: &mut Vec<(u64, Result<Response, Error>)>,
+	) -> io::Result<()> {
 		let start = Instant::now();
 		loop {
-			self.drive()?;
-			self.reap()?;
-			if !self.ready.is_empty() {
+			self.ring.submitter().submit_and_wait(0)?;
+			if self.reap(completed)? > 0 {
 				return Ok(());
 			}
-			// An IOPOLL ring has no doorbell, so a cross-thread wake is only in
-			// the state word: see it within one spin instead of to the timeout.
-			if park.woke() {
+			// An IOPOLL ring has no doorbell to ring, so a cross-thread wake is
+			// only in the state word: see it within one spin instead of to the
+			// timeout.
+			if self.signal.state.load(Ordering::Acquire) == NOTIFIED {
 				return Ok(());
 			}
 			if self.active.is_empty() {
@@ -363,218 +395,204 @@ impl Uring {
 		}
 	}
 
-	fn drive(&mut self) -> io::Result<()> {
-		self.ring.submitter().submit_and_wait(0)?;
-		Ok(())
-	}
-
-	fn reap(&mut self) -> io::Result<()> {
+	/// Takes every settled completion out of the ring and reports it into
+	/// `completed`, returning how many landed here.
+	fn reap(&mut self, completed: &mut Vec<(u64, Result<Response, Error>)>) -> io::Result<usize> {
 		let mut settled = Vec::new();
-		let mut rearm = Vec::new();
+		let mut landed = 0;
 		{
 			let ring = &mut self.ring;
 			let active = &mut self.active;
 			let futex_armed = &mut self.futex_armed;
-			let ready = &mut self.ready;
-			let retiring = &mut self.retiring;
 			for cqe in ring.completion() {
 				let id = cqe.user_data();
 				let more = cqueue::more(cqe.flags());
-				if retiring.contains(&id) {
-					if !more {
-						retiring.remove(&id);
-					}
-					continue;
-				}
-				// Only a hangup poll is multishot, and it reports nothing until
-				// the mask names the hangup.
-				if more {
-					if hung(cqe.result()) && active.remove(&id).is_some() {
-						retiring.insert(id);
-						settled.push(id);
-						ready.push_back((id, Ok(Response::Done)));
-					}
-					continue;
-				}
-				let entry = active.remove(&id);
-				if let Some(Active {
-					step: Step::Hangup { fd },
-					..
-				}) = &entry && cqe.result() >= 0
-					&& !hung(cqe.result())
-				{
-					// The kernel ended the multishot without a hangup (a CQ it
-					// could not post to): the wait is still owed.
-					rearm.push((id, *fd));
+				if id == FUTEX_TOKEN {
+					// Woken, refused because the word had moved on, or cancelled:
+					// each one just ends the wait.
+					*futex_armed = false;
 					continue;
 				}
 				if id == CANCEL_TOKEN {
 					continue;
 				}
-				if id == FUTEX_TOKEN {
-					// Woken, refused because the word had moved on, or cancelled: each
-					// one just ends the wait.
-					*futex_armed = false;
+				// Only a hangup poll is multishot, and it reports nothing until
+				// the mask names the hangup.
+				if more {
+					if hung(cqe.result()) {
+						// The first report settles the operation; removing it here
+						// makes the multishot's later completions, and any cancel,
+						// find nothing to say.
+						let Some(_in_flight) = active.remove(&id) else {
+							continue;
+						};
+						settled.push(id);
+						completed.push((id, Ok(Response::Done)));
+						landed += 1;
+					}
 					continue;
 				}
-				let moved = i64::from(cqe.result());
-				if moved < 0 {
-					let errno = -moved as i32;
-					let error = if errno == Errno::CANCELED.raw_os_error() {
-						Error::cancelled()
+				let Some(in_flight) = active.remove(&id) else {
+					// A poll can report twice — a multishot one whose hangup was
+					// already taken as the result — and then has nothing left to
+					// say.
+					continue;
+				};
+				let reported =
+					if in_flight.kind == Kind::Hangup && cqe.result() >= 0 && !hung(cqe.result()) {
+						// The kernel ended the multishot without a hangup (a CQ it
+						// could not post to): report a temporary failure so the
+						// caller can re-issue if it still wants to wait.
+						Err(Error::from(io::Error::from(io::ErrorKind::WouldBlock)))
 					} else {
-						Error::from(io::Error::from_raw_os_error(errno))
+						completion(in_flight.kind, cqe.result(), in_flight.control)
 					};
-					ready.push_back((id, Err(error)));
-					continue;
-				}
-				let moved = moved as usize;
-				let Some(mut active) = entry else {
-					ready.push_back((id, Ok(Response::Done)));
-					continue;
-				};
-				if active.step.kind() == Kind::CountWithFds {
-					if let Some(mut control) = active.control.take() {
-						active.fds.append(&mut control.take_fds());
-					}
-				}
-				let response = match active.step.kind() {
-					Kind::Count => Response::Count(moved),
-					Kind::CountWithFds => Response::CountWithFds(moved, active.fds),
-					Kind::Accepted => {
-						let handle = RawHandle::from_raw(moved);
-						// SAFETY: the kernel created this descriptor for the
-						// accept, and the response is its only owner.
-						Response::Accepted(unsafe { from_raw_socket(handle) })
-					}
-					Kind::Done => Response::Done,
-				};
-				ready.push_back((id, Ok(response)));
+				completed.push((id, reported));
+				landed += 1;
 			}
 		}
 		for id in settled {
 			let entry = opcode::AsyncCancel::new(id).build().user_data(CANCEL_TOKEN);
-			if let Err(error) = push(&mut self.ring, entry) {
+			if let Err(error) = self.push(entry) {
 				log::warn!(id, error:%; "a reported hangup poll stays armed");
 			}
 		}
-		for (id, fd) in rearm {
-			if let Err(error) = self.submit(id, Step::Hangup { fd }) {
-				self.ready.push_back((id, Err(Error::from(error))));
-			}
-		}
-		Ok(())
+		Ok(landed)
 	}
 
+	/// Queues a request, submitting what is already there when the queue is full.
+	/// A queue that is still full after that is the caller's error to report,
+	/// rather than a spin here.
+	fn push(&mut self, entry: squeue::Entry) -> io::Result<()> {
+		if self.try_push(&entry) {
+			return Ok(());
+		}
+		self.ring.submit()?;
+		if self.try_push(&entry) {
+			return Ok(());
+		}
+		Err(io::Error::new(
+			io::ErrorKind::WouldBlock,
+			"the submission queue is full",
+		))
+	}
+
+	/// Queues a request if the submission queue has room for it; publishing the
+	/// queue's tail is the caller's to decide.
+	fn try_push(&mut self, entry: &squeue::Entry) -> bool {
+		let mut submission = self.ring.submission();
+		unsafe { submission.push(entry) }.is_ok()
+	}
+
+	/// The ring's own request for an operation, and what has to outlive it: the
+	/// iovec array and the control area the kernel reads through, and a
+	/// descriptor the kernel closes in the caller's place.
+	///
+	/// An IOPOLL ring takes only operations the kernel can poll for, so the
+	/// operations it has no form for are refused here, before anything is built
+	/// for them.
 	fn prepare(
-		&mut self,
-		step: &mut Step,
-		control: &mut Option<Control>,
-		id: u64,
-	) -> io::Result<(squeue::Entry, IoVecs)> {
-		let (entry, buffers) = match step {
-			Step::Read { fd, fdoff, buffers } => {
-				let buffers = std::mem::take(buffers);
-				let entry = opcode::Readv::new(
-					types::Fd(fd.as_raw_fd()),
-					buffers.as_ptr().cast(),
-					count(&buffers)?,
-				)
-				.offset(*fdoff)
-				.build()
-				.user_data(id);
-				(entry, buffers)
+		&self,
+		fd: RawHandle,
+		op: Op<IoVecs>,
+	) -> io::Result<(squeue::Entry, Active, Option<OwnedDescriptor>)> {
+		if self.iopoll {
+			let what = match &op {
+				Op::Fsync => Some("fsync"),
+				Op::Flush => Some("flush"),
+				Op::Allocate { .. } | Op::Punch { .. } => Some("fallocate"),
+				Op::Accept => Some("accept"),
+				_ => None,
+			};
+			if let Some(what) = what {
+				return Err(io::Error::new(
+					io::ErrorKind::Unsupported,
+					format!(
+						"{what} cannot be submitted on an IOPOLL ring; give it a ring of its own"
+					),
+				));
 			}
-			Step::Write { fd, fdoff, buffers } => {
-				let buffers = std::mem::take(buffers);
-				let entry = opcode::Writev::new(
-					types::Fd(fd.as_raw_fd()),
-					buffers.as_ptr().cast(),
-					count(&buffers)?,
-				)
-				.offset(*fdoff)
-				.build()
-				.user_data(id);
-				(entry, buffers)
-			}
-			Step::Fsync { fd } => {
-				// An IOPOLL ring only takes operations the kernel can poll
-				// for; a fsync has no overlapped form, and io_uring answers
-				// EINVAL for it.
-				if self.iopoll {
-					return Err(io::Error::new(
-						io::ErrorKind::Unsupported,
-						"fsync cannot be submitted on an IOPOLL ring; give it a ring of its own",
-					));
+		}
+		// The descriptors a send carries move into the control area the kernel
+		// reads through, and the buffers a transfer reads through move into the
+		// entry's own table: neither is left for a second owner here.
+		let kind = Kind::of(&op);
+		let raw_fd = types::Fd(fd.as_raw_fd());
+		let mut control = None;
+		let mut duplicate: Option<OwnedDescriptor> = None;
+		let (request, buffers) = match op {
+			Op::Read { offset, span } => {
+				if let Some((buf, len)) = single(&span) {
+					(
+						opcode::Read::new(raw_fd, buf.as_ptr(), len)
+							.offset(offset)
+							.build(),
+						IoVecs::new(),
+					)
+				} else {
+					(
+						opcode::Readv::new(raw_fd, span.as_ptr().cast(), count(&span)?)
+							.offset(offset)
+							.build(),
+						span,
+					)
 				}
-				(
-					opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
-						.build()
-						.user_data(id),
-					IoVecs::new(),
-				)
 			}
-			Step::Flush { fd } => {
-				// Like a fsync, a close has no form an IOPOLL ring can poll
-				// for.
-				if self.iopoll {
-					return Err(io::Error::new(
-						io::ErrorKind::Unsupported,
-						"flush cannot be submitted on an IOPOLL ring; give it a ring of its own",
-					));
+			Op::Write { offset, span } => {
+				if let Some((buf, len)) = single(&span) {
+					(
+						opcode::Write::new(raw_fd, buf.as_ptr(), len)
+							.offset(offset)
+							.build(),
+						IoVecs::new(),
+					)
+				} else {
+					(
+						opcode::Writev::new(raw_fd, span.as_ptr().cast(), count(&span)?)
+							.offset(offset)
+							.build(),
+						span,
+					)
 				}
-				(
-					opcode::Close::new(types::Fd(fd.as_raw_fd()))
-						.build()
-						.user_data(id),
-					IoVecs::new(),
-				)
 			}
-			Step::Fallocate {
-				fd,
-				offset,
-				len,
-				mode,
-			} => {
-				if self.iopoll {
-					return Err(io::Error::new(
-						io::ErrorKind::Unsupported,
-						"fallocate cannot be submitted on an IOPOLL ring; give it a ring of its own",
-					));
-				}
-				(
-					opcode::Fallocate::new(types::Fd(fd.as_raw_fd()), *len)
-						.offset(*offset)
-						.mode(*mode)
-						.build()
-						.user_data(id),
-					IoVecs::new(),
-				)
+
+			Op::Fsync => (opcode::Fsync::new(raw_fd).build(), IoVecs::new()),
+			Op::Flush => {
+				// A flush is a close, and a close releases the descriptor the caller
+				// still holds: it runs on a duplicate, so what the kernel closes is
+				// this backend's. The reactor's entry goes on naming the caller's
+				// descriptor, which it keeps open until it goes.
+				let dup = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }.try_clone_to_owned()?;
+				let request = opcode::Close::new(types::Fd(dup.as_raw_fd())).build();
+				duplicate = Some(dup);
+				(request, IoVecs::new())
 			}
-			Step::Accept { fd } => {
-				// An accept cannot be polled for, and only a ring that can be
-				// polled for has anything to wait on.
-				if self.iopoll {
-					return Err(io::Error::new(
-						io::ErrorKind::Unsupported,
-						"an accept cannot complete on an IOPOLL ring; give it a ring of its own",
-					));
-				}
+			Op::Allocate { offset, len } => (
+				opcode::Fallocate::new(raw_fd, len)
+					.offset(offset)
+					.mode(0)
+					.build(),
+				IoVecs::new(),
+			),
+			Op::Punch { offset, len } => (
+				opcode::Fallocate::new(raw_fd, len)
+					.offset(offset)
+					.mode(libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE)
+					.build(),
+				IoVecs::new(),
+			),
+			Op::Accept => {
 				let flags = (rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK)
 					.bits() as i32;
-				let entry = opcode::Accept::new(
-					types::Fd(fd.as_raw_fd()),
-					std::ptr::null_mut(),
-					std::ptr::null_mut(),
+				(
+					opcode::Accept::new(raw_fd, std::ptr::null_mut(), std::ptr::null_mut())
+						.flags(flags)
+						.build(),
+					IoVecs::new(),
 				)
-				.flags(flags)
-				.build()
-				.user_data(id);
-				(entry, IoVecs::new())
 			}
-			Step::Recv { fd, buffers } => {
-				let buffers = std::mem::take(buffers);
-				let [buf] = buffers.as_slice() else {
+			Op::Recv { span } => {
+				let [buf] = span.as_slice() else {
 					return Err(io::Error::new(
 						io::ErrorKind::Unsupported,
 						"a socket receive needs exactly one buffer",
@@ -583,32 +601,30 @@ impl Uring {
 				let len = u32::try_from(buf.len()).map_err(|_| {
 					io::Error::new(io::ErrorKind::InvalidInput, "buffer longer than 4 GiB")
 				})?;
-				let entry =
-					opcode::Recv::new(types::Fd(fd.as_raw_fd()), buf.as_ptr() as *mut u8, len)
-						.build()
-						.user_data(id);
-				(entry, buffers)
+				(
+					opcode::Recv::new(raw_fd, buf.as_ptr(), len).build(),
+					IoVecs::new(),
+				)
 			}
-			Step::RecvWithFds { fd, buffers } => {
-				let buffers = std::mem::take(buffers);
-				let [buf] = buffers.as_slice() else {
+			Op::RecvWithFds { span } => {
+				let [buf] = span.as_slice() else {
 					return Err(io::Error::new(
 						io::ErrorKind::Unsupported,
 						"a socket receive needs exactly one buffer",
 					));
 				};
-				let mut area = Control::receive(buf.as_ptr() as *mut u8, buf.len());
+				let mut area = Control::receive(buf.as_ptr(), buf.len());
 				let message = area.message();
-				*control = Some(area);
-				let entry = opcode::RecvMsg::new(types::Fd(fd.as_raw_fd()), message)
-					.flags(libc::MSG_CMSG_CLOEXEC as u32)
-					.build()
-					.user_data(id);
-				(entry, buffers)
+				control = Some(area);
+				(
+					opcode::RecvMsg::new(raw_fd, message)
+						.flags(libc::MSG_CMSG_CLOEXEC as u32)
+						.build(),
+					IoVecs::new(),
+				)
 			}
-			Step::Send { fd, buffers, fds } => {
-				let buffers = std::mem::take(buffers);
-				let [buf] = buffers.as_slice() else {
+			Op::Send { span, fds } => {
+				let [buf] = span.as_slice() else {
 					return Err(io::Error::new(
 						io::ErrorKind::Unsupported,
 						"a socket send needs exactly one buffer",
@@ -618,265 +634,152 @@ impl Uring {
 					let len = u32::try_from(buf.len()).map_err(|_| {
 						io::Error::new(io::ErrorKind::InvalidInput, "buffer longer than 4 GiB")
 					})?;
-					let entry = opcode::Send::new(types::Fd(fd.as_raw_fd()), buf.as_ptr(), len)
-						.build()
-						.user_data(id);
-					(entry, buffers)
+					(
+						opcode::Send::new(raw_fd, buf.as_ptr(), len).build(),
+						IoVecs::new(),
+					)
 				} else {
-					let mut area = Control::send(buf.as_ptr(), buf.len(), std::mem::take(fds));
+					let mut area = Control::send(buf.as_ptr(), buf.len(), fds)?;
 					let message = area.message();
-					*control = Some(area);
-					let entry = opcode::SendMsg::new(types::Fd(fd.as_raw_fd()), message)
-						.build()
-						.user_data(id);
-					(entry, buffers)
+					control = Some(area);
+					(opcode::SendMsg::new(raw_fd, message).build(), IoVecs::new())
 				}
 			}
-			Step::Readable { fd } => {
-				let entry = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), readable_mask());
-				(entry.build().user_data(id), IoVecs::new())
-			}
-			Step::Writable { fd } => {
-				let entry = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), writable_mask());
-				(entry.build().user_data(id), IoVecs::new())
-			}
-			Step::Hangup { fd } => {
+			Op::Readable => (
+				opcode::PollAdd::new(raw_fd, rustix::event::PollFlags::IN.bits() as u32).build(),
+				IoVecs::new(),
+			),
+			Op::Writable => (
+				opcode::PollAdd::new(raw_fd, rustix::event::PollFlags::OUT.bits() as u32).build(),
+				IoVecs::new(),
+			),
+			Op::Hangup => {
 				// The kernel ORs IO_POLL_UNMASK (EPOLLERR | EPOLLHUP | EPOLLNVAL |
 				// EPOLLRDHUP, io_uring/poll.c) into every poll's events, so even an
 				// empty mask fires on a half-close. Multishot keeps the poll armed
 				// past those; `reap` waits for a mask with HUP or ERR.
-				let entry = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), 0).multi(true);
-				(entry.build().user_data(id), IoVecs::new())
+				(
+					opcode::PollAdd::new(raw_fd, 0).multi(true).build(),
+					IoVecs::new(),
+				)
 			}
 		};
-		Ok((entry, buffers))
-	}
-
-	fn submit(&mut self, id: u64, step: Step) -> io::Result<()> {
-		let mut step = step;
-		let mut control = None;
-		let (entry, buffers) = self.prepare(&mut step, &mut control, id)?;
-		self.active.insert(
-			id,
+		Ok((
+			request,
 			Active {
-				step,
 				_buffers: buffers,
 				control,
-				fds: Vec::new(),
+				kind,
 			},
-		);
-		// SQPOLL consumes submissions itself but needs a syscall to wake its sleeping thread.
-		let result = push(&mut self.ring, entry).and_then(|()| {
-			if self.sqpoll {
-				self.ring.submit()?;
-			}
-			Ok(())
-		});
-		if let Err(error) = result {
-			self.active.remove(&id);
-			return Err(error);
+			duplicate,
+		))
+	}
+}
+
+impl Mechanism for Uring {
+	fn submit(&mut self, id: u64, fd: RawHandle, op: Op<IoVecs>) -> Result<(), Error> {
+		// Prepared before the request names the id: a submission that fails before
+		// anything reaches the ring gives the caller the refusal, and the reactor
+		// takes its entry back out.
+		let (request, active, duplicate) = self.prepare(fd, op)?;
+		if let Err(error) = self.push(request.user_data(id)) {
+			// Nothing reached the ring, so the operation never was. The guard in
+			// `duplicate` closes what the request would have closed.
+			return Err(Error::from(error));
+		}
+		// The request names the duplicate a flush runs on, so the kernel's own
+		// close owns it from the moment it is queued — whether or not the wake
+		// below reaches a sleeping SQPOLL thread. From here it is not this call's
+		// to close.
+		std::mem::forget(duplicate);
+		self.active.insert(id, active);
+		if self.sqpoll {
+			// SQPOLL consumes submissions itself but needs a syscall to wake its
+			// sleeping thread. A wake that fails leaves the request queued all the
+			// same, so the operation stays with the ring — its iovecs and control
+			// area may not be freed while the kernel can still read them.
+			self.ring.submit()?;
 		}
 		Ok(())
+	}
+
+	fn cancel(&mut self, id: u64) {
+		let entry = opcode::AsyncCancel::new(id).build().user_data(CANCEL_TOKEN);
+		let _ = self.push(entry).and_then(|()| self.ring.submit());
+	}
+
+	fn poll(
+		&mut self,
+		timeout: Option<Duration>,
+		completed: &mut Vec<(u64, Result<Response, Error>)>,
+	) -> Result<(), Error> {
+		if timeout == Some(Duration::ZERO) {
+			// A poll that does not wait leaves the state word alone: a wake that
+			// arrived while the executor ticked must stay for the next blocking
+			// poll instead of being slept through.
+			if self.iopoll {
+				self.poll_devices(Some(Duration::ZERO), completed)?;
+			} else {
+				self.ring.submit()?;
+				self.reap(completed)?;
+			}
+			return Ok(());
+		}
+		// A wake that arrived before the wait is taken and answered with a
+		// non-blocking reap instead of sleeping; one that arrives after the
+		// transition rings the futex (or is seen by the IOPOLL spin).
+		if self
+			.signal
+			.state
+			.compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire)
+			.is_err()
+		{
+			self.signal.state.store(EMPTY, Ordering::Release);
+			if self.iopoll {
+				self.poll_devices(Some(Duration::ZERO), completed)?;
+			} else {
+				self.ring.submit()?;
+				self.reap(completed)?;
+			}
+			return Ok(());
+		}
+		let result = if self.iopoll {
+			self.poll_devices(timeout, completed)
+		} else {
+			self.arm_futex()
+				.and_then(|()| self.enter_wait(timeout))
+				.and_then(|()| self.reap(completed).map(|_| ()))
+		};
+		self.signal.state.store(EMPTY, Ordering::Release);
+		result?;
+		Ok(())
+	}
+
+	fn waker(&self) -> Waker {
+		Waker::from(Arc::clone(&self.signal))
 	}
 }
 
 impl Drop for Uring {
 	fn drop(&mut self) {
-		// A queued futex wait points at the park's state word, which the reactor
-		// frees with its last `Arc`. Cancel it and reap its completion first, so
-		// the ring lets go before the word can go.
+		// A queued futex wait points at the signal's state word, which the
+		// reactor frees with its last `Arc`. Cancel it and reap its completion
+		// first, so the ring lets go before the word can go.
 		if !self.futex_armed {
 			return;
 		}
 		let entry = opcode::AsyncCancel::new(FUTEX_TOKEN)
 			.build()
 			.user_data(CANCEL_TOKEN);
-		if push(&mut self.ring, entry).is_err() {
+		if self.push(entry).is_err() {
 			return;
 		}
 		while self.futex_armed {
-			if self.ring.submit_and_wait(1).is_err() || self.reap().is_err() {
+			if self.ring.submit_and_wait(1).is_err() || self.reap(&mut Vec::new()).is_err() {
 				return;
 			}
 		}
 	}
-}
-
-impl Backend for Uring {
-	fn read(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
-		self.submit(id, Step::Read { fd, fdoff, buffers })
-	}
-
-	fn write(&mut self, id: u64, fd: RawHandle, fdoff: u64, buffers: IoVecs) -> io::Result<()> {
-		self.submit(id, Step::Write { fd, fdoff, buffers })
-	}
-
-	fn fsync(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
-		self.submit(id, Step::Fsync { fd })
-	}
-
-	fn flush(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
-		let dup = unsafe { libc::dup(fd.as_raw_fd()) };
-		if dup < 0 {
-			return Err(io::Error::last_os_error());
-		}
-		let dup = RawHandle::from_raw(dup as usize);
-		let result = self.submit(id, Step::Flush { fd: dup });
-		if result.is_err() {
-			// Submission failed: close the duplicate. Do not retry EINTR; Linux already closed it and may reuse the number.
-			unsafe { libc::close(dup.as_raw_fd()) };
-		}
-		result
-	}
-
-	fn allocate(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()> {
-		self.submit(
-			id,
-			Step::Fallocate {
-				fd,
-				offset,
-				len,
-				mode: 0,
-			},
-		)
-	}
-
-	fn punch(&mut self, id: u64, fd: RawHandle, offset: u64, len: u64) -> io::Result<()> {
-		self.submit(
-			id,
-			Step::Fallocate {
-				fd,
-				offset,
-				len,
-				mode: libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-			},
-		)
-	}
-
-	fn recv(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
-		self.submit(id, Step::Recv { fd, buffers })
-	}
-
-	fn recv_with_fds(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
-		self.submit(id, Step::RecvWithFds { fd, buffers })
-	}
-
-	fn send(&mut self, id: u64, fd: RawHandle, buffers: IoVecs) -> io::Result<()> {
-		self.submit(
-			id,
-			Step::Send {
-				fd,
-				buffers,
-				fds: Vec::new(),
-			},
-		)
-	}
-
-	fn send_with_fds(
-		&mut self,
-		id: u64,
-		fd: RawHandle,
-		buffers: IoVecs,
-		fds: Vec<OwnedDescriptor>,
-	) -> io::Result<()> {
-		self.submit(id, Step::Send { fd, buffers, fds })
-	}
-
-	fn accept(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
-		self.submit(id, Step::Accept { fd })
-	}
-
-	fn readable(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
-		self.submit(id, Step::Readable { fd })
-	}
-
-	fn writable(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
-		self.submit(id, Step::Writable { fd })
-	}
-
-	fn hangup(&mut self, id: u64, fd: RawHandle) -> io::Result<()> {
-		self.submit(id, Step::Hangup { fd })
-	}
-
-	fn cancel(&mut self, id: u64) {
-		let entry = opcode::AsyncCancel::new(id).build().user_data(CANCEL_TOKEN);
-		let _ = push(&mut self.ring, entry).and_then(|()| self.ring.submit());
-	}
-
-	fn poll(&mut self, timeout: Option<Duration>, park: &Park) -> io::Result<u64> {
-		if let Some((id, _)) = self.ready.front() {
-			return Ok(*id);
-		}
-		if self.iopoll {
-			self.poll_devices(timeout, park)?;
-		} else if timeout == Some(Duration::ZERO) {
-			self.ring.submit()?;
-			self.reap()?;
-		} else {
-			self.arm_futex(park)?;
-			self.enter_wait(timeout)?;
-			self.reap()?;
-		}
-		match self.ready.front() {
-			Some((id, _)) => Ok(*id),
-			None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-		}
-	}
-
-	fn take(&mut self, id: u64) -> Result<Response, Error> {
-		match self.ready.pop_front() {
-			Some((found, response)) if found == id => response,
-			Some((found, response)) => {
-				self.ready.push_front((found, response));
-				Err(Error::from(io::Error::other(format!(
-					"take({id}) found a completion for {found}"
-				))))
-			}
-			None => Err(Error::from(io::Error::new(
-				io::ErrorKind::NotFound,
-				"no completion to take",
-			))),
-		}
-	}
-
-	fn doorbell(&self) -> Arc<dyn Doorbell> {
-		if self.iopoll {
-			Arc::new(Spin)
-		} else {
-			Arc::new(FutexWake)
-		}
-	}
-}
-
-/// Whether a poll's result mask names the peer gone or the socket failed.
-fn hung(result: i32) -> bool {
-	let gone = rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR;
-	result >= 0 && (result as u32) & (gone.bits() as u32) != 0
-}
-
-/// Return a full-ring error to the caller rather than spinning for space.
-fn push(ring: &mut IoUring, entry: squeue::Entry) -> io::Result<()> {
-	if try_push(ring, &entry) {
-		return Ok(());
-	}
-	ring.submit()?;
-	if try_push(ring, &entry) {
-		return Ok(());
-	}
-	Err(io::Error::new(
-		io::ErrorKind::WouldBlock,
-		"the submission queue is full",
-	))
-}
-
-fn try_push(ring: &mut IoUring, entry: &squeue::Entry) -> bool {
-	let mut submission = ring.submission();
-	unsafe { submission.push(entry) }.is_ok()
-}
-
-fn count(bufs: &[IoVec]) -> io::Result<u32> {
-	u32::try_from(bufs.len())
-		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many buffers"))
 }
 
 #[cfg(test)]
@@ -902,19 +805,9 @@ mod tests {
 	#[test]
 	fn a_blocking_wait_works_without_the_feature() -> io::Result<()> {
 		let mut uring = Uring::new(&Config::default())?;
-		let park = Arc::new(Park::new(uring.doorbell()));
 		uring.no_iowait = false;
 		let start = Instant::now();
-		let mut waited = None;
-		park.park(|| {
-			waited = Some(uring.poll(Some(Duration::from_millis(5)), &park));
-			Ok(())
-		})?;
-		let waited = waited.expect("the poll ran");
-		assert!(
-			matches!(waited, Err(ref error) if error.kind() == io::ErrorKind::WouldBlock),
-			"an empty wait reports nothing completed: {waited:?}"
-		);
+		uring.poll(Some(Duration::from_millis(5)), &mut Vec::new())?;
 		assert!(
 			start.elapsed() >= Duration::from_millis(5),
 			"the wait did not hold for its deadline"

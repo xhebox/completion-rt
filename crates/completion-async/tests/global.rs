@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use completion_async::{Facade, Timeout, bind, block_on, spawn, try_spawn};
+use completion_async::{Facade, Space, Timeout, block_on, spawn, try_spawn};
 
 #[test]
 fn a_task_spawned_with_spawn_is_run_by_block_on() {
@@ -61,7 +61,7 @@ fn a_facade_made_inside_block_on_submits_to_the_global_executor() {
 	let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let (mut server, _) = listener.accept().unwrap();
 
-	let payload = bind(Arc::new(Buffer::from_slice(b"hello"))).whole();
+	let payload = Space::new(Arc::new(Buffer::from_slice(b"hello"))).whole();
 	let sent = block_on(async move {
 		let socket: Facade<TcpStream> = Facade::new(client);
 		socket.send_all(payload).await
@@ -78,7 +78,7 @@ fn a_facade_made_inside_block_on_submits_to_the_global_executor() {
 fn a_timeout_made_inside_a_spawned_task_fires_under_block_on() {
 	common::init_logging();
 	let start = Instant::now();
-	let task = spawn(async { Timeout::new(Duration::from_millis(20))?.await });
+	let task = spawn(async { Timeout::new(Duration::from_millis(20)).await });
 	block_on(task).unwrap().unwrap();
 	assert!(start.elapsed() >= Duration::from_millis(20));
 }

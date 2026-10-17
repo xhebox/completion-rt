@@ -1,10 +1,8 @@
 //! Waiting on a descriptor for readiness, and nothing else.
 
-use completion_rt::{AsDescriptor, BorrowedDescriptor, Op as LowOp, OwnedDescriptor};
+use completion_rt::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor};
 
-use crate::Facade;
-use crate::completion::submit;
-use crate::net::Op;
+use crate::op::{Action, Facade, Op};
 
 /// A descriptor whose only operation is the wait for readiness: an eventfd, a
 /// pidfd, a vhost-user endpoint.
@@ -48,16 +46,12 @@ impl Facade<Signal> {
 	///
 	/// A completion resolves once, so a caller that wants readiness again
 	/// submits another one — this is not a standing registration.
-	pub fn wait_readable(&self) -> Op<Signal> {
-		Op::new(self, |reactor, handle| {
-			submit(reactor, handle, LowOp::Readable)
-		})
+	pub fn wait_readable(&self) -> Op {
+		Op::new(self, Action::Readable)
 	}
 
 	/// Resolves once the descriptor can take a write.
-	pub fn wait_writable(&self) -> Op<Signal> {
-		Op::new(self, |reactor, handle| {
-			submit(reactor, handle, LowOp::Writable)
-		})
+	pub fn wait_writable(&self) -> Op {
+		Op::new(self, Action::Writable)
 	}
 }

@@ -4,13 +4,9 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use completion_rt::{Handle, Op as LowOp, Reactor};
+use completion_rt::Span;
 
-use crate::Executor;
-use crate::completion::submit;
-use crate::global;
-use crate::net::{Kind, Op, Transfer};
-use crate::space::Span;
+use crate::op::{Action, Facade, Kind, Op, Transfer};
 
 /// `std::fs::OpenOptions` plus direct I/O, and on Windows the overlapped flag
 /// the iocp backend needs.
@@ -110,124 +106,6 @@ impl OpenOptions {
 	}
 }
 
-/// An owned resource with async operations submitted through its
-/// [`Executor`](crate::Executor).
-///
-/// Which operations a facade has is its resource type, named where the
-/// operations are: a `File` is read at an offset and synced, a `TcpStream` is
-/// received and sent on. A socket is not read at an offset or synced:
-///
-/// ```compile_fail
-/// # use completion_async::Facade;
-/// fn read(socket: &Facade<std::net::TcpStream>) {
-/// 	let _ = socket.read_at(vec![0u8; 4], 0);
-/// }
-/// ```
-///
-/// ```compile_fail
-/// # use completion_async::Facade;
-/// fn sync(socket: &Facade<std::net::TcpStream>) {
-/// 	let _ = socket.sync();
-/// }
-/// ```
-///
-/// Nor is a pipe synced:
-///
-/// ```compile_fail
-/// # use completion_async::Facade;
-/// fn sync(pipe: &Facade<std::io::PipeWriter>) {
-/// 	let _ = pipe.sync();
-/// }
-/// ```
-///
-/// Nor does a resource with a transfer have a readiness wait: the backend arms
-/// the readiness itself when a call would block. Only [`Signal`](crate::Signal)
-/// waits.
-///
-/// ```compile_fail
-/// # use completion_async::Facade;
-/// fn wait(socket: &Facade<std::net::TcpStream>) {
-/// 	let _ = socket.wait_readable();
-/// }
-/// ```
-pub struct Facade<S> {
-	handle: Handle<S>,
-	reactor: Reactor,
-}
-
-impl<S> Facade<S> {
-	/// Wraps `resource`, its operations going to this thread's global
-	/// executor.
-	///
-	/// See [`Facade::with_executor`] for the resource's requirements.
-	#[fastrace::trace]
-	pub fn new(resource: impl Into<S>) -> Facade<S> {
-		Self::from_parts(Handle::new(resource.into()), global::reactor())
-	}
-
-	/// Wraps `resource`, its operations going to `executor`.
-	///
-	/// On Windows the resource must be opened for overlapped I/O: a file
-	/// through [`OpenOptions`], which asks for `FILE_FLAG_OVERLAPPED`. A handle
-	/// opened without that flag cannot be owned by a completion port, so its
-	/// operations fail with the invalid-parameter error the association gives.
-	#[fastrace::trace]
-	pub fn with_executor(resource: impl Into<S>, executor: &Executor) -> Facade<S> {
-		Self::from_parts(Handle::new(resource.into()), executor.reactor().clone())
-	}
-
-	/// Wraps a `handle` the caller already holds, its operations going to this
-	/// thread's global executor; the facade shares the handle rather than taking
-	/// it over.
-	pub fn bind(handle: Handle<S>) -> Facade<S> {
-		Self::from_parts(handle, global::reactor())
-	}
-
-	/// Wraps a `handle` the caller already holds, its operations going to
-	/// `executor`; the facade shares the handle rather than taking it over.
-	pub fn bind_with_executor(handle: Handle<S>, executor: &Executor) -> Facade<S> {
-		Self::from_parts(handle, executor.reactor().clone())
-	}
-
-	pub(super) fn from_parts(handle: Handle<S>, reactor: Reactor) -> Facade<S> {
-		Self { handle, reactor }
-	}
-
-	pub(super) fn reactor(&self) -> &Reactor {
-		&self.reactor
-	}
-
-	pub(super) fn handle(&self) -> &Handle<S> {
-		&self.handle
-	}
-
-	/// Waits for all other facade clones and operations to release the resource; returns `None` if another take is already waiting.
-	pub async fn take(self) -> Option<S> {
-		self.handle.take().await
-	}
-
-	/// [`take`](Facade::take) without waiting: `Err(self)` while another clone
-	/// or an operation still names the resource.
-	pub fn try_take(self) -> Result<S, Facade<S>> {
-		match self.handle.try_take() {
-			Ok(resource) => Ok(resource),
-			Err(handle) => Err(Self {
-				handle,
-				reactor: self.reactor,
-			}),
-		}
-	}
-}
-
-impl<S> Clone for Facade<S> {
-	fn clone(&self) -> Facade<S> {
-		Self {
-			handle: self.handle.clone(),
-			reactor: self.reactor.clone(),
-		}
-	}
-}
-
 pub type File = Facade<fs::File>;
 
 /// The four read and write methods of a resource read and written at an
@@ -244,7 +122,7 @@ macro_rules! positional {
 				/// Reads into `span` at `fdoff`, in one call: a short count is what the
 				/// call moved, not an error. [`read_exact_at`](Self::read_exact_at)
 				/// loops.
-				pub fn read_at<'a>(&self, span: Span<'a>, fdoff: u64) -> Transfer<'a, $resource> {
+				pub fn read_at(&self, span: Span, fdoff: u64) -> Transfer {
 					Transfer::new(self, Kind::Read { fdoff }, span)
 				}
 
@@ -253,13 +131,13 @@ macro_rules! positional {
 				///
 				/// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) when the file ends
 				/// first.
-				pub fn read_exact_at<'a>(&self, span: Span<'a>, fdoff: u64) -> Transfer<'a, $resource> {
+				pub fn read_exact_at(&self, span: Span, fdoff: u64) -> Transfer {
 					Transfer::new(self, Kind::ReadAll { fdoff }, span)
 				}
 
 				/// Writes `span` at `fdoff`, in one call: a short count is what the call
 				/// moved, not an error. [`write_all_at`](Self::write_all_at) loops.
-				pub fn write_at<'a>(&self, span: Span<'a>, fdoff: u64) -> Transfer<'a, $resource> {
+				pub fn write_at(&self, span: Span, fdoff: u64) -> Transfer {
 					Transfer::new(self, Kind::Write { fdoff }, span)
 				}
 
@@ -267,7 +145,7 @@ macro_rules! positional {
 				/// all.
 				///
 				/// [`WriteZero`](io::ErrorKind::WriteZero) when a call writes nothing.
-				pub fn write_all_at<'a>(&self, span: Span<'a>, fdoff: u64) -> Transfer<'a, $resource> {
+				pub fn write_all_at(&self, span: Span, fdoff: u64) -> Transfer {
 					Transfer::new(self, Kind::WriteAll { fdoff }, span)
 				}
 			}
@@ -299,10 +177,8 @@ positional!(
 );
 
 impl Facade<fs::File> {
-	pub fn sync(&self) -> Op<fs::File> {
-		Op::new(self, |reactor, handle| {
-			submit(reactor, handle, LowOp::Fsync)
-		})
+	pub fn sync(&self) -> Op {
+		Op::new(self, Action::Fsync)
 	}
 
 	/// Reports the resource's pending deferred write-back errors — `ENOSPC`,
@@ -312,28 +188,22 @@ impl Facade<fs::File> {
 	/// of the caller's, and it does not make the data durable — [`sync`](Self::sync)
 	/// is what does that. What it reports is the error the filesystem had
 	/// deferred and would otherwise surface at the resource's next close.
-	pub fn flush(&self) -> Op<fs::File> {
-		Op::new(self, |reactor, handle| {
-			submit(reactor, handle, LowOp::Flush)
-		})
+	pub fn flush(&self) -> Op {
+		Op::new(self, Action::Flush)
 	}
 
 	/// Backs `len` bytes at `offset` with storage, so a write there does not
 	/// fail for space. A range past the end grows the file to the range's end,
 	/// reading as zeros; the file never shrinks.
-	pub fn allocate(&self, offset: u64, len: u64) -> Op<fs::File> {
-		Op::new(self, move |reactor, handle| {
-			submit(reactor, handle, LowOp::Allocate { offset, len })
-		})
+	pub fn allocate(&self, offset: u64, len: u64) -> Op {
+		Op::new(self, Action::Allocate { offset, len })
 	}
 
 	/// Zeroes `len` bytes at `offset`, freeing their storage where the
 	/// filesystem can; the length stays.
 	///
 	/// On Windows the storage is freed only in a file marked sparse.
-	pub fn punch(&self, offset: u64, len: u64) -> Op<fs::File> {
-		Op::new(self, move |reactor, handle| {
-			submit(reactor, handle, LowOp::Punch { offset, len })
-		})
+	pub fn punch(&self, offset: u64, len: u64) -> Op {
+		Op::new(self, Action::Punch { offset, len })
 	}
 }

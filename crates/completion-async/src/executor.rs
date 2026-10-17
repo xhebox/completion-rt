@@ -1,61 +1,28 @@
-//! The executor a completion reactor's tasks run on, and the scopes whose
-//! tasks borrow from their caller.
+//! The executor a completion reactor's tasks run on.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 
-use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak as SyncWeak};
+use std::sync::{Arc, Mutex, Weak as SyncWeak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use completion_rt::{Lease, Memory, Reactor};
+use completion_rt::Config;
 
 use crate::Error;
-use crate::completion::cancel_task_future;
-use crate::space::Space;
+use crate::reactor::Reactor;
 
 const TICK_BUDGET: usize = 64;
-
-/// Configure the executor's reactor.
-#[derive(Clone, Copy, Debug)]
-pub struct Config {
-	pub entries: u32,
-	/// Completions appear only while polling (`io_uring` IOPOLL).
-	pub iopoll: bool,
-	/// A kernel thread consumes submissions (`io_uring` SQPOLL).
-	pub sqpoll: bool,
-}
-
-impl Default for Config {
-	fn default() -> Self {
-		Config {
-			entries: 256,
-			iopoll: false,
-			sqpoll: false,
-		}
-	}
-}
-
-impl Config {
-	fn into_rt(self) -> completion_rt::Config {
-		completion_rt::Config {
-			entries: self.entries,
-			iopoll: self.iopoll,
-			sqpoll: self.sqpoll,
-		}
-	}
-}
 
 /// A handle for spawning thread-local tasks while its executor exists.
 #[derive(Clone)]
 pub struct Spawner {
-	local: Weak<Local<'static>>,
+	local: Weak<Local>,
 }
 
 impl Spawner {
@@ -116,7 +83,7 @@ pub(crate) fn poll_join<T>(join: &RefCell<Join<T>>, cx: &mut Context<'_>) -> Pol
 		}
 		Join::Done(_) => {
 			let Join::Done(output) = std::mem::replace(&mut *join, Join::Taken) else {
-				unreachable!()
+				unreachable!("the arm just matched Done")
 			};
 			Poll::Ready(output)
 		}
@@ -173,15 +140,22 @@ impl<F: Future> Runnable for Job<F> {
 		// publishes them.
 		self.scheduled.swap(false, Ordering::AcqRel);
 		if matches!(*self.join.borrow(), Join::Cancelled) {
-			cancel_task_future(self.future.take());
+			self.future = None;
 			return Poll::Ready(());
 		}
-		let output = match self.future.as_mut().unwrap().as_mut().poll(cx) {
+		let output = match self
+			.future
+			.as_mut()
+			.expect("a task is polled only while it still has its future")
+			.as_mut()
+			.poll(cx)
+		{
 			Poll::Pending => return Poll::Pending,
 			Poll::Ready(output) => output,
 		};
 		if matches!(*self.join.borrow(), Join::Cancelled) {
-			cancel_task_future((self.future.take(), output));
+			self.future = None;
+			drop(output);
 			return Poll::Ready(());
 		}
 		drop(self.future.take());
@@ -194,8 +168,8 @@ impl<F: Future> Runnable for Job<F> {
 				}
 			}
 			Join::Detached => drop(output),
-			Join::Cancelled => cancel_task_future(output),
-			_ => unreachable!(),
+			Join::Cancelled => drop(output),
+			_ => unreachable!("the future finished while the slot held its result"),
 		}
 		Poll::Ready(())
 	}
@@ -209,17 +183,14 @@ impl<F: Future> Runnable for Job<F> {
 }
 
 /// A task set, and the queue of ids a wake has made runnable.
-///
-/// The executor's set is `'static` and lives as long as the executor; a
-/// [`Scope`]'s is bounded by the scope, which cancels what is left in it.
-pub(crate) struct Local<'a> {
-	tasks: RefCell<HashMap<u64, Box<dyn Runnable + 'a>>>,
+pub(crate) struct Local {
+	tasks: RefCell<HashMap<u64, Box<dyn Runnable>>>,
 	ready: Arc<Ready>,
 	next_id: Cell<u64>,
 }
 
-impl<'a> Local<'a> {
-	pub(crate) fn new() -> Local<'a> {
+impl Local {
+	pub(crate) fn new() -> Local {
 		Local {
 			tasks: RefCell::new(HashMap::new()),
 			ready: Arc::new(Ready {
@@ -230,9 +201,9 @@ impl<'a> Local<'a> {
 		}
 	}
 
-	pub(crate) fn spawn<T: 'a>(
+	pub(crate) fn spawn<T: 'static>(
 		&self,
-		future: impl Future<Output = T> + 'a,
+		future: impl Future<Output = T> + 'static,
 	) -> (Rc<RefCell<Join<T>>>, Waker) {
 		let id = self.next_id.get();
 		self.next_id
@@ -263,20 +234,13 @@ impl<'a> Local<'a> {
 			.ready
 			.driver
 			.lock()
-			.unwrap_or_else(PoisonError::into_inner);
+			.expect("the driver waker slot was poisoned");
 		if slot
 			.as_ref()
 			.is_none_or(|current| !current.will_wake(driver))
 		{
 			*slot = Some(driver.clone());
 		}
-	}
-
-	/// Drops the tasks still in the set as a cancellation: their operations are
-	/// given up, not abandoned.
-	pub(crate) fn cancel_all(&self) {
-		let tasks = std::mem::take(&mut *self.tasks.borrow_mut());
-		cancel_task_future(tasks);
 	}
 
 	pub(crate) fn tick(&self, budget: usize) -> bool {
@@ -306,7 +270,7 @@ impl<'a> Local<'a> {
 	}
 }
 
-impl Drop for Local<'_> {
+impl Drop for Local {
 	fn drop(&mut self) {
 		let mut tasks = self.tasks.take();
 		for job in tasks.values_mut() {
@@ -322,17 +286,15 @@ struct Ready {
 }
 
 impl Ready {
-	// A waker can run while another task unwinds a panic, so a poisoned lock must
-	// not turn that wake into a second panic: take the inner queue back from the
-	// poison instead of propagating it.
+	// A poisoned lock is a bug: it panics, and says which lock it was.
 	fn enqueue(&self, id: u64) {
-		let mut runnable = self.runnable.lock().unwrap_or_else(PoisonError::into_inner);
+		let mut runnable = self.runnable.lock().expect("the ready queue was poisoned");
 		runnable.push_back(id);
 		drop(runnable);
 		let driver = self
 			.driver
 			.lock()
-			.unwrap_or_else(PoisonError::into_inner)
+			.expect("the driver waker slot was poisoned")
 			.clone();
 		// Raised with the lock released: a waker that re-enters here would
 		// otherwise deadlock against it.
@@ -344,7 +306,7 @@ impl Ready {
 	fn dequeue(&self) -> Option<u64> {
 		self.runnable
 			.lock()
-			.unwrap_or_else(PoisonError::into_inner)
+			.expect("the ready queue was poisoned")
 			.pop_front()
 	}
 
@@ -352,7 +314,7 @@ impl Ready {
 		!self
 			.runnable
 			.lock()
-			.unwrap_or_else(PoisonError::into_inner)
+			.expect("the ready queue was poisoned")
 			.is_empty()
 	}
 }
@@ -386,14 +348,14 @@ impl Wake for TaskWake {
 /// It parks the thread calling [`Executor::block_on`] in its own reactor.
 pub struct Executor {
 	reactor: Reactor,
-	local: Rc<Local<'static>>,
+	local: Rc<Local>,
 	driver: Waker,
 }
 
 impl Executor {
 	#[fastrace::trace]
 	pub fn new(config: Config) -> Result<Executor, Error> {
-		let reactor = Reactor::new(config.into_rt())?;
+		let reactor = Reactor::new(config)?;
 		let driver = reactor.waker();
 		let local = Rc::new(Local::new());
 		local.drive(&driver);
@@ -411,7 +373,7 @@ impl Executor {
 
 	fn run<F: Future>(
 		reactor: &Reactor,
-		local: &Local<'static>,
+		local: &Local,
 		driver: &Waker,
 		fut: F,
 	) -> Result<F::Output, Error> {
@@ -430,16 +392,8 @@ impl Executor {
 				return Ok(out);
 			}
 			let more = local.tick(TICK_BUDGET);
-			reactor.poll(if more { Some(Duration::ZERO) } else { None })?;
+			reactor.drive(if more { Some(Duration::ZERO) } else { None })?;
 		}
-	}
-
-	/// Binds `memory` to this executor for its operations to name spans of.
-	///
-	/// The space keeps the memory alive until it and every operation naming it
-	/// are gone; an operation on another executor refuses it.
-	pub fn bind(&self, memory: Arc<dyn Memory>) -> Space<'static> {
-		Space::new(self.reactor.bind(memory))
 	}
 
 	/// A handle for spawning tasks on this executor.
@@ -449,55 +403,22 @@ impl Executor {
 		}
 	}
 
-	/// Runs `body` with a [`Scope`] whose tasks may borrow from the caller.
+	/// Spawns a task, or returns an [`Error`] of kind
+	/// [`ExecutorClosed`](crate::ErrorKind::ExecutorClosed) if the executor has
+	/// been dropped.
 	///
-	/// The tasks are driven by the scope future, so they advance while the body
-	/// awaits. Whatever is still in flight when the body returns is dropped
-	/// before this does, which is what lets a task hold a borrow rather than a
-	/// shared owner of the memory it transfers through.
-	pub fn scope<'s, F, Fut, R>(&mut self, body: F) -> Result<R, Error>
-	where
-		F: FnOnce(Scope<'s>) -> Fut,
-		Fut: Future<Output = R> + 's,
-	{
-		/// The barrier: on the way out, normal or unwinding, waits until no
-		/// operation under the lease is left in the kernel.
-		struct Settle<'c> {
-			reactor: &'c Reactor,
-			lease: Rc<Lease>,
-		}
+	/// A method on the executor rather than on its [`Spawner`]: the executor is
+	/// alive for the call, so only the reactor's shutdown can close it.
+	pub fn try_spawn<T: 'static>(
+		&self,
+		future: impl Future<Output = T> + 'static,
+	) -> Result<Task<T>, Error> {
+		self.spawner().try_spawn(future)
+	}
 
-		impl Drop for Settle<'_> {
-			fn drop(&mut self) {
-				while self.reactor.settle(&self.lease) {
-					if let Err(error) = self.reactor.poll(None) {
-						// Returning would end the borrow while the kernel may still
-						// write through it.
-						log::error!(error:%; "the reactor failed while a scope waited out its lent memory");
-						std::process::abort();
-					}
-				}
-			}
-		}
-
-		let lease = Rc::new(self.reactor.lease());
-		let local = Rc::new(Local::new());
-		let body = body(Scope {
-			local: Rc::clone(&local),
-			lease: Rc::clone(&lease),
-			reactor: self.reactor.clone(),
-		});
-		let future = ScopeFuture {
-			local,
-			body: Some(Box::pin(body)),
-		};
-		let settle = Settle {
-			reactor: &self.reactor,
-			lease,
-		};
-		let result = Executor::run(settle.reactor, &self.local, &self.driver, future);
-		drop(settle);
-		result
+	/// Spawns a task, panicking if the executor has been dropped.
+	pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Task<T> {
+		self.spawner().spawn(future)
 	}
 
 	pub(crate) fn reactor(&self) -> &Reactor {
@@ -508,143 +429,6 @@ impl Executor {
 impl Drop for Executor {
 	fn drop(&mut self) {
 		// Shut the reactor down first so in-flight I/O settles before task futures release their Completions.
-		self.reactor.shutdown(true);
-	}
-}
-
-/// Tasks borrowing the scope that spawned them.
-///
-/// [`spawn`](crate::spawn) cannot take a future that holds a reference: the
-/// executor's task set outlives the call that filled it, so its futures are
-/// `'static`. A scope is the other half of that trade — the tasks it hands out
-/// are bounded by the scope, which drives them itself and drops whatever is
-/// still in flight before it returns. That is what lets a task hold a borrow of
-/// the caller's memory instead of a shared owner of it, which is the shape a
-/// hypervisor needs: the guest's pages are mapped by someone else and cannot be
-/// moved into an `Arc`.
-///
-/// Tasks are polled by the scope future, so they advance while the body waits
-/// on them; a body that computes without awaiting holds them up, exactly as it
-/// holds up everything else on the thread.
-///
-/// Handed to the body [`Executor::scope`] runs, and gone when that body
-/// returns: a handle taken from here cannot outlive the borrow it was made
-/// with.
-///
-/// Passed by value, not by reference: an `async` body has to move the handle in
-/// to keep it across an `await`, and a reference would tie the body to the
-/// closure's own frame rather than the scope's.
-#[derive(Clone)]
-pub struct Scope<'a> {
-	local: Rc<Local<'a>>,
-	lease: Rc<Lease>,
-	reactor: Reactor,
-}
-
-impl<'a> Scope<'a> {
-	/// Lends `memory` to operations started inside this scope.
-	///
-	/// The operations are tied to the scope: one submitted after it ends is
-	/// refused, and the scope does not return while one is still in the kernel —
-	/// even one whose future was forgotten.
-	pub fn lend(&self, memory: &'a dyn Memory) -> Space<'a> {
-		// SAFETY: the space reaches the reactor under this scope's lease, and
-		// `Executor::scope` — a plain call, which cannot be forgotten — settles
-		// the lease before returning, so every operation naming the memory has
-		// left the kernel while `'a` still holds. Every other handle on the space
-		// is typed `Space<'a>` or `Span<'a>`, or sits in a `Transfer<'a, _>`, all
-		// bounded by `'a`.
-		Space::new(unsafe { self.reactor.lend(memory, &self.lease) })
-	}
-
-	/// Spawns `future` on this scope.
-	///
-	/// The task runs whether or not its handle is awaited. Dropping the handle
-	/// only gives up the result; the task keeps running until the scope ends,
-	/// and is dropped with it.
-	pub fn spawn<T: 'a>(&self, future: impl Future<Output = T> + 'a) -> ScopeTask<'a, T> {
-		let (join, _) = self.local.spawn(future);
-		ScopeTask {
-			join,
-			scope: PhantomData,
-		}
-	}
-}
-
-/// A task on a [`Scope`], awaited for its result.
-///
-/// Unlike [`Task`], dropping this does not cancel the task: a scope has an end
-/// to hang cancellation on, so the handle does not have to be one.
-pub struct ScopeTask<'a, T> {
-	join: Rc<RefCell<Join<T>>>,
-	/// Ties the handle to the scope, which is what bounds the borrow.
-	scope: PhantomData<&'a ()>,
-}
-
-impl<T> Future for ScopeTask<'_, T> {
-	type Output = T;
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-		poll_join(&self.join, cx)
-	}
-}
-
-impl<T> Drop for ScopeTask<'_, T> {
-	fn drop(&mut self) {
-		let waiting = matches!(*self.join.borrow(), Join::Waiting(_));
-		if waiting {
-			let previous = self.join.replace(Join::Detached);
-			drop(previous);
-		}
-	}
-}
-
-/// The future a [`Scope`] body is wrapped in: it polls the tasks, then the body.
-struct ScopeFuture<'a, Fut: Future> {
-	local: Rc<Local<'a>>,
-	body: Option<Pin<Box<Fut>>>,
-}
-
-impl<Fut: Future> Future for ScopeFuture<'_, Fut> {
-	type Output = Fut::Output;
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Fut::Output> {
-		let this = self.get_mut();
-		let local = &this.local;
-		// The tasks wake this future, not the executor's task set: the waker the
-		// body was polled with is the one they have to raise.
-		local.drive(cx.waker());
-		let more = local.tick(TICK_BUDGET);
-		let body = this
-			.body
-			.as_mut()
-			.expect("a scope is polled after its body returned");
-		match body.as_mut().poll(cx) {
-			Poll::Ready(output) => {
-				this.body = None;
-				// Still in flight, so cancelled here: the borrow they hold dies with
-				// the scope, and an operation they started is given up and waited
-				// out by the scope's barrier. Also what breaks the cycle a task
-				// holding a `Scope` clone makes with the set.
-				local.cancel_all();
-				Poll::Ready(output)
-			}
-			Poll::Pending => {
-				// A task left over from a spent budget has not run yet. One the
-				// body spawned on this poll raised the waker itself.
-				if more {
-					cx.waker().wake_by_ref();
-				}
-				Poll::Pending
-			}
-		}
-	}
-}
-
-impl<Fut: Future> Drop for ScopeFuture<'_, Fut> {
-	fn drop(&mut self) {
-		// The body first: it may hold handles into the tasks.
-		self.body = None;
-		self.local.cancel_all();
+		let _ = self.reactor.shutdown(true);
 	}
 }

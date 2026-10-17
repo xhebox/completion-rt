@@ -32,7 +32,6 @@ pub enum Status {
 #[derive(Debug)]
 pub struct Error {
 	kind: ErrorKind,
-	status: Status,
 	source: Option<io::Error>,
 }
 
@@ -42,7 +41,6 @@ impl Error {
 	pub fn cancelled() -> Error {
 		Error {
 			kind: ErrorKind::Cancelled,
-			status: Status::Permanent,
 			source: None,
 		}
 	}
@@ -52,15 +50,16 @@ impl Error {
 	pub fn executor_closed() -> Error {
 		Error {
 			kind: ErrorKind::ExecutorClosed,
-			status: Status::Permanent,
 			source: None,
 		}
 	}
 
-	pub(crate) fn stopped() -> Error {
+	/// The reactor has been shut down; only the layer that owns the shutdown
+	/// builds this.
+	#[doc(hidden)]
+	pub fn stopped() -> Error {
 		Error {
 			kind: ErrorKind::Stopped,
-			status: Status::Permanent,
 			source: None,
 		}
 	}
@@ -70,7 +69,12 @@ impl Error {
 	}
 
 	pub fn status(&self) -> Status {
-		self.status
+		match self.source.as_ref().map(io::Error::kind) {
+			Some(
+				io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut,
+			) => Status::Temporary,
+			_ => Status::Permanent,
+		}
 	}
 }
 
@@ -98,15 +102,8 @@ impl StdError for Error {
 
 impl From<io::Error> for Error {
 	fn from(error: io::Error) -> Error {
-		let status = match error.kind() {
-			io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-				Status::Temporary
-			}
-			_ => Status::Permanent,
-		};
 		Error {
 			kind: ErrorKind::Failed,
-			status,
 			source: Some(error),
 		}
 	}

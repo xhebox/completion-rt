@@ -61,6 +61,32 @@ impl IoVec {
 	pub fn as_ptr(&self) -> *mut u8 {
 		self.ptr
 	}
+
+	/// These bytes as a slice.
+	///
+	/// # Safety
+	/// Nothing may be moving these bytes: no transfer naming them may be in
+	/// flight, and no other thread may hold them. A reference claims the range
+	/// holds still and is not aliased, which a kernel still reading or writing
+	/// through the range breaks — the same claim [`Memory`] exists to avoid
+	/// making. The slice lives no longer than the [`Memory`] the range was
+	/// resolved from.
+	pub unsafe fn as_slice<'a>(&self) -> &'a [u8] {
+		// SAFETY: the caller vouches nothing else touches the range, and that
+		// the memory behind it outlives the slice.
+		unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+	}
+
+	/// These bytes as a mutable slice.
+	///
+	/// # Safety
+	/// As for [`IoVec::as_slice`]: nothing may be moving these bytes, and the
+	/// memory behind them outlives the slice.
+	pub unsafe fn as_mut_slice<'a>(&self) -> &'a mut [u8] {
+		// SAFETY: as for `as_slice`, with the write side of the same claim: the
+		// caller vouches nothing else reads or writes the range either.
+		unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+	}
 }
 
 impl fmt::Debug for IoVec {

@@ -133,3 +133,25 @@ fn a_pooled_buffer_backs_a_span_like_any_other() {
 	assert_eq!(span.to_vec(), b"pooled");
 	assert_eq!(span.buffer().len(), 4096);
 }
+
+#[test]
+fn a_buffer_is_a_memory() {
+	let memory: Arc<dyn Memory> = Arc::new(Buffer::from_slice(b"hello"));
+	assert_eq!(memory.len(), 5);
+	assert!(!memory.is_empty());
+
+	let iovec = memory.iovec(Extent { offset: 1, len: 3 }).unwrap();
+	assert_eq!(iovec.len(), 3);
+	let mut out = [0u8; 3];
+	// SAFETY: `iovec` resolved inside `memory`, which stays alive for this copy.
+	unsafe { std::ptr::copy_nonoverlapping(iovec.as_ptr(), out.as_mut_ptr(), out.len()) };
+	assert_eq!(&out, b"ell");
+
+	assert_eq!(
+		memory
+			.iovec(Extent { offset: 4, len: 2 })
+			.unwrap_err()
+			.kind(),
+		io::ErrorKind::InvalidInput
+	);
+}

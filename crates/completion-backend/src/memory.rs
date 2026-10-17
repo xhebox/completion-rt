@@ -341,6 +341,19 @@ impl fmt::Debug for Buffer {
 	}
 }
 
+// SAFETY: `self.0.memory()` is the `Arc`'d [`Memory`] this buffer holds, so
+// every range it resolves stays alive as long as `&self` does, and `Buffer`
+// never hands out a reference over those bytes.
+unsafe impl Memory for Buffer {
+	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
+		self.0.memory().iovec(extent)
+	}
+
+	fn len(&self) -> usize {
+		Buffer::len(self)
+	}
+}
+
 impl From<Vec<u8>> for Buffer {
 	fn from(bytes: Vec<u8>) -> Buffer {
 		Buffer::from(bytes.into_boxed_slice())

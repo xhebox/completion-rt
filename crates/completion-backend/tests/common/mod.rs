@@ -1,4 +1,4 @@
-//! What the completion-rt tests share.
+//! What the completion-backend tests share.
 //!
 //! Which helpers a binary uses depends on which target's tests it builds —
 //! windows compiles the socket tests away — so the module as a whole opts out
@@ -132,12 +132,12 @@ impl Buffer {
 
 // SAFETY: the bytes are atomics, so a write through the pointer races on bytes
 // only, never on a reference; `iovec` checks the extent against the length.
-unsafe impl completion_rt::Memory for Buffer {
+unsafe impl completion_backend::Memory for Buffer {
 	fn len(&self) -> usize {
 		self.0.len()
 	}
 
-	fn iovec(&self, extent: completion_rt::Extent) -> io::Result<completion_rt::IoVec> {
+	fn iovec(&self, extent: completion_backend::Extent) -> io::Result<completion_backend::IoVec> {
 		let end = usize::try_from(extent.offset)
 			.ok()
 			.and_then(|offset| offset.checked_add(extent.len));
@@ -149,6 +149,6 @@ unsafe impl completion_rt::Memory for Buffer {
 		}
 		let base = self.0.as_ptr() as *mut u8;
 		// SAFETY: in bounds, checked above.
-		Ok(unsafe { completion_rt::IoVec::new(base.add(extent.offset as usize), extent.len) })
+		Ok(unsafe { completion_backend::IoVec::new(base.add(extent.offset as usize), extent.len) })
 	}
 }

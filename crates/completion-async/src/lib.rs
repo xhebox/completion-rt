@@ -58,7 +58,7 @@ mod timer;
 // this crate needs one name for them: the memory, the extents and iovecs, and
 // the descriptors.
 pub use completion::Cancel;
-pub use completion_rt::{
+pub use completion_backend::{
 	AsDescriptor, BorrowedDescriptor, Config, Error, ErrorKind, Extent, IoVec, Memory,
 	OwnedDescriptor, OwnedSocket, Space, Span, Status,
 };

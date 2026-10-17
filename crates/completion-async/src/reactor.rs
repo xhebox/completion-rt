@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
-use completion_rt::{AsDescriptor, Backend, Config, Error, ErrorKind, Response};
+use completion_backend::{AsDescriptor, Backend, Config, Error, ErrorKind, Response};
 
 mod entries;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use completion_rt::Op;
+pub(crate) use completion_backend::Op;
 
 use entries::{Entries, Entry};
 
@@ -306,7 +306,7 @@ impl Reactor {
 	/// whose result was already taken does nothing.
 	///
 	/// An operation still in flight is cancelled and detached without blocking:
-	/// the reactor keeps its [`Space`](completion_rt::Space) and descriptor alive
+	/// the reactor keeps its [`Space`](completion_backend::Space) and descriptor alive
 	/// until the backend reports its completion, though the span's byte range
 	/// remains in flight until then.
 	pub(crate) fn release(&self, key: Key) {

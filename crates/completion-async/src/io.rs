@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use completion_rt::Span;
+use completion_backend::Span;
 
 use crate::op::{Action, Facade, Kind, Op, Transfer};
 
@@ -173,7 +173,7 @@ positional!(
 #[cfg(windows)]
 positional!(
 	std::os::windows::io::OwnedHandle,
-	completion_rt::OwnedDescriptor,
+	completion_backend::OwnedDescriptor,
 );
 
 impl Facade<fs::File> {

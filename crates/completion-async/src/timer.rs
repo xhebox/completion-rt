@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use completion_rt::Error;
+use completion_backend::Error;
 
 use crate::Executor;
 use crate::completion::{Cancel, Completion, submit_timer};

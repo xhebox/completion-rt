@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, Weak as SyncWeak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use completion_rt::Config;
+use completion_backend::Config;
 
 use crate::Error;
 use crate::reactor::Reactor;

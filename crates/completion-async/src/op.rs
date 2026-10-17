@@ -10,7 +10,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use completion_rt::{AsDescriptor, Error, Op as LowOp, OwnedDescriptor, Response, Span, Status};
+use completion_backend::{
+	AsDescriptor, Error, Op as LowOp, OwnedDescriptor, Response, Span, Status,
+};
 
 use crate::Executor;
 use crate::completion::{Cancel, Completion, submit};

@@ -1,6 +1,6 @@
 //! Waiting on a descriptor for readiness, and nothing else.
 
-use completion_rt::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor};
+use completion_backend::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor};
 
 use crate::op::{Action, Facade, Op};
 

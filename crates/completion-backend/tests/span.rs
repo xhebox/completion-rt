@@ -6,7 +6,7 @@ use common::Buffer;
 
 use std::sync::Arc;
 
-use completion_rt::{Extent, Memory, Space};
+use completion_backend::{Extent, Memory, Space};
 
 fn extents(ranges: &[(u64, usize)]) -> Vec<Extent> {
 	ranges

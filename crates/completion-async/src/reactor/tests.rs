@@ -13,10 +13,10 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use completion_rt::{AsDescriptor, Config, Error, ErrorKind, Extent, IoVec, Memory, Response};
+use completion_backend::{AsDescriptor, Config, Error, ErrorKind, Extent, IoVec, Memory, Response};
 
 #[cfg(target_os = "linux")]
-use completion_rt::Status;
+use completion_backend::Status;
 
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -167,7 +167,7 @@ fn stalled_recv(
 		fd(right),
 		Op::Read {
 			offset: 0,
-			span: completion_rt::Space::new(memory(buf)).whole(),
+			span: completion_backend::Space::new(memory(buf)).whole(),
 		},
 		None,
 	)
@@ -188,7 +188,7 @@ fn a_landed_file_operation_does_not_wait_out_the_timeout() {
 		fd(&file),
 		Op::Read {
 			offset: 0,
-			span: completion_rt::Space::new(memory(&buf)).whole(),
+			span: completion_backend::Space::new(memory(&buf)).whole(),
 		},
 		None,
 	)
@@ -353,7 +353,7 @@ fn a_shutdown_lands_what_is_in_flight_and_refuses_new_work() {
 		fd(&file),
 		Op::Read {
 			offset: 0,
-			span: completion_rt::Space::new(memory(&buf)).whole(),
+			span: completion_backend::Space::new(memory(&buf)).whole(),
 		},
 		None,
 	)
@@ -378,7 +378,7 @@ fn a_shutdown_lands_what_is_in_flight_and_refuses_new_work() {
 		fd(&file),
 		Op::Read {
 			offset: 0,
-			span: completion_rt::Space::new(memory(&buf)).whole(),
+			span: completion_backend::Space::new(memory(&buf)).whole(),
 		},
 		None,
 	)
@@ -984,7 +984,7 @@ mod hangup {
 		// held so its operation stays with the ring.
 		let scratch = tempdir("hangup-terminated");
 		let buf: Arc<Buffer> = Arc::new(Buffer::new(24));
-		let space = completion_rt::Space::new(memory(&buf));
+		let space = completion_backend::Space::new(memory(&buf));
 		let mut reads = Vec::new();
 		for index in 0..24u64 {
 			let path = scratch.path().join(format!("data{index}"));

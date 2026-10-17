@@ -10,8 +10,8 @@ ignores:
   # macros — neither has a rustix wrapper that io_uring can use. The portable
   # backend's `recvmsg`/`sendmsg` are the same, and its transfers pass caller
   # memory to the kernel by pointer rather than as a slice.
-  - crates/completion-rt/src/backend/uring.rs
-  - crates/completion-rt/src/backend/portable.rs
+  - crates/completion-backend/src/backend/uring.rs
+  - crates/completion-backend/src/backend/portable.rs
 rule:
   all:
     - kind: identifier

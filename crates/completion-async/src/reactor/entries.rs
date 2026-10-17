@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
 
-use completion_rt::{AsDescriptor, Error, Response, Space};
+use completion_backend::{AsDescriptor, Error, Response, Space};
 
 /// The record one submitted operation or timer lives in, from submission until
 /// its result is taken or it is given up on.

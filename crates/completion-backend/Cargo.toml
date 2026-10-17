@@ -1,9 +1,9 @@
 [package]
-name = "completion-rt"
+name = "completion-backend"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96.1"
-description = "Completion-model async I/O: single-threaded reactor per platform backend, token-based submission."
+description = "Completion-model I/O backend: io_uring, IOCP, and polling."
 license = "MIT"
 repository = "https://github.com/xhebox/completion-rt"
 

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
-use completion_rt::{AsDescriptor, Error, ErrorKind, Op, Response};
+use completion_backend::{AsDescriptor, Error, ErrorKind, Op, Response};
 
 use crate::reactor::{Key, Reactor};
 
@@ -212,11 +212,11 @@ pub(crate) fn submit_timer(
 ///
 /// Dropping an in-flight operation is predictable and does not block: the drop
 /// cancels the operation and detaches it, and the reactor keeps its
-/// [`Space`](completion_rt::Space) and descriptor alive until the kernel
+/// [`Space`](completion_backend::Space) and descriptor alive until the kernel
 /// finishes with it, though the span's bytes stay in flight until then. A
 /// range that is to be read or reused right away is waited for by naming a
 /// [`Cancel`]: the completion then resolves to `None` only once the kernel has
-/// let go of the [`Span`](completion_rt::Span).
+/// let go of the [`Span`](completion_backend::Span).
 pub(crate) struct Completion {
 	reactor: Reactor,
 	key: Key,
@@ -275,7 +275,7 @@ impl Drop for Completion {
 mod tests {
 	use super::*;
 	use crate::reactor::Reactor;
-	use completion_rt::Config;
+	use completion_backend::Config;
 	use std::time::Duration;
 
 	fn platform() -> Reactor {

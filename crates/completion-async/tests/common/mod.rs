@@ -1,4 +1,4 @@
-//! What the completion-rt tests share.
+//! What the completion-backend tests share.
 //!
 //! Which helpers a binary uses depends on which target's tests it builds —
 //! windows compiles the socket tests away — so the module as a whole opts out

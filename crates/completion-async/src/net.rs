@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use completion_rt::{AsDescriptor, OwnedDescriptor, OwnedSocket, Response, Span};
+use completion_backend::{AsDescriptor, OwnedDescriptor, OwnedSocket, Response, Span};
 
 use crate::Error;
 use crate::completion::Cancel;
@@ -211,7 +211,7 @@ mod imp {
 	use std::io;
 	use std::net::Shutdown;
 
-	use completion_rt::BorrowedDescriptor;
+	use completion_backend::BorrowedDescriptor;
 
 	pub(super) fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
 		let how = match how {
@@ -242,7 +242,7 @@ mod imp {
 		shutdown as winsock_shutdown,
 	};
 
-	use completion_rt::BorrowedDescriptor;
+	use completion_backend::BorrowedDescriptor;
 
 	pub(super) fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
 		let how = match how {

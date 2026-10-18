@@ -4,6 +4,10 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 
+/// The result of a completion operation or runtime call, with [`Error`] as the
+/// failure every one of them reports.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
 /// Category of an [`Error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

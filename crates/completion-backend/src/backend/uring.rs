@@ -18,13 +18,13 @@ use std::time::{Duration, Instant};
 
 use super::Op;
 use crate::desc::{BorrowedDescriptor, OwnedDescriptor, OwnedSocket};
-use crate::error::Error;
-use crate::memory::{IoVec, Span};
+use crate::error::{Error, Result};
+use crate::memory::{Resolved, Span};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue, types};
 use rustix::io::Errno;
 use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 
-use super::{Config, Response};
+use super::{Config, Driver, Response};
 
 const MIN_RING_ENTRIES: u32 = 2;
 
@@ -217,7 +217,7 @@ pub(crate) struct Uring {
 	active: SlotMap<DefaultKey, Active>,
 	/// The iovec arrays a vectored request points at, kept for the next one once
 	/// nothing reads them.
-	iovecs: Vec<Vec<IoVec>>,
+	iovecs: Vec<Vec<libc::iovec>>,
 	/// Whether the kernel takes `IORING_ENTER_NO_IOWAIT` (Linux 6.15+). A kernel that does not still blocks in `io_uring_enter`, and that sleep counts as iowait.
 	no_iowait: bool,
 	/// Whether the futex wait is queued and has not completed.
@@ -236,7 +236,7 @@ struct Active {
 	/// at keeps its address when the `Vec` moves in here; only a reallocation
 	/// would move it, and the array is filled before its request is queued and
 	/// left alone until the completion takes it back.
-	buffers: Vec<IoVec>,
+	buffers: Vec<libc::iovec>,
 	/// The message area an operation carrying descriptors reads through, and
 	/// where a receive's descriptors land.
 	control: Option<Control>,
@@ -246,19 +246,19 @@ struct Active {
 
 /// An iovec array to fill for a vectored request: one nothing is reading from,
 /// or a new one.
-fn lease(iovecs: &mut Vec<Vec<IoVec>>) -> Vec<IoVec> {
+fn lease(iovecs: &mut Vec<Vec<libc::iovec>>) -> Vec<libc::iovec> {
 	iovecs.pop().unwrap_or_default()
 }
 
 /// Takes an array back once nothing reads it, keeping the allocation for the
 /// next vectored request.
-fn release(iovecs: &mut Vec<Vec<IoVec>>, mut buffers: Vec<IoVec>) {
+fn release(iovecs: &mut Vec<Vec<libc::iovec>>, mut buffers: Vec<libc::iovec>) {
 	buffers.clear();
 	iovecs.push(buffers);
 }
 
 /// What the mechanism reported, as the operation's own result.
-fn completion(kind: Kind, result: i32, control: Option<Control>) -> Result<Response, Error> {
+fn completion(kind: Kind, result: i32, control: Option<Control>) -> Result<Response> {
 	if result < 0 {
 		let errno = -result;
 		return Err(if errno == Errno::CANCELED.raw_os_error() {
@@ -297,22 +297,22 @@ fn capped(len: usize) -> u32 {
 /// through a plain `read` or `write`: the kernel takes that buffer's address
 /// and length from the SQE itself, so no iovec array has to outlive the
 /// request. A span of any other shape needs the vectored form.
-fn single(span: &Span) -> io::Result<Option<(IoVec, u32)>> {
+fn single(span: &Span) -> Result<Option<(Resolved, u32)>> {
 	let Some(buf) = span.resolve_single() else {
 		return Ok(None);
 	};
 	let buf = buf?;
-	Ok(Some((buf, capped(buf.len()))))
+	Ok(Some((buf, capped(buf.len))))
 }
 
 /// The one buffer a control message names: a `recvmsg` or `sendmsg` carries a
 /// single iovec.
-fn only(span: &Span, call: &str) -> io::Result<IoVec> {
+fn only(span: &Span, call: &str) -> Result<Resolved> {
 	if span.extents().len() != 1 {
-		return Err(io::Error::new(
+		return Err(Error::from(io::Error::new(
 			io::ErrorKind::Unsupported,
 			format!("a socket {call} needs exactly one buffer"),
-		));
+		)));
 	}
 	span.resolve_single()
 		.expect("a span of one extent needs no array")
@@ -413,7 +413,7 @@ impl Uring {
 	fn poll_devices(
 		&mut self,
 		timeout: Option<Duration>,
-		mut complete: impl FnMut(u64, Result<Response, Error>),
+		mut complete: impl FnMut(u64, Result<Response>),
 	) -> io::Result<()> {
 		let start = Instant::now();
 		loop {
@@ -440,10 +440,7 @@ impl Uring {
 
 	/// Takes every settled completion out of the ring and reports it to
 	/// `complete`, returning how many landed here.
-	fn reap(
-		&mut self,
-		mut complete: impl FnMut(u64, Result<Response, Error>),
-	) -> io::Result<usize> {
+	fn reap(&mut self, mut complete: impl FnMut(u64, Result<Response>)) -> io::Result<usize> {
 		let mut settled = Vec::new();
 		let mut landed = 0;
 		{
@@ -552,7 +549,7 @@ impl Uring {
 		id: u64,
 		fd: BorrowedDescriptor<'_>,
 		op: Op,
-	) -> io::Result<(squeue::Entry, Active, Option<OwnedDescriptor>)> {
+	) -> Result<(squeue::Entry, Active, Option<OwnedDescriptor>)> {
 		if self.iopoll {
 			let what = match &op {
 				Op::Fsync => Some("fsync"),
@@ -562,12 +559,12 @@ impl Uring {
 				_ => None,
 			};
 			if let Some(what) = what {
-				return Err(io::Error::new(
+				return Err(Error::from(io::Error::new(
 					io::ErrorKind::Unsupported,
 					format!(
 						"{what} cannot be submitted on an IOPOLL ring; give it a ring of its own"
 					),
-				));
+				)));
 			}
 		}
 		// The descriptors a send carries move into the control area the kernel
@@ -579,27 +576,27 @@ impl Uring {
 		let mut duplicate: Option<OwnedDescriptor> = None;
 		let (request, buffers) = match op {
 			Op::Read { offset, span } => match single(&span)? {
-				Some((buf, len)) => (
-					opcode::Read::new(raw_fd, buf.as_ptr(), len)
+				Some((buf, count)) => (
+					opcode::Read::new(raw_fd, buf.ptr, count)
 						.offset(offset)
 						.build(),
 					Vec::new(),
 				),
 				None => self.vectored(&span, |ptr, count| {
-					opcode::Readv::new(raw_fd, ptr.cast(), count)
+					opcode::Readv::new(raw_fd, ptr, count)
 						.offset(offset)
 						.build()
 				})?,
 			},
 			Op::Write { offset, span } => match single(&span)? {
-				Some((buf, len)) => (
-					opcode::Write::new(raw_fd, buf.as_ptr(), len)
+				Some((buf, count)) => (
+					opcode::Write::new(raw_fd, buf.ptr, count)
 						.offset(offset)
 						.build(),
 					Vec::new(),
 				),
 				None => self.vectored(&span, |ptr, count| {
-					opcode::Writev::new(raw_fd, ptr.cast(), count)
+					opcode::Writev::new(raw_fd, ptr, count)
 						.offset(offset)
 						.build()
 				})?,
@@ -642,13 +639,13 @@ impl Uring {
 			Op::Recv { span } => {
 				let buf = only(&span, "receive")?;
 				(
-					opcode::Recv::new(raw_fd, buf.as_ptr(), capped(buf.len())).build(),
+					opcode::Recv::new(raw_fd, buf.ptr, capped(buf.len)).build(),
 					Vec::new(),
 				)
 			}
 			Op::RecvWithFds { span } => {
 				let buf = only(&span, "receive")?;
-				let mut area = Control::receive(buf.as_ptr(), buf.len());
+				let mut area = Control::receive(buf.ptr, buf.len);
 				let message = area.message();
 				control = Some(area);
 				(
@@ -662,11 +659,11 @@ impl Uring {
 				let buf = only(&span, "send")?;
 				if fds.is_empty() {
 					(
-						opcode::Send::new(raw_fd, buf.as_ptr(), capped(buf.len())).build(),
+						opcode::Send::new(raw_fd, buf.ptr, capped(buf.len)).build(),
 						Vec::new(),
 					)
 				} else {
-					let mut area = Control::send(buf.as_ptr(), buf.len(), fds)?;
+					let mut area = Control::send(buf.ptr, buf.len, fds)?;
 					let message = area.message();
 					control = Some(area);
 					(opcode::SendMsg::new(raw_fd, message).build(), Vec::new())
@@ -710,12 +707,22 @@ impl Uring {
 	fn vectored(
 		&mut self,
 		span: &Span,
-		entry: impl FnOnce(*const IoVec, u32) -> squeue::Entry,
-	) -> io::Result<(squeue::Entry, Vec<IoVec>)> {
-		let count = u32::try_from(span.extents().len())
-			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many buffers"))?;
+		entry: impl FnOnce(*const libc::iovec, u32) -> squeue::Entry,
+	) -> Result<(squeue::Entry, Vec<libc::iovec>)> {
+		let count = u32::try_from(span.extents().len()).map_err(|_| {
+			Error::from(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"too many buffers",
+			))
+		})?;
 		let mut buffers = lease(&mut self.iovecs);
-		match span.resolve_into(&mut buffers) {
+		let resolved = span.resolve_with(|buf| {
+			buffers.push(libc::iovec {
+				iov_base: buf.ptr.cast(),
+				iov_len: buf.len,
+			});
+		});
+		match resolved {
 			Ok(()) => Ok((entry(buffers.as_ptr(), count), buffers)),
 			Err(error) => {
 				release(&mut self.iovecs, buffers);
@@ -725,13 +732,8 @@ impl Uring {
 	}
 }
 
-impl Uring {
-	pub(super) fn submit(
-		&mut self,
-		id: u64,
-		fd: BorrowedDescriptor<'_>,
-		op: Op,
-	) -> Result<(), Error> {
+impl Driver for Uring {
+	fn submit(&mut self, id: u64, fd: BorrowedDescriptor<'_>, op: Op) -> Result<()> {
 		// Prepared before the request names the id: a submission that fails before
 		// anything reaches the ring gives the caller the refusal, and the reactor
 		// takes its entry back out.
@@ -766,7 +768,7 @@ impl Uring {
 		Ok(())
 	}
 
-	pub(super) fn cancel(&mut self, id: u64) {
+	fn cancel(&mut self, id: u64) {
 		// The kernel cancels by the token it holds, which only the table maps
 		// back to the reactor's id.
 		let token = self
@@ -783,11 +785,11 @@ impl Uring {
 		let _ = self.push(entry).and_then(|()| self.ring.submit());
 	}
 
-	pub(super) fn poll(
+	fn poll(
 		&mut self,
 		timeout: Option<Duration>,
-		mut complete: impl FnMut(u64, Result<Response, Error>),
-	) -> Result<(), Error> {
+		mut complete: impl FnMut(u64, Result<Response>),
+	) -> Result<()> {
 		if timeout == Some(Duration::ZERO) {
 			// A poll that does not wait leaves the state word alone: a wake that
 			// arrived while the executor ticked must stay for the next blocking
@@ -840,7 +842,7 @@ impl Uring {
 		Ok(())
 	}
 
-	pub(super) fn waker(&self) -> Waker {
+	fn waker(&self) -> Waker {
 		Waker::from(Arc::clone(&self.signal))
 	}
 }

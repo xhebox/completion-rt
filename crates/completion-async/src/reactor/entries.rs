@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
 
-use completion_backend::{AsDescriptor, Buffer, Error, Response};
+use completion_backend::{AsDescriptor, Buffer, Response, Result};
 use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 
 /// State of an in-flight operation or timer in the reactor table.
 pub(super) struct Entry {
-	pub(super) response: Option<Result<Response, Error>>,
+	pub(super) response: Option<Result<Response>>,
 	pub(super) waker: Option<Waker>,
 	/// True if the future was dropped before taking the result; the entry will be
 	/// removed as soon as the backend reports completion.
@@ -71,7 +71,7 @@ impl Entries {
 	/// its result: a mechanism can report the same operation twice. It is also
 	/// `None` when the holder is not waiting yet, and when the holder gave the
 	/// result up, in which case the operation ends here.
-	pub(super) fn land(&mut self, id: u64, response: Result<Response, Error>) -> Option<Waker> {
+	pub(super) fn land(&mut self, id: u64, response: Result<Response>) -> Option<Waker> {
 		let entry = self.slots.get_mut(key(id))?;
 		if entry.is_done() {
 			return None;

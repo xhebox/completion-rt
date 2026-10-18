@@ -8,26 +8,28 @@ license = "MIT"
 repository = "https://github.com/xhebox/completion-rt"
 
 [dependencies]
+blocking = "1.7"
+enum_dispatch = "0.3"
 log = { version = "0.4.34", features = ["std", "kv"] }
+polling = "3.11"
 slotmap = "1"
 smallvec = "1"
+socket2 = "0.6"
+strum = { version = "0.28", features = ["derive"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
-libc = "0.2"
-rustix = { version = "1.1", features = ["event", "fs", "net", "thread"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 # The portable backend: readiness from `polling` (epoll, kqueue, event ports,
-# poll) and file I/O on `blocking`'s thread pool. Linux and Windows keep the
-# kernel's own file I/O instead.
-[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
-blocking = "1.7"
+# IOCP) and file I/O on `blocking`'s thread pool, on every target. Its socket
+# calls are `socket2`'s on every target; the rest are unix's here and Win32's on
+# the windows target.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
-polling = "3.11"
-rustix = { version = "1.1", features = ["event", "fs", "net"] }
+rustix = { version = "1.1", features = ["event", "fs", "net", "thread"] }
 
 [features]
 # `iowait` withholds `IORING_ENTER_NO_IOWAIT` from the ring's blocking waits,

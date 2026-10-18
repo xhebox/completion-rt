@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
-use completion_backend::{AsDescriptor, Backend, Config, Error, ErrorKind, Response};
+use completion_backend::{AsDescriptor, Backend, Config, Error, ErrorKind, Response, Result};
 
 mod entries;
 #[cfg(test)]
@@ -38,7 +38,7 @@ struct Driver {
 }
 
 impl Driver {
-	fn new(config: Config) -> Result<Driver, Error> {
+	fn new(config: Config) -> Result<Driver> {
 		Ok(Driver {
 			stopped: false,
 			timers: BTreeSet::new(),
@@ -50,7 +50,7 @@ impl Driver {
 	/// Collects the backend's completions and wakes whoever waits. The whole
 	/// pass runs on `&mut self`, so a waker that re-enters the reactor panics
 	/// instead of touching the driver mid-flight.
-	fn poll(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
+	fn poll(&mut self, timeout: Option<Duration>) -> Result<()> {
 		let entries = &mut self.entries;
 		self.backend.poll(timeout, |id, response| {
 			if let Some(waker) = entries.land(id, response) {
@@ -67,7 +67,7 @@ impl Driver {
 			.all(|(_, entry)| entry.is_done() || entry.timer.is_some())
 	}
 
-	fn wait(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
+	fn wait(&mut self, timeout: Option<Duration>) -> Result<()> {
 		let nearest = self
 			.timers
 			.first()
@@ -109,7 +109,7 @@ impl Driver {
 		}
 	}
 
-	fn drive_to_idle(&mut self) -> Result<(), Error> {
+	fn drive_to_idle(&mut self) -> Result<()> {
 		self.poll(Some(Duration::ZERO))?;
 		while !self.is_idle() {
 			self.poll(None)?;
@@ -120,7 +120,7 @@ impl Driver {
 	/// The teardown behind [`Reactor::shutdown`] and the driver's own drop; only
 	/// the first call does anything. It ends with the driver holding nothing, and
 	/// leaves every entry whose key is not yet released to resolve.
-	fn shutdown(&mut self, force: bool) -> Result<(), Error> {
+	fn shutdown(&mut self, force: bool) -> Result<()> {
 		if std::mem::replace(&mut self.stopped, true) {
 			return Ok(());
 		}
@@ -165,7 +165,7 @@ impl Drop for Driver {
 pub(crate) struct Reactor(Rc<RefCell<Driver>>);
 
 impl Reactor {
-	pub(crate) fn new(config: Config) -> Result<Self, Error> {
+	pub(crate) fn new(config: Config) -> Result<Self> {
 		Ok(Reactor(Rc::new(RefCell::new(Driver::new(config)?))))
 	}
 
@@ -175,13 +175,13 @@ impl Reactor {
 	}
 
 	/// Polls the backend and fires expired timers, waiting up to `timeout`.
-	pub(crate) fn drive(&self, timeout: Option<Duration>) -> Result<(), Error> {
+	pub(crate) fn drive(&self, timeout: Option<Duration>) -> Result<()> {
 		self.0.borrow_mut().wait(timeout)
 	}
 
 	/// Stops accepting new submissions and drives all in-flight operations to
 	/// completion (cancelling them first if `force` is true).
-	pub(crate) fn shutdown(&self, force: bool) -> Result<(), Error> {
+	pub(crate) fn shutdown(&self, force: bool) -> Result<()> {
 		self.0.borrow_mut().shutdown(force)
 	}
 
@@ -193,8 +193,11 @@ impl Reactor {
 
 	/// Submits `op` on `fd`, keeping `fd` and any referenced [`Buffer`](completion_backend::Buffer)
 	/// alive until the operation completes and its entry is removed.
-	pub(crate) fn submit(&self, fd: Arc<dyn AsDescriptor>, op: Op) -> Result<Key, Error> {
-		let buffer = op.buffer();
+	pub(crate) fn submit(&self, fd: Arc<dyn AsDescriptor>, op: Op) -> Result<Key> {
+		let buffer = op
+			.span()
+			.filter(|span| span.len() > 0)
+			.map(|span| span.buffer().clone());
 		let entry = Entry {
 			response: None,
 			waker: None,
@@ -219,7 +222,7 @@ impl Reactor {
 	}
 
 	/// Registers a timer expiring at `deadline`.
-	pub(crate) fn submit_timer(&self, deadline: Instant) -> Result<Key, Error> {
+	pub(crate) fn submit_timer(&self, deadline: Instant) -> Result<Key> {
 		let entry = Entry {
 			response: None,
 			waker: None,
@@ -240,7 +243,7 @@ impl Reactor {
 
 	/// Takes the completed result for `key` if ready, or registers `waker` and
 	/// returns `None`.
-	pub(crate) fn poll(&self, key: Key, waker: &Waker) -> Option<Result<Response, Error>> {
+	pub(crate) fn poll(&self, key: Key, waker: &Waker) -> Option<Result<Response>> {
 		let mut driver = self.0.borrow_mut();
 		// The id names the entry's own slot: one the driver let go of names
 		// nothing, not whatever operation took the slot afterwards.

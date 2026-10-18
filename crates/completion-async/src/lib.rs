@@ -47,8 +47,8 @@ mod timer;
 
 pub use completion::Cancel;
 pub use completion_backend::{
-	AsDescriptor, BorrowedDescriptor, Buffer, BufferPool, Config, Error, ErrorKind, Extent, IoVec,
-	Memory, OwnedDescriptor, OwnedSocket, Span, Status,
+	AsDescriptor, BackendKind, BorrowedDescriptor, Buffer, BufferPool, Config, Error, ErrorKind,
+	Memory, OwnedDescriptor, OwnedSocket, Result, Span, Status,
 };
 pub use executor::{Executor, Spawner, Task};
 pub use global::{block_on, spawn, try_spawn};

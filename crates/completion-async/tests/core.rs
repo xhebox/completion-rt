@@ -353,6 +353,136 @@ fn allocate_is_refused_on_an_iopoll_ring() {
 	}
 }
 
+/// The backend is chosen at runtime, by name: on Linux `portable` swaps the
+/// ring for `polling`'s readiness and `blocking`'s pool, so a regular file lands
+/// on the pool and a socket on the poller, as they do on the ring.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_portable_backend_serves_a_file_and_a_socket() {
+	use std::os::unix::net::UnixStream;
+
+	use completion_async::OpenOptions;
+
+	let mut executor = Executor::new(Config {
+		backend: "portable".parse().unwrap(),
+		..Config::default()
+	})
+	.unwrap();
+	let directory = common::tempdir("completion-portable").unwrap();
+	let path = directory.path().join("data");
+	std::fs::write(&path, [0xab; 8192]).unwrap();
+	let file = File::with_executor(
+		OpenOptions::new()
+			.read(true)
+			.write(true)
+			.open(&path)
+			.unwrap(),
+		&executor,
+	);
+
+	// A regular file has no readiness to wait on, so its transfers run on the pool.
+	let buf: Buffer = Buffer::zeroed(4);
+	let n = executor
+		.block_on(file.read_at(span(&buf), 0))
+		.unwrap()
+		.into_result()
+		.unwrap();
+	assert_eq!(n, 4);
+	assert_eq!(buf.to_vec(), [0xab; 4]);
+
+	// A punch is a pool job too, and it cuts the hole the ring cuts.
+	executor.block_on(file.punch(0, 4096)).unwrap().unwrap();
+	assert_eq!(std::fs::read(&path).unwrap()[..4096], [0u8; 4096][..]);
+
+	// A socket is a readiness source: the poller reports it, the call runs.
+	let (left, right) = UnixStream::pair().unwrap();
+	let left: Facade<UnixStream> = Facade::with_executor(left, &executor);
+	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
+	let payload: Buffer = Buffer::from_slice(b"portable");
+	assert_eq!(
+		executor
+			.block_on(left.send(span(&payload)))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		8
+	);
+	let received: Buffer = Buffer::zeroed(8);
+	assert_eq!(
+		executor
+			.block_on(right.recv(span(&received)))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		8
+	);
+	assert_eq!(received.to_vec(), b"portable");
+}
+
+/// An accept on the portable backend, on every target: the listener is a
+/// readiness source, the connection comes back as a facade, and the two ends
+/// are live both ways.
+#[test]
+fn the_portable_backend_accepts_a_connection() {
+	use std::io::{Read, Write};
+	use std::net::{TcpListener, TcpStream};
+
+	use completion_async::Facade;
+
+	let mut executor = Executor::new(Config {
+		backend: "portable".parse().unwrap(),
+		..Config::default()
+	})
+	.unwrap();
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	let address = listener.local_addr().unwrap();
+	listener.set_nonblocking(true).unwrap();
+	let listener: Facade<TcpListener> = Facade::with_executor(listener, &executor);
+	let mut client = TcpStream::connect(address).unwrap();
+	let stream: Facade<TcpStream> = executor
+		.block_on(listener.accept())
+		.unwrap()
+		.expect("the accept landed");
+
+	let payload: Buffer = Buffer::from_slice(b"hello");
+	assert_eq!(
+		executor
+			.block_on(stream.send(span(&payload)))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		5
+	);
+	let mut got = [0u8; 5];
+	client.read_exact(&mut got).unwrap();
+	assert_eq!(&got, b"hello");
+
+	client.write_all(b"world").unwrap();
+	let received: Buffer = Buffer::zeroed(5);
+	assert_eq!(
+		executor
+			.block_on(stream.recv(span(&received)))
+			.unwrap()
+			.into_result()
+			.unwrap(),
+		5
+	);
+	assert_eq!(received.to_vec(), b"world");
+
+	// The accepted socket is the backend's to run: a unix one carries the flags
+	// a watched descriptor needs, non-blocking and closed on exec.
+	#[cfg(unix)]
+	{
+		let socket = stream
+			.try_take()
+			.unwrap_or_else(|_| panic!("a settled operation still named the socket"));
+		let flags = rustix::fs::fcntl_getfl(&socket).unwrap();
+		assert!(flags.contains(rustix::fs::OFlags::NONBLOCK));
+		let descriptor = rustix::io::fcntl_getfd(&socket).unwrap();
+		assert!(descriptor.contains(rustix::io::FdFlags::CLOEXEC));
+	}
+}
+
 /// Dropping the executor stops the reactor it owns: a facade left over — every
 /// clone a caller kept is one — is refused from then on, so the caller has an
 /// error to act on instead of a completion nothing drives.

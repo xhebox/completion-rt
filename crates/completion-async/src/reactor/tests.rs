@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use completion_backend::{AsDescriptor, Buffer, Config, Error, ErrorKind, Response};
+use completion_backend::{AsDescriptor, Buffer, Config, ErrorKind, Response, Result};
 
 #[cfg(target_os = "linux")]
 use completion_backend::Status;
@@ -62,7 +62,7 @@ impl Scratch {
 }
 
 /// Drives the reactor until the completion lands, then takes its result.
-fn drive_to_result(reactor: &Reactor, mut completion: Completion) -> Result<Response, Error> {
+fn drive_to_result(reactor: &Reactor, mut completion: Completion) -> Result<Response> {
 	let mut cx = Context::from_waker(Waker::noop());
 	loop {
 		match completion.poll(&mut cx) {
@@ -150,13 +150,10 @@ fn a_landed_file_operation_does_not_wait_out_the_timeout() {
 	while !reactor.idle() {
 		reactor.drive(Some(Duration::from_secs(30))).unwrap();
 	}
-	assert_eq!(
-		drive_to_result(&reactor, completion)
-			.unwrap()
-			.count()
-			.unwrap(),
-		5
-	);
+	assert!(matches!(
+		drive_to_result(&reactor, completion),
+		Ok(Response::Count(5))
+	));
 	assert!(
 		started.elapsed() < Duration::from_secs(1),
 		"the poll slept on a completion it already had"
@@ -311,13 +308,10 @@ fn a_shutdown_lands_what_is_in_flight_and_refuses_new_work() {
 	// Shut down with the read still only submitted: the shutdown drives it to
 	// its end.
 	reactor.shutdown(false).unwrap();
-	assert_eq!(
-		drive_to_result(&reactor, completion)
-			.unwrap()
-			.count()
-			.unwrap(),
-		5
-	);
+	assert!(matches!(
+		drive_to_result(&reactor, completion),
+		Ok(Response::Count(5))
+	));
 	assert_eq!(buf.to_vec(), b"hello");
 	assert!(reactor.idle());
 
@@ -439,7 +433,7 @@ fn a_graceful_shutdown_lets_an_operation_land_on_its_own() {
 		Poll::Pending => panic!("the shutdown returned with the receive still out"),
 		Poll::Ready(None) => panic!("the receive reported a cancel"),
 	};
-	assert_eq!(result.unwrap().count().unwrap(), 4);
+	assert!(matches!(result, Ok(Response::Count(4))));
 	assert_eq!(&buf.to_vec()[..4], b"late");
 }
 
@@ -585,7 +579,7 @@ mod uring {
 		let response = ready
 			.expect("the receive landed")
 			.expect("the bytes are the operation's own result, cancel or not");
-		assert_eq!(response.count().unwrap(), 4);
+		assert!(matches!(response, Response::Count(4)));
 		assert_eq!(buf.to_vec(), b"wins", "the bytes the receive moved");
 	}
 }
@@ -933,7 +927,7 @@ mod hangup {
 		let scratch = tempdir("hangup-terminated");
 		let buf: Buffer = Buffer::zeroed(24);
 		let mut reads = Vec::new();
-		for index in 0..24u64 {
+		for index in 0..24usize {
 			let path = scratch.path().join(format!("data{index}"));
 			std::fs::write(&path, b"hello").unwrap();
 			let file = Arc::new(OpenOptions::new().read(true).open(&path).unwrap());

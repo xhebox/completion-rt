@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use completion_backend::{AsDescriptor, OwnedDescriptor, OwnedSocket, Response, Span};
 
-use crate::Error;
+use crate::Result;
 use crate::completion::Cancel;
 use crate::op::{Action, Facade, Gate, Kind, Op, Receive, Transfer};
 
@@ -42,9 +42,9 @@ impl<S> Accept<S> {
 }
 
 impl<S: ListenerHandle> Future for Accept<S> {
-	type Output = Result<Facade<S::Stream>, Error>;
+	type Output = Result<Facade<S::Stream>>;
 
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Facade<S::Stream>, Error>> {
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Facade<S::Stream>>> {
 		let this = self.get_mut();
 		assert!(!this.finished, "an accept is not polled after it resolved");
 		match this.gate.poll(cx) {

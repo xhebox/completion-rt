@@ -1,6 +1,6 @@
 # completion-rt
 
-Completion-model async I/O for Rust: io_uring on Linux, IOCP on Windows, and a readiness-based emulation (`polling`, with file I/O on `blocking`'s pool) on other unix.
+Completion-model async I/O for Rust: io_uring on Linux, IOCP on Windows, and a readiness-based emulation (`polling`, with file I/O on `blocking`'s pool) on every target — the default on unix other than Linux, and what `Config::backend` selects on Linux and Windows too, as `BackendKind::Portable` or the string `"portable"`.
 
 ```rust
 use completion_async::{Buffer, Cancel, Config, Executor, Facade};
@@ -23,7 +23,7 @@ assert_eq!(read.into_result()?, 5);
 
 ## Usage notes
 
-- On the portable backend, pass non-blocking descriptors for anything that is not a regular file: a blocking one stalls the reactor.
+- On the portable backend, pass non-blocking descriptors for anything that is not a regular file: a blocking one stalls the reactor. Windows polls sockets only; every other handle's calls run on the pool.
 - io_uring requires Linux 5.11 or later: every blocking wait passes `IORING_ENTER_EXT_ARG` for its timeout. A stream's `hangup` needs 5.13, for a multishot poll; on an older kernel it fails.
 - On io_uring, waits carry `IORING_ENTER_NO_IOWAIT` (Linux 6.15+), so an idle reactor is not counted as iowait; enable the `iowait` feature to leave the flag off.
 

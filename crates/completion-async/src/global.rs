@@ -13,7 +13,7 @@ use std::future::Future;
 
 use crate::reactor::Reactor;
 
-use crate::{Config, Error, Executor, Spawner, Task};
+use crate::{Config, Executor, Result, Spawner, Task};
 
 thread_local! {
 	static EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
@@ -43,7 +43,7 @@ fn handles<R>(f: impl FnOnce(&Spawner, &Reactor) -> R) -> R {
 /// # Panics
 /// Panics if called from inside another [`block_on`] on the same thread, or if
 /// the default executor could not be created.
-pub fn block_on<F: Future>(future: F) -> Result<F::Output, Error> {
+pub fn block_on<F: Future>(future: F) -> Result<F::Output> {
 	handles(|_, _| ());
 	EXECUTOR.with(|slot| {
 		let mut slot = slot
@@ -64,7 +64,7 @@ pub fn spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Task<T> {
 /// Spawns a thread-local task on the current thread's default [`Executor`], or
 /// returns [`ErrorKind::ExecutorClosed`](crate::ErrorKind::ExecutorClosed) if
 /// the thread's executor has been destroyed.
-pub fn try_spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Result<Task<T>, Error> {
+pub fn try_spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Result<Task<T>> {
 	handles(|spawner, _| spawner.try_spawn(future))
 }
 

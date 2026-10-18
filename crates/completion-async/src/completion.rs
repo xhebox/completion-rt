@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
-use completion_backend::{AsDescriptor, Error, ErrorKind, Op, Response};
+use completion_backend::{AsDescriptor, ErrorKind, Op, Response, Result};
 use slotmap::{DefaultKey, SlotMap};
 
 use crate::reactor::{Key, Reactor};
@@ -207,7 +207,7 @@ pub(crate) fn submit(
 	fd: Arc<dyn AsDescriptor>,
 	op: Op,
 	cancel: Option<&Cancel>,
-) -> Result<Completion, Error> {
+) -> Result<Completion> {
 	let key = reactor.submit(fd, op)?;
 	Ok(Completion::new(reactor.clone(), key, cancel))
 }
@@ -217,7 +217,7 @@ pub(crate) fn submit_timer(
 	reactor: &Reactor,
 	deadline: Instant,
 	cancel: Option<&Cancel>,
-) -> Result<Completion, Error> {
+) -> Result<Completion> {
 	let key = reactor.submit_timer(deadline)?;
 	Ok(Completion::new(reactor.clone(), key, cancel))
 }
@@ -251,7 +251,7 @@ impl Completion {
 		self.reactor.cancel(self.key);
 	}
 
-	pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Response, Error>>> {
+	pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Response>>> {
 		loop {
 			if let Some(response) = self.reactor.poll(self.key, cx.waker()) {
 				if self.requested

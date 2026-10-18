@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use completion_backend::Error;
+use completion_backend::{Error, Result};
 
 use crate::Executor;
 use crate::completion::{Cancel, Completion, submit_timer};
@@ -56,9 +56,9 @@ impl Timeout {
 }
 
 impl Future for Timeout {
-	type Output = Result<(), Error>;
+	type Output = Result<()>;
 
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
 		let this = self.get_mut();
 		assert!(!this.finished, "a timeout is not polled after it resolved");
 		loop {

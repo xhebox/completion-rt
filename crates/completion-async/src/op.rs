@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use completion_backend::{
-	AsDescriptor, Error, Op as LowOp, OwnedDescriptor, Response, Span, Status,
+	AsDescriptor, Error, Op as LowOp, OwnedDescriptor, Response, Result, Span, Status,
 };
 
 use crate::Executor;
@@ -75,10 +75,10 @@ impl<S> Facade<S> {
 	/// Wraps `resource` and binds it to `executor`.
 	///
 	/// # Platform notes
-	/// - **Windows**: Files must be opened with `FILE_FLAG_OVERLAPPED` (use
-	///   [`OpenOptions`](crate::OpenOptions)), or IOCP submissions will fail with
-	///   invalid-parameter errors.
-	/// - **Portable Unix** (non-Linux): Non-file descriptors (sockets, pipes, etc.)
+	/// - **Windows, IOCP**: Files must be opened with `FILE_FLAG_OVERLAPPED`
+	///   (use [`OpenOptions`](crate::OpenOptions)), or IOCP submissions will fail
+	///   with invalid-parameter errors; the portable backend takes either.
+	/// - **Portable backend, unix**: Non-file descriptors (sockets, pipes, etc.)
 	///   must be configured in non-blocking mode.
 	#[fastrace::trace]
 	pub fn with_executor(resource: impl Into<S>, executor: &Executor) -> Facade<S> {
@@ -135,17 +135,17 @@ pub struct Outcome<T> {
 	/// (e.g. number of bytes transferred or [`Received`]).
 	pub value: T,
 	/// `Ok(())` if the operation completed in full, or `Err` if it stopped early.
-	pub result: Result<(), Error>,
+	pub result: Result<()>,
 }
 
 impl<T> Outcome<T> {
-	pub(crate) fn new(value: T, result: Result<(), Error>) -> Outcome<T> {
+	pub(crate) fn new(value: T, result: Result<()>) -> Outcome<T> {
 		Self { value, result }
 	}
 
 	/// Converts the outcome into a standard `Result`, returning `self.value` on
 	/// `Ok` and discarding partial progress on `Err`.
-	pub fn into_result(self) -> Result<T, Error> {
+	pub fn into_result(self) -> Result<T> {
 		self.result.map(|()| self.value)
 	}
 }
@@ -270,7 +270,7 @@ impl Flow {
 		}
 	}
 
-	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
 		loop {
 			if self.call.is_none() {
 				if self.kind.mode() != Mode::Once && self.done >= self.span.len() {
@@ -308,7 +308,7 @@ impl Flow {
 		}
 	}
 
-	fn round(&mut self) -> Result<Completion, Error> {
+	fn round(&mut self) -> Result<Completion> {
 		let span = self.span.clone().skip(self.done);
 		let shift = self.done as u64;
 		let op = match self.kind {
@@ -340,11 +340,11 @@ impl Flow {
 		)
 	}
 
-	fn landed(&mut self, result: Result<Response, Error>) -> Result<bool, Error> {
-		let response = result?;
-		let (count, fds) = match response {
+	fn landed(&mut self, result: Result<Response>) -> Result<bool> {
+		let (count, fds) = match result? {
+			Response::Count(count) => (count, Vec::new()),
 			Response::CountWithFds(count, fds) => (count, fds),
-			other => (other.count()?, Vec::new()),
+			other => unreachable!("a transfer's round reports a count, not {other:?}"),
 		};
 		if let Control::In(gathered) = &mut self.control {
 			gathered.extend(fds);
@@ -391,7 +391,7 @@ impl Gate {
 		&self.reactor
 	}
 
-	pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Response, Error>> {
+	pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Response>> {
 		loop {
 			if self.call.is_none() {
 				if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
@@ -586,9 +586,9 @@ impl Op {
 }
 
 impl Future for Op {
-	type Output = Result<(), Error>;
+	type Output = Result<()>;
 
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
 		let this = self.get_mut();
 		assert!(
 			!this.finished,

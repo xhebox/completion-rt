@@ -89,7 +89,7 @@ fn a_hangup_survives_a_poll_the_kernel_ends_early() {
 	let scratch = common::tempdir("completion-hangup-ended").unwrap();
 	let buf: Buffer = Buffer::zeroed(24);
 	let mut reads = Vec::new();
-	for index in 0..24 {
+	for index in 0..24usize {
 		let path = scratch.path().join(format!("data{index}"));
 		std::fs::write(&path, b"hello").unwrap();
 		let file: File = Facade::with_executor(common::open(&path).unwrap(), &executor);

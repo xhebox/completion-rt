@@ -11,8 +11,9 @@ use crate::op::{Action, Facade, Kind, Op, Transfer};
 /// Builder for opening files with optional direct I/O (`O_DIRECT` / `F_NOCACHE` /
 /// `FILE_FLAG_NO_BUFFERING`).
 ///
-/// On Windows, [`OpenOptions::open`] always sets `FILE_FLAG_OVERLAPPED`, which is
-/// required before wrapping a [`std::fs::File`] in [`Facade`].
+/// On Windows, [`OpenOptions::open`] always sets `FILE_FLAG_OVERLAPPED`, which
+/// IOCP requires before wrapping a [`std::fs::File`] in [`Facade`]; the portable
+/// backend takes either mode.
 pub struct OpenOptions {
 	inner: std::fs::OpenOptions,
 	direct: bool,

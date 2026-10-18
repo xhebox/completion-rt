@@ -34,10 +34,10 @@ use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZE
 
 use super::Op;
 use crate::desc::{BorrowedDescriptor, OwnedSocket};
-use crate::error::Error;
-use crate::memory::{IoVec, Span};
+use crate::error::{Error, Result};
+use crate::memory::{Resolved, Span};
 
-use super::{Config, Response};
+use super::{Config, Driver, Response};
 
 /// How long a teardown waits for one round of completions before going on.
 const WAIT_MILLIS: u32 = 1000;
@@ -109,10 +109,6 @@ pub(crate) struct Iocp {
 	/// until it is closed, and a second `CreateIoCompletionPort` on it fails
 	/// with `ERROR_INVALID_PARAMETER`, so each handle is associated once.
 	associated: HashSet<usize>,
-	/// The iovec array an operation resolves through: a socket transfer names
-	/// every buffer from it, a read or write only its first, but every extent
-	/// has to resolve before submission.
-	scratch: Vec<IoVec>,
 }
 
 struct Active {
@@ -185,7 +181,6 @@ impl Iocp {
 			active: SlotMap::new(),
 			free_overlapped: Vec::new(),
 			associated: HashSet::new(),
-			scratch: Vec::new(),
 		})
 	}
 
@@ -365,24 +360,37 @@ impl Iocp {
 		Ok(())
 	}
 
-	fn issue(
-		&mut self,
-		id: u64,
-		fd: HANDLE,
-		read: bool,
-		span: &Span,
-		fdoff: u64,
-	) -> io::Result<()> {
+	fn issue(&mut self, id: u64, fd: HANDLE, read: bool, span: &Span, fdoff: u64) -> Result<()> {
 		self.associate(fd)?;
-		let (buf, len) = Self::first(span, &mut self.scratch)?;
+		// `ReadFile` and `WriteFile` transfer through one buffer, and their
+		// scatter forms want page-aligned unbuffered I/O: a gathered span moves
+		// short through its first extent, and a caller after all of it repeats
+		// the call. Every extent is still resolved, so one out of bounds refuses
+		// the submission.
+		let buf = span.resolve_first()?.unwrap_or(Resolved {
+			ptr: std::ptr::null_mut(),
+			len: 0,
+		});
 		let (key, ov_ptr) = self.enqueue(id, fd, fdoff, None, true);
 		// SAFETY: standard Win32 calls; `ov_ptr` names the box in `active`,
 		// alive until the completion is collected.
 		let ok = unsafe {
 			if read {
-				ReadFile(fd, buf.cast(), capped(len), std::ptr::null_mut(), ov_ptr)
+				ReadFile(
+					fd,
+					buf.ptr.cast(),
+					capped(buf.len),
+					std::ptr::null_mut(),
+					ov_ptr,
+				)
 			} else {
-				WriteFile(fd, buf.cast(), capped(len), std::ptr::null_mut(), ov_ptr)
+				WriteFile(
+					fd,
+					buf.ptr.cast(),
+					capped(buf.len),
+					std::ptr::null_mut(),
+					ov_ptr,
+				)
 			}
 		};
 		if ok == 0 {
@@ -394,20 +402,18 @@ impl Iocp {
 		Ok(())
 	}
 
-	fn transfer(&mut self, id: u64, socket: SOCKET, span: &Span, send: bool) -> io::Result<()> {
+	fn transfer(&mut self, id: u64, socket: SOCKET, span: &Span, send: bool) -> Result<()> {
 		self.associate(socket as HANDLE)?;
 		// The array only has to outlive the call: an overlapped `WSASend` or
 		// `WSARecv` copies it, and keeps only the buffers it names. Resolving
 		// first refuses an extent out of bounds before anything is queued.
-		span.resolve_into(&mut self.scratch)?;
-		let wsabufs: Vec<WSABUF> = self
-			.scratch
-			.iter()
-			.map(|buf| WSABUF {
-				len: capped(buf.len()),
-				buf: buf.as_ptr(),
-			})
-			.collect();
+		let mut wsabufs: Vec<WSABUF> = Vec::with_capacity(span.extents().len());
+		span.resolve_with(|buf| {
+			wsabufs.push(WSABUF {
+				len: capped(buf.len),
+				buf: buf.ptr,
+			});
+		})?;
 		let (key, ov_ptr) = self.enqueue(id, socket as HANDLE, 0, None, true);
 		let count = wsabufs.len() as u32;
 		let mut moved: u32 = 0;
@@ -438,26 +444,60 @@ impl Iocp {
 		Ok(())
 	}
 
-	/// The first of `span`: `ReadFile` and `WriteFile` take one, and their
-	/// scatter forms want page-aligned unbuffered I/O. A gathered span moves
-	/// short, and a caller after all of it repeats the call. Every extent is
-	/// still resolved, so one out of bounds refuses the submission.
-	fn first(span: &Span, scratch: &mut Vec<IoVec>) -> io::Result<(*mut u8, usize)> {
-		if let Some(buf) = span.resolve_single() {
-			let buf = buf?;
-			return Ok((buf.as_ptr(), buf.len()));
-		}
-		span.resolve_into(scratch)?;
-		let buf = scratch.first().expect("a span of more than one extent");
-		Ok((buf.as_ptr(), buf.len()))
-	}
-
 	fn unsupported() -> io::Error {
 		io::Error::new(
 			io::ErrorKind::Unsupported,
 			"this operation is not implemented on the IOCP backend",
 		)
 	}
+}
+
+/// Grows the file to the range's end, so the space it needs is reserved; the
+/// call has no overlapped form.
+///
+/// Setting the end of file shrinks as readily as it grows, and a reservation
+/// below the current length is what the range is already backed by; allocate
+/// only grows, so the current length floors both.
+fn allocate(handle: HANDLE, offset: u64, len: u64) -> i32 {
+	let end = offset.saturating_add(len);
+	// SAFETY: standard Win32 calls on handles the caller holds; both info
+	// structs outlive their calls.
+	let mut current = 0i64;
+	if unsafe { GetFileSizeEx(handle, &mut current) } == 0 {
+		return unsafe { GetLastError() as i32 };
+	}
+	let want = end.max(current.max(0) as u64);
+	let size = FILE_END_OF_FILE_INFO {
+		EndOfFile: want as i64,
+	};
+	if unsafe {
+		SetFileInformationByHandle(
+			handle,
+			FileEndOfFileInfo,
+			&size as *const _ as *const core::ffi::c_void,
+			size_of::<FILE_END_OF_FILE_INFO>() as u32,
+		)
+	} == 0
+	{
+		return unsafe { GetLastError() as i32 };
+	}
+	// How much is reserved, not where it is: the range's end is what has to be
+	// backed.
+	let reservation = FILE_ALLOCATION_INFO {
+		AllocationSize: want as i64,
+	};
+	if unsafe {
+		SetFileInformationByHandle(
+			handle,
+			FileAllocationInfo,
+			&reservation as *const _ as *const core::ffi::c_void,
+			size_of::<FILE_ALLOCATION_INFO>() as u32,
+		)
+	} == 0
+	{
+		return unsafe { GetLastError() as i32 };
+	}
+	0
 }
 
 /// The most bytes one Win32 call names: `ReadFile` and a `WSABUF` carry a
@@ -534,13 +574,8 @@ fn as_socket(fd: BorrowedDescriptor<'_>) -> io::Result<SOCKET> {
 	}
 }
 
-impl Iocp {
-	pub(super) fn submit(
-		&mut self,
-		id: u64,
-		fd: BorrowedDescriptor<'_>,
-		op: Op,
-	) -> Result<(), Error> {
+impl Driver for Iocp {
+	fn submit(&mut self, id: u64, fd: BorrowedDescriptor<'_>, op: Op) -> Result<()> {
 		match op {
 			Op::Read { offset, span } => self.issue(id, as_handle(fd)?, true, &span, offset)?,
 			Op::Write { offset, span } => self.issue(id, as_handle(fd)?, false, &span, offset)?,
@@ -581,7 +616,7 @@ impl Iocp {
 		Ok(())
 	}
 
-	pub(super) fn cancel(&mut self, id: u64) {
+	fn cancel(&mut self, id: u64) {
 		let Some(active) = self.active.values().find(|active| active.id == id) else {
 			return;
 		};
@@ -591,11 +626,11 @@ impl Iocp {
 		unsafe { CancelIoEx(active.ov.handle, pointer) };
 	}
 
-	pub(super) fn poll(
+	fn poll(
 		&mut self,
 		timeout: Option<Duration>,
-		mut complete: impl FnMut(u64, Result<Response, Error>),
-	) -> Result<(), Error> {
+		mut complete: impl FnMut(u64, Result<Response>),
+	) -> Result<()> {
 		let timeout_ms = match timeout {
 			None => u32::MAX,
 			Some(duration) => duration.as_millis().min(u32::MAX as u128 - 1) as u32,
@@ -673,7 +708,7 @@ impl Iocp {
 		Ok(())
 	}
 
-	pub(super) fn waker(&self) -> Waker {
+	fn waker(&self) -> Waker {
 		Waker::from(Arc::clone(&self.port))
 	}
 }
@@ -720,54 +755,6 @@ impl Drop for Iocp {
 			}
 		}
 	}
-}
-
-/// Grows the file to the range's end, so the space it needs is reserved; the
-/// call has no overlapped form and runs on the reactor thread.
-fn allocate(handle: HANDLE, offset: u64, len: u64) -> i32 {
-	let end = offset.saturating_add(len);
-	// SAFETY: standard Win32 calls on handles the facade owns; both info
-	// structs outlive their calls.
-	//
-	// Setting the end of file shrinks as readily as it grows, and a reservation
-	// below the current length is what the range is already backed by;
-	// allocate only grows, so the current length floors both.
-	let mut current = 0i64;
-	if unsafe { GetFileSizeEx(handle, &mut current) } == 0 {
-		return unsafe { GetLastError() } as i32;
-	}
-	let want = end.max(current.max(0) as u64);
-	let size = FILE_END_OF_FILE_INFO {
-		EndOfFile: want as i64,
-	};
-	if unsafe {
-		SetFileInformationByHandle(
-			handle,
-			FileEndOfFileInfo,
-			&size as *const _ as *const core::ffi::c_void,
-			size_of::<FILE_END_OF_FILE_INFO>() as u32,
-		)
-	} == 0
-	{
-		return unsafe { GetLastError() } as i32;
-	}
-	// How much is reserved, not where it is: the range's end is what has to be
-	// backed.
-	let reservation = FILE_ALLOCATION_INFO {
-		AllocationSize: want as i64,
-	};
-	if unsafe {
-		SetFileInformationByHandle(
-			handle,
-			FileAllocationInfo,
-			&reservation as *const _ as *const core::ffi::c_void,
-			size_of::<FILE_ALLOCATION_INFO>() as u32,
-		)
-	} == 0
-	{
-		return unsafe { GetLastError() } as i32;
-	}
-	0
 }
 
 /// A failed completion; the abort `CancelIoEx` causes is the cancel.

@@ -14,7 +14,7 @@ use std::sync::{Arc, Once};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 
-use completion_async::{Buffer, Extent, IoVec, Memory};
+use completion_async::{Buffer, Error, Memory, Result};
 
 /// Runs a future to completion on this thread, woken by whoever completes it.
 ///
@@ -190,18 +190,19 @@ impl Drop for TrackedMemory {
 	}
 }
 
-// SAFETY: the bytes are owned outright and only reached through `iovec`, which
-// checks every extent against them.
+// SAFETY: the bytes are owned outright and only reached through `resolve`,
+// which checks every extent against them.
 unsafe impl Memory for TrackedMemory {
-	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
-		let start = usize::try_from(extent.offset)
-			.map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-		let end = start
-			.checked_add(extent.len)
-			.filter(|&end| end <= self.bytes.len())
-			.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-		// SAFETY: `start..end` is inside the vector, which the buffer keeps alive.
-		Ok(unsafe { IoVec::new(self.bytes.as_ptr().add(start).cast_mut(), end - start) })
+	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
+		let fits = offset
+			.checked_add(len)
+			.is_some_and(|end| end <= self.bytes.len());
+		if !fits {
+			return Err(Error::from(io::Error::from(io::ErrorKind::InvalidInput)));
+		}
+		// SAFETY: `offset..offset + len` is inside the vector, which the buffer
+		// keeps alive.
+		Ok(unsafe { self.bytes.as_ptr().add(offset).cast_mut() })
 	}
 
 	fn len(&self) -> usize {

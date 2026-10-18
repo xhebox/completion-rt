@@ -6,46 +6,38 @@ mod common;
 use std::io;
 use std::sync::Arc;
 
-use completion_backend::{Buffer, BufferPool, Extent, IoVec, Memory};
-
-fn extents(ranges: &[(u64, usize)]) -> Vec<Extent> {
-	ranges
-		.iter()
-		.map(|&(offset, len)| Extent { offset, len })
-		.collect()
-}
+use completion_backend::{Buffer, BufferPool, Error, Memory, Result};
 
 #[test]
 fn a_span_names_the_extents_it_was_taken_with() {
 	let buffer = Buffer::zeroed(8);
-	let span = buffer.gather([Extent { offset: 0, len: 2 }, Extent { offset: 4, len: 3 }]);
+	let span = buffer.gather([(0, 2), (4, 3)]);
 
 	assert_eq!(span.buffer().len(), 8);
-	assert_eq!(span.extents(), &extents(&[(0, 2), (4, 3)]));
+	assert_eq!(span.extents(), &[(0, 2), (4, 3)]);
 	assert_eq!(span.len(), 5);
 }
 
 #[test]
 fn skip_and_take_cut_the_extents_in_order() {
 	let buffer = Buffer::zeroed(8);
-	let span = buffer.gather([Extent { offset: 0, len: 2 }, Extent { offset: 4, len: 3 }]);
+	let span = buffer.gather([(0, 2), (4, 3)]);
 
-	assert_eq!(span.clone().skip(3).extents(), &extents(&[(5, 2)]));
-	assert_eq!(span.take(4).extents(), &extents(&[(0, 2), (4, 2)]));
+	assert_eq!(span.clone().skip(3).extents(), &[(5, 2)]);
+	assert_eq!(span.take(4).extents(), &[(0, 2), (4, 2)]);
 }
 
 #[test]
 fn whole_covers_the_buffer_as_one_extent() {
 	let buffer = Buffer::zeroed(8);
 
-	assert_eq!(buffer.whole().extents(), &extents(&[(0, 8)]));
+	assert_eq!(buffer.whole().extents(), &[(0, 8)]);
 }
 
 #[test]
 fn a_buffer_copies_bytes_in_and_out_of_its_range() {
 	let buffer = Buffer::zeroed(8);
 	assert_eq!(buffer.len(), 8);
-	assert!(!buffer.is_empty());
 
 	buffer.copy_from(2, b"abc");
 	buffer.write(5, b"xyz");
@@ -55,7 +47,7 @@ fn a_buffer_copies_bytes_in_and_out_of_its_range() {
 	assert_eq!(buffer.to_vec(), b"\0\0abcxyz");
 	assert_eq!(buffer.slice_to_vec(2..5), b"abc");
 
-	assert!(Buffer::zeroed(0).is_empty());
+	assert_eq!(Buffer::zeroed(0).len(), 0);
 }
 
 #[test]
@@ -67,7 +59,7 @@ fn a_buffer_refuses_a_range_past_its_end() {
 #[test]
 fn a_span_copies_bytes_relative_to_itself() {
 	let buffer = Buffer::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
-	let span = buffer.gather([(0u64, 2usize), (4, 3)]);
+	let span = buffer.gather([(0, 2), (4, 3)]);
 	assert_eq!(span.to_vec(), [0, 1, 4, 5, 6]);
 
 	// The offset runs across the extents, not within one of them.
@@ -94,15 +86,16 @@ struct Custom(Vec<u8>);
 // SAFETY: the bytes outlive the memory, and an extent that does not fit them
 // is refused.
 unsafe impl Memory for Custom {
-	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
-		let start = usize::try_from(extent.offset)
-			.map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-		let end = start
-			.checked_add(extent.len)
-			.filter(|&end| end <= self.0.len())
-			.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-		// SAFETY: `start..end` is inside the vector, which the buffer keeps alive.
-		Ok(unsafe { IoVec::new(self.0.as_ptr().add(start).cast_mut(), end - start) })
+	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
+		let fits = offset
+			.checked_add(len)
+			.is_some_and(|end| end <= self.0.len());
+		if !fits {
+			return Err(Error::from(io::Error::from(io::ErrorKind::InvalidInput)));
+		}
+		// SAFETY: `offset..offset + len` is inside the vector, which the buffer
+		// keeps alive.
+		Ok(unsafe { self.0.as_ptr().add(offset).cast_mut() })
 	}
 
 	fn len(&self) -> usize {
@@ -138,43 +131,16 @@ fn a_pooled_buffer_backs_a_span_like_any_other() {
 fn a_buffer_is_a_memory() {
 	let memory: Arc<dyn Memory> = Arc::new(Buffer::from_slice(b"hello"));
 	assert_eq!(memory.len(), 5);
-	assert!(!memory.is_empty());
 
-	let iovec = memory.iovec(Extent { offset: 1, len: 3 }).unwrap();
-	assert_eq!(iovec.len(), 3);
+	let ptr = memory.resolve(1, 3).unwrap();
 	let mut out = [0u8; 3];
-	// SAFETY: `iovec` resolved inside `memory`, which stays alive for this copy.
-	unsafe { std::ptr::copy_nonoverlapping(iovec.as_ptr(), out.as_mut_ptr(), out.len()) };
+	// SAFETY: `resolve` handed out memory inside `memory`, which stays alive for
+	// this copy.
+	unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len()) };
 	assert_eq!(&out, b"ell");
 
 	assert_eq!(
-		memory
-			.iovec(Extent { offset: 4, len: 2 })
-			.unwrap_err()
-			.kind(),
+		io::Error::from(memory.resolve(4, 2).unwrap_err()).kind(),
 		io::ErrorKind::InvalidInput
 	);
-}
-
-/// A resolved [`IoVec`] names one contiguous range, so its bytes are a slice
-/// once nothing is moving them: that is how a caller puts bytes into a buffer
-/// or takes them out of one after a transfer lands, rather than through a copy
-/// helper on every type that can hold memory.
-#[test]
-fn an_iovec_hands_out_the_bytes_it_names() {
-	let buffer = Buffer::from_slice(b"hello");
-	let memory: Arc<dyn Memory> = Arc::new(buffer.clone());
-
-	let iovec = memory.iovec(Extent { offset: 1, len: 3 }).unwrap();
-	// SAFETY: no operation names this memory, and the buffer outlives both
-	// slices taken from the range.
-	assert_eq!(unsafe { iovec.as_slice() }, b"ell");
-	// SAFETY: as above, and the write side is nobody else's either.
-	unsafe { iovec.as_mut_slice() }.copy_from_slice(b"ELL");
-	assert_eq!(buffer.to_vec(), b"hELLo");
-
-	// A range of no bytes is a slice of no bytes, not a dangling one.
-	let empty = memory.iovec(Extent { offset: 5, len: 0 }).unwrap();
-	// SAFETY: a zero-length range names no bytes.
-	assert!(unsafe { empty.as_slice() }.is_empty());
 }

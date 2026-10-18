@@ -7,8 +7,8 @@ use std::io;
 use std::sync::Arc;
 
 use completion_async::{
-	Buffer, BufferPool, Config, ErrorKind, Executor, Extent, Facade, File, IoVec, Memory,
-	OpenOptions,
+	Buffer, BufferPool, Config, Error, ErrorKind, Executor, Facade, File, Memory, OpenOptions,
+	Result,
 };
 
 /// The async driver the file operations run on: it owns the reactor, so
@@ -160,17 +160,18 @@ fn a_pooled_buffer_moves_bytes_through_a_file_and_returns_to_the_pool() {
 struct Custom(Vec<u8>);
 
 // SAFETY: the bytes outlive the memory and only reach the kernel through
-// `iovec`, which refuses an extent that does not fit them.
+// `resolve`, which refuses an extent that does not fit them.
 unsafe impl Memory for Custom {
-	fn iovec(&self, extent: Extent) -> io::Result<IoVec> {
-		let start = usize::try_from(extent.offset)
-			.map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-		let end = start
-			.checked_add(extent.len)
-			.filter(|&end| end <= self.0.len())
-			.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-		// SAFETY: `start..end` is inside the vector, which the buffer keeps alive.
-		Ok(unsafe { IoVec::new(self.0.as_ptr().add(start).cast_mut(), end - start) })
+	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
+		let fits = offset
+			.checked_add(len)
+			.is_some_and(|end| end <= self.0.len());
+		if !fits {
+			return Err(Error::from(io::Error::from(io::ErrorKind::InvalidInput)));
+		}
+		// SAFETY: `offset..offset + len` is inside the vector, which the buffer
+		// keeps alive.
+		Ok(unsafe { self.0.as_ptr().add(offset).cast_mut() })
 	}
 
 	fn len(&self) -> usize {

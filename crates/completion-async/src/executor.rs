@@ -16,8 +16,8 @@ use slotmap::{DefaultKey, SlotMap};
 
 use completion_backend::Config;
 
-use crate::Error;
 use crate::reactor::Reactor;
+use crate::{Error, Result};
 
 const TICK_BUDGET: usize = 64;
 
@@ -33,7 +33,7 @@ impl Spawner {
 	pub fn try_spawn<T: 'static>(
 		&self,
 		future: impl Future<Output = T> + 'static,
-	) -> Result<Task<T>, Error> {
+	) -> Result<Task<T>> {
 		let Some(local) = self.local.upgrade() else {
 			return Err(Error::executor_closed());
 		};
@@ -403,18 +403,18 @@ pub struct Executor {
 impl Executor {
 	/// Creates a new executor and initializes its underlying I/O backend with `config`.
 	#[fastrace::trace]
-	pub fn new(config: Config) -> Result<Executor, Error> {
+	pub fn new(config: Config) -> Result<Executor> {
 		let reactor = Reactor::new(config)?;
 		let local = Rc::new(Local::new(reactor.waker()));
 		Ok(Executor { reactor, local })
 	}
 
 	/// Drives `fut` and any spawned tasks on the current thread until `fut` completes.
-	pub fn block_on<F: Future>(&mut self, fut: F) -> Result<F::Output, Error> {
+	pub fn block_on<F: Future>(&mut self, fut: F) -> Result<F::Output> {
 		Executor::run(&self.reactor, &self.local, fut)
 	}
 
-	fn run<F: Future>(reactor: &Reactor, local: &Local, fut: F) -> Result<F::Output, Error> {
+	fn run<F: Future>(reactor: &Reactor, local: &Local, fut: F) -> Result<F::Output> {
 		let mut fut = std::pin::pin!(fut);
 		let mut cx = Context::from_waker(local.root());
 		loop {
@@ -467,7 +467,7 @@ impl Executor {
 	pub fn try_spawn<T: 'static>(
 		&self,
 		future: impl Future<Output = T> + 'static,
-	) -> Result<Task<T>, Error> {
+	) -> Result<Task<T>> {
 		self.spawner().try_spawn(future)
 	}
 

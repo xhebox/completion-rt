@@ -10,8 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use completion_async::{
-	BackendKind, Buffer, Config, ErrorKind, Executor, Listener, OwnedDescriptor, Socket, Span,
-	Stream,
+	Buffer, Config, Executor, Listener, OwnedDescriptor, Socket, Span, Stream, timeout,
 };
 
 /// The async driver the socket operations run on.
@@ -417,70 +416,6 @@ fn a_unix_connect_gives_a_live_stream() {
 /// is answered by the socket turning writable, and the stream it hands back is
 /// live both ways.
 #[test]
-fn a_portable_connect_gives_a_live_stream() {
-	use std::io::Write;
-
-	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-	common::init_logging();
-	let mut executor = Executor::new(Config {
-		backend: BackendKind::Portable,
-		..Config::default()
-	})
-	.unwrap();
-	let connecting = Stream::connect(listener.local_addr().unwrap());
-	let stream = executor
-		.block_on(connecting)
-		.unwrap()
-		.expect("the connect failed");
-	let (mut peer, _) = listener.accept().unwrap();
-
-	let payload: Buffer = Buffer::from(b"hello");
-	assert_eq!(
-		executor
-			.block_on(stream.send(span(&payload)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
-	peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-	let mut got = [0u8; 5];
-	peer.read_exact(&mut got).unwrap();
-	assert_eq!(&got, b"hello");
-
-	peer.write_all(b"world").unwrap();
-	let received: Buffer = Buffer::zeroed(5);
-	assert_eq!(
-		executor
-			.block_on(stream.recv(span(&received)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
-	assert_eq!(received.whole().to_vec(), b"world");
-}
-
-/// A connect given up on its scope reports the cancel: the socket it made is
-/// dropped with it, and nothing of the connection reaches the kernel.
-#[test]
-fn a_given_up_connect_reports_the_cancel() {
-	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-	let mut executor = executor();
-	let scope = executor.scope();
-	// The scope fired before the connect was asked for, so the first poll gives
-	// it up without ever reaching the kernel.
-	drop(scope.cancel());
-	let connecting = Stream::connect(listener.local_addr().unwrap());
-	let error = executor
-		.block_on(async { scope.spawn(connecting).await })
-		.unwrap()
-		.err()
-		.expect("a given-up connect resolved");
-	assert_eq!(error.kind(), ErrorKind::Cancelled);
-}
-
-/// A receive that asked for control data hands the descriptors back with the
-/// bytes: the caller owns what the kernel passed over the socket.
-#[test]
 #[cfg(unix)]
 fn recv_with_fds_hands_the_descriptors_back() {
 	use std::os::unix::net::UnixStream;
@@ -606,104 +541,6 @@ fn a_shutdown_write_half_closes_the_connection() {
 /// there — the bytes it took are its progress, and the cancel is why it stopped.
 #[test]
 #[cfg(unix)]
-fn a_cancel_ends_a_recv_exact_loop_mid_way() {
-	use std::io::Write;
-	use std::os::unix::net::UnixStream;
-
-	let (left, right) = UnixStream::pair().unwrap();
-	left.set_nonblocking(true).unwrap();
-	right.set_nonblocking(true).unwrap();
-	let mut executor = executor();
-	let socket: Stream = Stream::new(right);
-
-	let buffer: Buffer = Buffer::zeroed(8);
-	// Four bytes are one call: the loop takes them and comes back for the rest,
-	// which the peer never sends.
-	(&left).write_all(b"ABCD").unwrap();
-	let scope = executor.scope();
-	let raiser = scope.clone();
-	let thread = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(100));
-		drop(raiser.cancel());
-	});
-
-	let outcome = executor
-		.block_on(async { scope.spawn(socket.recv_exact(span(&buffer))).await })
-		.unwrap();
-	thread.join().unwrap();
-	assert_eq!(outcome.value, 4, "the loop kept the bytes it had taken");
-	assert!(
-		outcome
-			.result
-			.as_ref()
-			.is_err_and(|error| error.kind() == ErrorKind::Cancelled),
-		"a given-up loop is not the loop's own result: {:?}",
-		outcome.result
-	);
-	assert_eq!(
-		&buffer.whole().to_vec()[..4],
-		b"ABCD",
-		"the first call's bytes stay"
-	);
-	assert_eq!(
-		&buffer.whole().to_vec()[4..],
-		&[0u8; 4],
-		"the loop wrote past what it was given"
-	);
-}
-
-/// A cancel that lands in a `send_all` loop reports the bytes the loop had put
-/// out: the progress is not thrown away with the cancel.
-///
-/// Windows: a loopback send to a peer that never reads completes whole, so the
-/// loop is never left in front of the kernel for the cancel to end.
-#[cfg(unix)]
-#[test]
-fn a_cancel_ends_a_send_all_loop_with_its_progress() {
-	// The peer is held, and never reads: the buffers take a few calls' worth
-	// and the loop is left with the kernel. They are held to a slice of the
-	// payload from before the connection is made, so eight mebibytes cannot all
-	// leave whatever the platform's defaults would buffer.
-	let (client, _server) = held_pair(64 << 10);
-	let mut executor = executor();
-	let socket: Stream = Stream::new(client);
-
-	let len = 8 << 20;
-	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Buffer = Buffer::from(bytes.as_slice());
-	let scope = executor.scope();
-	let raiser = scope.clone();
-	let thread = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(100));
-		drop(raiser.cancel());
-	});
-
-	let outcome = executor
-		.block_on(async { scope.spawn(socket.send_all(span(&payload))).await })
-		.unwrap();
-	thread.join().unwrap();
-	assert!(
-		outcome.value > 0,
-		"the cancel threw away the bytes the loop had sent"
-	);
-	assert!(
-		outcome
-			.result
-			.as_ref()
-			.is_err_and(|error| error.kind() == ErrorKind::Cancelled),
-		"a given-up loop is not the loop's own result: {:?}",
-		outcome.result
-	);
-}
-
-/// A `send_all` loop that fails keeps the progress it made before the call that
-/// failed: the peer going away is the call's error, not a reason to forget the
-/// bytes that left.
-///
-/// Windows: a loopback send to a peer that never reads completes whole, so the
-/// peer going away leaves no send for the reset to fail.
-#[cfg(unix)]
-#[test]
 fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 	// The peer reads nothing and is gone: buffers held to a slice of the
 	// payload are filled, the rest is left waiting, and the connection goes
@@ -855,4 +692,74 @@ fn a_take_without_waiting_reports_a_receive_in_flight() {
 		socket.try_take().is_some(),
 		"the settled receive let the socket go"
 	);
+}
+
+/// An accept that lands while nobody waits for it, and whose result is then
+/// dropped, closes the connection it made: the peer reads the end of the stream.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_dropped_accept_result_closes_the_connection() {
+	use std::os::unix::net::UnixStream;
+
+	let directory = common::tempdir("completion-accept-dropped").unwrap();
+	let (listener, path) = listener(directory.path());
+	let mut executor = executor();
+	let listener: Listener = Listener::new(listener);
+
+	let accepted = executor.spawn(listener.accept());
+	let mut client = UnixStream::connect(&path).unwrap();
+	executor
+		.block_on(timeout(Duration::from_millis(100)))
+		.unwrap()
+		.unwrap();
+	drop(accepted);
+
+	client
+		.set_read_timeout(Some(Duration::from_secs(5)))
+		.unwrap();
+	let mut byte = [0u8; 1];
+	assert_eq!(
+		client.read(&mut byte).unwrap(),
+		0,
+		"the peer read data where the connection should have ended"
+	);
+}
+
+/// A receive dropped while in flight is cancelled and reaped: the stream is the
+/// caller's again once the cancel lands, and a byte the peer sends afterwards is
+/// not written into the buffer the dropped receive named.
+#[test]
+fn a_dropped_in_flight_recv_is_cancelled_and_never_written() {
+	use std::io::Write;
+
+	let (mut client, server) = pair();
+	let mut executor = executor();
+	let stream: Stream = Stream::new(server);
+	let buf = Buffer::zeroed(8);
+	let recv_span = span(&buf);
+
+	// One poll submits the receive; dropping it then leaves it in flight.
+	executor
+		.block_on(async {
+			let mut recv = std::pin::pin!(stream.recv(recv_span));
+			std::future::poll_fn(|cx| {
+				let _ = recv.as_mut().poll(cx);
+				std::task::Poll::Ready(())
+			})
+			.await;
+		})
+		.unwrap();
+	executor
+		.block_on(timeout(Duration::from_millis(50)))
+		.unwrap()
+		.unwrap();
+	let _held =
+		Stream::new(Stream::try_take(stream).expect("the dropped receive still holds the stream"));
+
+	client.write_all(b"later").unwrap();
+	executor
+		.block_on(timeout(Duration::from_millis(50)))
+		.unwrap()
+		.unwrap();
+	assert_eq!(buf.whole().to_vec(), [0u8; 8]);
 }

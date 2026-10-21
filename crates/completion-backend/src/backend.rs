@@ -158,15 +158,6 @@ pub enum BackendKind {
 	Iocp,
 }
 
-#[enum_dispatch(Driver<T>)]
-enum BackendImpl<T> {
-	Portable(portable::Portable<T>),
-	#[cfg(target_os = "linux")]
-	Uring(uring::Uring<T>),
-	#[cfg(windows)]
-	Iocp(iocp::Iocp<T>),
-}
-
 /// Platform completion driver.
 ///
 /// Once [`Backend::submit`] returns `Ok(id)`, the caller must keep the
@@ -174,7 +165,14 @@ enum BackendImpl<T> {
 /// alive until [`Backend::poll`] yields a completion for `id`. Operation IDs
 /// carry a generation, so cancelling an ID whose operation already completed is
 /// a no-op.
-pub struct Backend<T = ()>(BackendImpl<T>);
+#[enum_dispatch(Driver<T>)]
+pub enum Backend<T = ()> {
+	Portable(portable::Portable<T>),
+	#[cfg(target_os = "linux")]
+	Uring(uring::Uring<T>),
+	#[cfg(windows)]
+	Iocp(iocp::Iocp<T>),
+}
 
 impl<T> Backend<T> {
 	/// Creates a new completion backend with `config`.
@@ -186,17 +184,17 @@ impl<T> Backend<T> {
 			#[cfg(windows)]
 			BackendKind::Iocp => iocp::Iocp::new(config)?.into(),
 		};
-		Ok(Backend(backend))
+		Ok(backend)
 	}
 
 	/// Returns the completion mechanism this backend runs on.
 	pub fn kind(&self) -> BackendKind {
-		match &self.0 {
-			BackendImpl::Portable(_) => BackendKind::Portable,
+		match self {
+			Backend::Portable(_) => BackendKind::Portable,
 			#[cfg(target_os = "linux")]
-			BackendImpl::Uring(_) => BackendKind::Uring,
+			Backend::Uring(_) => BackendKind::Uring,
 			#[cfg(windows)]
-			BackendImpl::Iocp(_) => BackendKind::Iocp,
+			Backend::Iocp(_) => BackendKind::Iocp,
 		}
 	}
 
@@ -207,7 +205,7 @@ impl<T> Backend<T> {
 	/// bounds. If this returns `Err`, the operation was not queued and no
 	/// completion will be produced for it.
 	pub fn submit(&mut self, fd: BorrowedDescriptor<'_>, op: Op, data: T) -> Result<u64> {
-		self.0.submit(fd, op, data)
+		Driver::submit(self, fd, op, data)
 	}
 
 	/// Requests asynchronous cancellation of the in-flight operation `id`.
@@ -215,7 +213,7 @@ impl<T> Backend<T> {
 	/// The operation's final result (cancelled or completed) is still delivered
 	/// by [`Backend::poll`].
 	pub fn cancel(&mut self, id: u64) {
-		self.0.cancel(id)
+		Driver::cancel(self, id)
 	}
 
 	/// Requests cancellation of every operation currently in flight.
@@ -223,13 +221,13 @@ impl<T> Backend<T> {
 	/// As with [`Backend::cancel`], each operation's final result is still
 	/// delivered by [`Backend::poll`].
 	pub fn cancel_all(&mut self) {
-		self.0.cancel_all()
+		Driver::cancel_all(self)
 	}
 
 	/// Returns `true` if no operation is in flight and no completion is waiting
 	/// to be handed over.
 	pub fn is_idle(&self) -> bool {
-		self.0.is_idle()
+		Driver::is_idle(self)
 	}
 
 	/// Polls for completed operations, waiting up to `timeout` if none are ready
@@ -240,11 +238,11 @@ impl<T> Backend<T> {
 		timeout: Option<Duration>,
 		complete: impl FnMut(u64, T, Result<Response>),
 	) -> Result<()> {
-		self.0.poll(timeout, complete)
+		Driver::poll(self, timeout, complete)
 	}
 
 	/// Returns a thread-safe [`Waker`] that wakes a blocking [`Backend::poll`].
 	pub fn waker(&self) -> Waker {
-		self.0.waker()
+		Driver::waker(self)
 	}
 }

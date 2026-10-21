@@ -1,31 +1,155 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
-
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak as SyncWeak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak as SyncWeak};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slotmap::{DefaultKey, SlotMap};
+use smallvec::SmallVec;
 
-use completion_backend::Config;
-
-use crate::Result;
-use crate::cancel::Scope;
-use crate::global;
-use crate::reactor::{self, Driver};
+use completion_backend::{AsDescriptor, Backend, Buffer, Config, Error, Op, Response, Result};
 
 const TICK_BUDGET: usize = 64;
 
+// ---------------------------------------------------------------------------
+// Thread-local state
+// ---------------------------------------------------------------------------
+
+thread_local! {
+	static RT: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+}
+
+/// The combined I/O driver and task scheduler for one thread.
+struct Runtime {
+	backend: Backend<Arc<Entry>>,
+	shared: Arc<Shared>,
+	tasks: SlotMap<DefaultKey, Option<Box<dyn Runnable>>>,
+	ready: Arc<Ready>,
+	running: bool,
+}
+
+impl Runtime {
+	fn new(config: Config) -> Result<Runtime> {
+		let backend = Backend::new(&config)?;
+		let driver_waker = backend.waker();
+		let shared = Arc::new(Shared {
+			inner: Mutex::new(SharedInner {
+				stopped: false,
+				cancellations: Vec::new(),
+				timers: BTreeMap::new(),
+				next_timer: 0,
+				waker: driver_waker.clone(),
+			}),
+		});
+		let ready = Arc::new(Ready {
+			runnable: Mutex::new(VecDeque::new()),
+			driver_waker,
+			parked: AtomicBool::new(false),
+			root_woken: AtomicBool::new(true),
+		});
+		Ok(Runtime {
+			backend,
+			shared,
+			tasks: SlotMap::new(),
+			ready,
+			running: false,
+		})
+	}
+
+	fn drive(&mut self, timeout: Option<Duration>) -> Result<()> {
+		for id in self.shared.take_cancellations() {
+			self.backend.cancel(id);
+		}
+		let within = self.shared.within(timeout);
+		let polled = self.backend.poll(within, |_id, entry, response| {
+			entry.complete(response);
+		});
+		self.shared.expire_timers();
+		polled
+	}
+
+	fn submit(&mut self, fd: Arc<dyn AsDescriptor>, op: Op) -> Slot {
+		let buffer = op
+			.span()
+			.filter(|span| span.len() > 0)
+			.map(|span| span.buffer().clone());
+		let entry = Arc::new(Entry::pending(Some(Arc::clone(&fd)), buffer));
+		if self.shared.is_stopped() {
+			return Slot::refused(Error::stopped());
+		}
+		match self
+			.backend
+			.submit(fd.as_descriptor(), op, Arc::clone(&entry))
+		{
+			Ok(id) => Slot::new(Arc::clone(&self.shared), Key::Op(id), entry),
+			Err(error) => Slot::refused(error),
+		}
+	}
+
+	fn submit_timer(&self, deadline: Instant) -> Slot {
+		match self.shared.add_timer(deadline) {
+			Some((key, entry)) => Slot::new(Arc::clone(&self.shared), key, entry),
+			None => Slot::refused(Error::stopped()),
+		}
+	}
+}
+
+impl Drop for Runtime {
+	fn drop(&mut self) {
+		for job in self.tasks.values_mut().filter_map(Option::as_mut) {
+			job.abandon();
+		}
+		if let Some(timers) = self.shared.stop() {
+			for timer in timers.into_values() {
+				timer.complete(Err(Error::cancelled()));
+			}
+			self.backend.cancel_all();
+			while !self.backend.is_idle() {
+				if self.drive(None).is_err() {
+					break;
+				}
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Short-lived borrows into the thread-local Runtime
+// ---------------------------------------------------------------------------
+
+/// Borrows `RT` briefly to run `f`. Panics if no runtime is installed.
+fn with_rt<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
+	RT.with(|cell| {
+		let mut borrow = cell.borrow_mut();
+		let rt = borrow
+			.as_mut()
+			.expect("no runtime is installed on this thread");
+		f(rt)
+	})
+}
+
+/// Ensures a runtime exists on this thread (lazy default), then borrows it.
+fn with_rt_or_default<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
+	RT.with(|cell| {
+		if cell.borrow().is_none() {
+			let rt = Runtime::new(Config::default())
+				.expect("the thread's default runtime could not be created");
+			*cell.borrow_mut() = Some(rt);
+		}
+		f(cell.borrow_mut().as_mut().unwrap())
+	})
+}
+
+// ---------------------------------------------------------------------------
+// JoinHandle / Join
+// ---------------------------------------------------------------------------
+
 /// Handle to a spawned thread-local task.
-///
-/// Awaiting a `JoinHandle` yields the task's output. Dropping a `JoinHandle`
-/// detaches the task, letting it keep running in the background and discarding
-/// its output.
 pub struct JoinHandle<T> {
 	pub(crate) join: Rc<RefCell<Join<T>>>,
 }
@@ -81,9 +205,12 @@ pub(crate) enum Join<T> {
 	Gone,
 }
 
+// ---------------------------------------------------------------------------
+// Task (Job) internals
+// ---------------------------------------------------------------------------
+
 trait Runnable {
 	fn waker(&self) -> &Waker;
-	fn scope(&self) -> &Scope;
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()>;
 	fn abandon(&mut self);
 }
@@ -93,7 +220,6 @@ struct Job<F: Future> {
 	join: Rc<RefCell<Join<F::Output>>>,
 	scheduled: Arc<AtomicBool>,
 	waker: Waker,
-	scope: Scope,
 }
 
 impl<F: Future> Runnable for Job<F> {
@@ -101,13 +227,7 @@ impl<F: Future> Runnable for Job<F> {
 		&self.waker
 	}
 
-	fn scope(&self) -> &Scope {
-		&self.scope
-	}
-
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-		// `AcqRel` swap rather than a store so any wake that observed `scheduled == true`
-		// and returned without re-queueing synchronizes-with this poll.
 		self.scheduled.swap(false, Ordering::AcqRel);
 		let output = match self.future.as_mut().poll(cx) {
 			Poll::Pending => return Poll::Pending,
@@ -135,125 +255,13 @@ impl<F: Future> Runnable for Job<F> {
 	}
 }
 
-pub(crate) struct Local {
-	tasks: RefCell<SlotMap<DefaultKey, Option<Box<dyn Runnable>>>>,
-	ready: Arc<Ready>,
-	root: Waker,
-	scope: RefCell<Scope>,
-}
-
-impl Local {
-	pub(crate) fn new(driver: Waker, root: Scope) -> Local {
-		let ready = Arc::new(Ready {
-			runnable: Mutex::new(VecDeque::new()),
-			driver,
-			parked: AtomicBool::new(false),
-			root_woken: AtomicBool::new(true),
-		});
-		Local {
-			tasks: RefCell::new(SlotMap::new()),
-			root: Waker::from(Arc::clone(&ready)),
-			scope: RefCell::new(root),
-			ready,
-		}
-	}
-
-	pub(crate) fn current_scope(&self) -> Scope {
-		self.scope.borrow().clone()
-	}
-
-	pub(crate) fn spawn<T: 'static>(
-		&self,
-		scope: Scope,
-		future: impl Future<Output = T> + 'static,
-	) -> Rc<RefCell<Join<T>>> {
-		let join = Rc::new(RefCell::new(Join::Waiting(None)));
-		let scheduled = Arc::new(AtomicBool::new(false));
-		let ready = Arc::downgrade(&self.ready);
-		let mut queued = None;
-		self.tasks.borrow_mut().insert_with_key(|key| {
-			let waker = Waker::from(Arc::new(TaskWake {
-				key,
-				scheduled: Arc::clone(&scheduled),
-				ready,
-			}));
-			queued = Some(waker.clone());
-			Some(Box::new(Job {
-				future: Box::pin(future),
-				join: Rc::clone(&join),
-				scheduled,
-				waker: waker.clone(),
-				scope,
-			}) as Box<dyn Runnable>)
-		});
-		let waker = queued.expect("the spawn inserted the task");
-		waker.wake_by_ref();
-		join
-	}
-
-	pub(crate) fn tick(&self, budget: usize) -> bool {
-		for _ in 0..budget {
-			let Some(key) = self.ready.dequeue() else {
-				break;
-			};
-			// Take the task out of its slot while polling so `self.tasks` is not
-			// borrowed if the future spawns or wakes tasks reentrantly.
-			let Some(mut job) = self.tasks.borrow_mut().get_mut(key).and_then(Option::take) else {
-				continue;
-			};
-			let waker = job.waker().clone();
-			let previous = self.scope.replace(job.scope().clone());
-			let result = catch_unwind(AssertUnwindSafe(|| {
-				job.poll(&mut Context::from_waker(&waker))
-			}));
-			*self.scope.borrow_mut() = previous;
-			match result {
-				Ok(Poll::Pending) => {
-					let mut tasks = self.tasks.borrow_mut();
-					let slot = tasks
-						.get_mut(key)
-						.expect("the task's slot went away while it ran");
-					*slot = Some(job);
-				}
-				Ok(Poll::Ready(())) => {
-					self.tasks.borrow_mut().remove(key);
-				}
-				Err(panic) => {
-					job.abandon();
-					self.tasks.borrow_mut().remove(key);
-					resume_unwind(panic);
-				}
-			}
-		}
-		self.ready.has_ready()
-	}
-
-	pub(crate) fn park(&self) {
-		self.ready.parked.store(true, Ordering::SeqCst);
-	}
-
-	pub(crate) fn unpark(&self) {
-		self.ready.parked.store(false, Ordering::SeqCst);
-	}
-
-	pub(crate) fn take_root_woken(&self) -> bool {
-		self.ready.root_woken.swap(false, Ordering::SeqCst)
-	}
-}
-
-impl Drop for Local {
-	fn drop(&mut self) {
-		let mut tasks = self.tasks.take();
-		for job in tasks.values_mut().filter_map(Option::as_mut) {
-			job.abandon();
-		}
-		drop(tasks);
-	}
-}
+// ---------------------------------------------------------------------------
+// Ready queue + wakers
+// ---------------------------------------------------------------------------
 
 struct Ready {
 	runnable: Mutex<VecDeque<DefaultKey>>,
-	driver: Waker,
+	driver_waker: Waker,
 	parked: AtomicBool,
 	root_woken: AtomicBool,
 }
@@ -266,7 +274,7 @@ impl Ready {
 			.push_back(key);
 		self.root_woken.store(true, Ordering::SeqCst);
 		if self.parked.swap(false, Ordering::SeqCst) {
-			self.driver.wake_by_ref();
+			self.driver_waker.wake_by_ref();
 		}
 	}
 
@@ -294,7 +302,7 @@ impl Wake for Ready {
 	fn wake_by_ref(self: &Arc<Self>) {
 		self.root_woken.store(true, Ordering::SeqCst);
 		if self.parked.swap(false, Ordering::SeqCst) {
-			self.driver.wake_by_ref();
+			self.driver_waker.wake_by_ref();
 		}
 	}
 }
@@ -320,220 +328,437 @@ impl Wake for TaskWake {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Core operations on Runtime (called via with_rt short borrows)
+// ---------------------------------------------------------------------------
+
+fn do_spawn<T: 'static>(
+	rt: &mut Runtime,
+	future: impl Future<Output = T> + 'static,
+) -> Rc<RefCell<Join<T>>> {
+	let join = Rc::new(RefCell::new(Join::Waiting(None)));
+	let scheduled = Arc::new(AtomicBool::new(false));
+	let ready = Arc::downgrade(&rt.ready);
+	let mut queued = None;
+	rt.tasks.insert_with_key(|key| {
+		let waker = Waker::from(Arc::new(TaskWake {
+			key,
+			scheduled: Arc::clone(&scheduled),
+			ready,
+		}));
+		queued = Some(waker.clone());
+		Some(Box::new(Job {
+			future: Box::pin(future),
+			join: Rc::clone(&join),
+			scheduled,
+			waker: waker.clone(),
+		}) as Box<dyn Runnable>)
+	});
+	let waker = queued.expect("the spawn inserted the task");
+	waker.wake_by_ref();
+	join
+}
+
+/// Polls up to `budget` ready tasks. Each task is taken out of the runtime
+/// before polling so the `RT` borrow is not held across the poll — futures
+/// polled inside the task can call `submit`/`spawn` freely.
+fn tick(budget: usize) -> bool {
+	for _ in 0..budget {
+		let Some(key) = with_rt(|rt| rt.ready.dequeue()) else {
+			break;
+		};
+		let Some(mut job) = with_rt(|rt| rt.tasks.get_mut(key).and_then(Option::take)) else {
+			continue;
+		};
+		// No RT borrow held here — the future can submit/spawn freely.
+		let waker = job.waker().clone();
+		let result = catch_unwind(AssertUnwindSafe(|| {
+			job.poll(&mut Context::from_waker(&waker))
+		}));
+		match result {
+			Ok(Poll::Pending) => {
+				with_rt(|rt| {
+					let slot = rt
+						.tasks
+						.get_mut(key)
+						.expect("the task's slot went away while it ran");
+					*slot = Some(job);
+				});
+			}
+			Ok(Poll::Ready(())) => {
+				with_rt(|rt| rt.tasks.remove(key));
+			}
+			Err(panic) => {
+				job.abandon();
+				with_rt(|rt| rt.tasks.remove(key));
+				resume_unwind(panic);
+			}
+		}
+	}
+	with_rt(|rt| rt.ready.has_ready())
+}
+
+// ---------------------------------------------------------------------------
+// Executor (public configuration + lifecycle handle)
+// ---------------------------------------------------------------------------
+
 /// Single-threaded async executor and I/O reactor.
-pub struct Executor {
-	pub(crate) reactor: RefCell<Option<Driver>>,
-	pub(crate) local: Rc<Local>,
-	pub(crate) root: Scope,
-}
-
-struct Entered<'a> {
-	reactor: &'a RefCell<Option<Driver>>,
-	previous: Option<Driver>,
-}
-
-impl<'a> Entered<'a> {
-	fn new(reactor: &'a RefCell<Option<Driver>>, driver: Driver) -> Entered<'a> {
-		Entered {
-			reactor,
-			previous: reactor::enter(Some(driver), |_| ()).0,
-		}
-	}
-}
-
-impl Drop for Entered<'_> {
-	fn drop(&mut self) {
-		let driver = reactor::REACTOR.with(|slot| slot.borrow_mut().take());
-		*self.reactor.borrow_mut() = driver;
-		if let Some(previous) = self.previous.take() {
-			reactor::enter(Some(previous), |_| ());
-		}
-	}
-}
+///
+/// Create one to override the default backend [`Config`], or use the free
+/// function [`block_on`] which lazily creates a default one.
+pub struct Executor;
 
 impl Executor {
-	/// Creates a new executor and initializes its underlying I/O backend with `config`.
 	#[fastrace::trace]
 	pub fn new(config: Config) -> Result<Executor> {
-		let reactor = Driver::new(config)?;
-		let root = Scope::new();
-		let local = Rc::new(Local::new(reactor.waker(), root.clone()));
-		Ok(Executor {
-			reactor: RefCell::new(Some(reactor)),
-			local,
-			root,
-		})
+		let rt = Runtime::new(config)?;
+		let previous = RT.with(|cell| cell.borrow_mut().replace(rt));
+		drop(previous);
+		Ok(Executor)
 	}
 
-	/// Drives `fut` and any spawned tasks on the current thread until `fut` completes.
 	pub fn block_on<F: Future>(&mut self, fut: F) -> Result<F::Output> {
-		self.run(fut)
+		run(fut)
 	}
 
-	pub(crate) fn run<F: Future>(&self, fut: F) -> Result<F::Output> {
-		let driver = self
-			.reactor
-			.borrow_mut()
-			.take()
-			.expect("the executor's reactor is already running");
-		let local = &self.local;
-		let _reactor = Entered::new(&self.reactor, driver);
-		let _local = global::enter_local(local);
-		let mut fut = std::pin::pin!(fut);
-		let mut cx = Context::from_waker(&local.root);
-		loop {
-			local.take_root_woken();
-			if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
-				// Run one bounded tick so tasks spawned by `fut` just before
-				// returning reach their first suspension point.
-				local.tick(TICK_BUDGET);
-				return Ok(out);
-			}
-			let more = local.tick(TICK_BUDGET);
-			if more || local.take_root_woken() {
-				reactor::REACTOR.with(|slot| {
-					slot.borrow_mut()
-						.as_mut()
-						.expect("the executor's reactor is entered")
-						.drive(Some(Duration::ZERO))
-				})?;
-				continue;
-			}
-			// Store `parked = true` before rechecking `ready` and `root_woken`
-			// under `SeqCst` so a concurrent wake either sees `parked` or is seen
-			// by the recheck.
-			local.park();
-			if local.ready.has_ready() || local.take_root_woken() {
-				local.unpark();
-				reactor::REACTOR.with(|slot| {
-					slot.borrow_mut()
-						.as_mut()
-						.expect("the executor's reactor is entered")
-						.drive(Some(Duration::ZERO))
-				})?;
-				continue;
-			}
-			let result = reactor::REACTOR.with(|slot| {
-				slot.borrow_mut()
-					.as_mut()
-					.expect("the executor's reactor is entered")
-					.drive(None)
-			});
-			local.unpark();
-			result?;
-		}
-	}
-
-	/// Creates a new child [`Scope`] derived from this executor's root scope.
-	pub fn scope(&self) -> Scope {
-		self.root.child()
-	}
-
-	/// Spawns a thread-local task on this executor, in the scope active where it
-	/// is spawned.
 	pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> JoinHandle<T> {
-		let join = self.local.spawn(self.local.current_scope(), future);
-		JoinHandle { join }
+		JoinHandle {
+			join: with_rt(|rt| do_spawn(rt, future)),
+		}
 	}
 }
 
-impl Drop for Executor {
+// ---------------------------------------------------------------------------
+// The run loop (shared by Executor::block_on and free block_on)
+// ---------------------------------------------------------------------------
+
+struct RunGuard;
+
+impl Drop for RunGuard {
 	fn drop(&mut self) {
-		if let Some(driver) = self.reactor.get_mut().take() {
-			let _ = driver.shutdown(true);
+		let _ = RT.try_with(|cell| {
+			if let Ok(mut borrow) = cell.try_borrow_mut()
+				&& let Some(rt) = borrow.as_mut()
+			{
+				rt.running = false;
+			}
+		});
+	}
+}
+
+fn run<F: Future>(fut: F) -> Result<F::Output> {
+	let root_waker = with_rt_or_default(|rt| {
+		assert!(!rt.running, "block_on cannot be nested on the same thread");
+		rt.running = true;
+		Waker::from(Arc::clone(&rt.ready))
+	});
+	let _guard = RunGuard;
+	let mut fut = std::pin::pin!(fut);
+	let mut cx = Context::from_waker(&root_waker);
+	loop {
+		with_rt(|rt| rt.ready.root_woken.swap(false, Ordering::SeqCst));
+		if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+			tick(TICK_BUDGET);
+			return Ok(out);
+		}
+		let more = tick(TICK_BUDGET);
+		if more || with_rt(|rt| rt.ready.root_woken.swap(false, Ordering::SeqCst)) {
+			with_rt(|rt| rt.drive(Some(Duration::ZERO)))?;
+			continue;
+		}
+		with_rt(|rt| rt.ready.parked.store(true, Ordering::SeqCst));
+		if with_rt(|rt| rt.ready.has_ready() || rt.ready.root_woken.swap(false, Ordering::SeqCst)) {
+			with_rt(|rt| rt.ready.parked.store(false, Ordering::SeqCst));
+			with_rt(|rt| rt.drive(Some(Duration::ZERO)))?;
+			continue;
+		}
+		let result = with_rt(|rt| rt.drive(None));
+		with_rt(|rt| rt.ready.parked.store(false, Ordering::SeqCst));
+		result?;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Free-function public API
+// ---------------------------------------------------------------------------
+
+/// Runs `future` to completion on the current thread.
+pub fn block_on<F: Future>(future: F) -> Result<F::Output> {
+	run(future)
+}
+
+/// Spawns a thread-local task.
+pub fn spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> JoinHandle<T> {
+	JoinHandle {
+		join: with_rt_or_default(|rt| do_spawn(rt, future)),
+	}
+}
+
+pub(crate) fn submit(fd: Arc<dyn AsDescriptor>, op: Op) -> Slot {
+	with_rt_or_default(|rt| rt.submit(fd, op))
+}
+
+pub(crate) fn submit_timer(deadline: Instant) -> Slot {
+	with_rt_or_default(|rt| rt.submit_timer(deadline))
+}
+
+// ---------------------------------------------------------------------------
+// I/O completion tracking (Entry, Shared, Slot)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Key {
+	Op(u64),
+	Timer(TimerKey),
+}
+
+type TimerKey = (Instant, u64);
+
+struct Entry {
+	inner: Mutex<EntryInner>,
+}
+
+struct EntryInner {
+	response: Option<Result<Response>>,
+	wakers: SmallVec<[Waker; 2]>,
+	cancelled: bool,
+	done: bool,
+	descriptor: Option<Arc<dyn AsDescriptor>>,
+	buffer: Option<Buffer>,
+}
+
+impl Entry {
+	fn pending(descriptor: Option<Arc<dyn AsDescriptor>>, buffer: Option<Buffer>) -> Entry {
+		Entry {
+			inner: Mutex::new(EntryInner {
+				response: None,
+				wakers: SmallVec::new(),
+				cancelled: false,
+				done: false,
+				descriptor,
+				buffer,
+			}),
+		}
+	}
+
+	fn lock(&self) -> MutexGuard<'_, EntryInner> {
+		self.inner.lock().unwrap_or_else(|p| p.into_inner())
+	}
+
+	fn complete(&self, response: Result<Response>) {
+		let mut inner = self.lock();
+		inner.buffer = None;
+		inner.descriptor = None;
+		inner.response = Some(response);
+		inner.done = true;
+		let wakers = std::mem::take(&mut inner.wakers);
+		drop(inner);
+		for waker in wakers {
+			waker.wake();
+		}
+	}
+
+	fn mark_cancelled(&self) -> bool {
+		let mut inner = self.lock();
+		!std::mem::replace(&mut inner.cancelled, true) && !inner.done
+	}
+
+	fn take_or_register(&self, waker: &Waker) -> Option<Result<Response>> {
+		let mut inner = self.lock();
+		if let Some(response) = inner.response.take() {
+			return Some(response);
+		}
+		if !inner.wakers.iter().any(|w| w.will_wake(waker)) {
+			inner.wakers.push(waker.clone());
+		}
+		None
+	}
+
+	fn take_response(&self) -> Option<Result<Response>> {
+		self.lock().response.take()
+	}
+}
+
+struct Shared {
+	inner: Mutex<SharedInner>,
+}
+
+struct SharedInner {
+	stopped: bool,
+	cancellations: Vec<u64>,
+	timers: BTreeMap<TimerKey, Arc<Entry>>,
+	next_timer: u64,
+	waker: Waker,
+}
+
+impl Shared {
+	fn lock(&self) -> MutexGuard<'_, SharedInner> {
+		self.inner.lock().unwrap_or_else(|p| p.into_inner())
+	}
+
+	fn queue_cancel(&self, id: u64) {
+		let mut inner = self.lock();
+		inner.cancellations.push(id);
+		inner.waker.wake_by_ref();
+	}
+
+	fn release(&self, key: Key, entry: &Entry) {
+		match key {
+			Key::Op(id) => {
+				if !entry.mark_cancelled() {
+					return;
+				}
+				self.queue_cancel(id);
+			}
+			Key::Timer(key) => {
+				self.lock().timers.remove(&key);
+			}
+		}
+	}
+
+	fn take_cancellations(&self) -> Vec<u64> {
+		std::mem::take(&mut self.lock().cancellations)
+	}
+
+	fn is_stopped(&self) -> bool {
+		self.lock().stopped
+	}
+
+	fn stop(&self) -> Option<BTreeMap<TimerKey, Arc<Entry>>> {
+		let mut inner = self.lock();
+		if std::mem::replace(&mut inner.stopped, true) {
+			return None;
+		}
+		Some(std::mem::take(&mut inner.timers))
+	}
+
+	fn add_timer(&self, deadline: Instant) -> Option<(Key, Arc<Entry>)> {
+		let mut inner = self.lock();
+		if inner.stopped {
+			return None;
+		}
+		let entry = Arc::new(Entry::pending(None, None));
+		let key = (deadline, inner.next_timer);
+		inner.next_timer += 1;
+		inner.timers.insert(key, Arc::clone(&entry));
+		Some((Key::Timer(key), entry))
+	}
+
+	fn expire_timers(&self) {
+		let mut inner = self.lock();
+		let now = Instant::now();
+		while let Some((&(deadline, _), _)) = inner.timers.first_key_value() {
+			if deadline > now {
+				break;
+			}
+			let (_, timer) = inner
+				.timers
+				.pop_first()
+				.expect("the first timer is present");
+			timer.complete(Ok(Response::Done));
+		}
+	}
+
+	fn within(&self, timeout: Option<Duration>) -> Option<Duration> {
+		let inner = self.lock();
+		let nearest = inner
+			.timers
+			.first_key_value()
+			.map(|(&(deadline, _), _)| deadline.saturating_duration_since(Instant::now()));
+		match (timeout, nearest) {
+			(Some(timeout), Some(nearest)) => Some(timeout.min(nearest)),
+			(timeout, nearest) => timeout.or(nearest),
 		}
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use super::{Local, TICK_BUDGET};
+pub(crate) struct Slot {
+	inner: SlotInner,
+}
 
-	use crate::cancel::Scope;
+enum SlotInner {
+	Live {
+		shared: Arc<Shared>,
+		entry: Arc<Entry>,
+		key: Option<Key>,
+		owner: bool,
+	},
+	Refused(Option<Result<Response>>),
+}
 
-	use std::cell::RefCell;
-	use std::rc::Rc;
-	use std::sync::Arc;
-	use std::sync::atomic::{AtomicUsize, Ordering};
-	use std::task::{Poll, Wake, Waker};
-
-	/// A stand-in for the reactor's waker that counts the times a wake rings it.
-	struct Ring(AtomicUsize);
-
-	impl Wake for Ring {
-		fn wake(self: Arc<Self>) {
-			self.wake_by_ref();
+impl Clone for Slot {
+	fn clone(&self) -> Self {
+		match &self.inner {
+			SlotInner::Live {
+				shared, entry, key, ..
+			} => Slot {
+				inner: SlotInner::Live {
+					shared: Arc::clone(shared),
+					entry: Arc::clone(entry),
+					key: *key,
+					owner: false,
+				},
+			},
+			SlotInner::Refused(_) => Slot {
+				inner: SlotInner::Refused(None),
+			},
 		}
+	}
+}
 
-		fn wake_by_ref(self: &Arc<Self>) {
-			self.0.fetch_add(1, Ordering::AcqRel);
+impl Drop for Slot {
+	fn drop(&mut self) {
+		let SlotInner::Live {
+			shared,
+			entry,
+			key,
+			owner: true,
+		} = &mut self.inner
+		else {
+			return;
+		};
+		if let Some(key) = key.take() {
+			shared.release(key, entry);
+		}
+		let response = entry.take_response();
+		drop(response);
+	}
+}
+
+impl Slot {
+	fn new(shared: Arc<Shared>, key: Key, entry: Arc<Entry>) -> Slot {
+		Slot {
+			inner: SlotInner::Live {
+				shared,
+				entry,
+				key: Some(key),
+				owner: true,
+			},
 		}
 	}
 
-	fn local() -> (Arc<Ring>, Local) {
-		let ring = Arc::new(Ring(AtomicUsize::new(0)));
-		let local = Local::new(Waker::from(Arc::clone(&ring)), Scope::new());
-		(ring, local)
+	fn refused(error: Error) -> Slot {
+		Slot {
+			inner: SlotInner::Refused(Some(Err(error))),
+		}
 	}
+}
 
-	/// A wake raised on the executor thread has the loop itself to answer it:
-	/// it must not ring the reactor, whose notify is a syscall on the portable
-	/// and IOCP backends.
-	#[test]
-	fn a_spawn_does_not_ring_the_reactor() {
-		let (ring, local) = local();
-		let join = local.spawn(Scope::new(), std::future::pending::<()>());
-		local.tick(TICK_BUDGET);
-		assert_eq!(
-			ring.0.load(Ordering::Acquire),
-			0,
-			"a spawn on the executor thread rang the reactor"
-		);
-		drop(join);
-	}
+impl Future for Slot {
+	type Output = Result<Response>;
 
-	/// A wake that crosses the park transition is the one that has to reach
-	/// the reactor: nothing else would bring the loop back.
-	#[test]
-	fn a_root_wake_across_the_park_rings_the_reactor() {
-		let (ring, local) = local();
-		local.park();
-		local.root.wake_by_ref();
-		assert_eq!(
-			ring.0.load(Ordering::Acquire),
-			1,
-			"a root wake while parked did not ring the reactor"
-		);
-		assert!(local.take_root_woken(), "the root wake was not recorded");
-	}
-
-	/// The same for a task's own wake: the parked loop has no other way to
-	/// learn that the queue grew.
-	#[test]
-	fn a_task_wake_across_the_park_rings_the_reactor() {
-		let (ring, local) = local();
-		let filed = Rc::new(RefCell::new(None::<Waker>));
-		let slot = Rc::clone(&filed);
-		let join = local.spawn(
-			Scope::new(),
-			std::future::poll_fn(move |cx| -> Poll<()> {
-				*slot.borrow_mut() = Some(cx.waker().clone());
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Response>> {
+		match &mut self.get_mut().inner {
+			SlotInner::Live { entry, key, .. } => {
+				if let Some(response) = entry.take_or_register(cx.waker()) {
+					*key = None;
+					return Poll::Ready(response);
+				}
 				Poll::Pending
-			}),
-		);
-		local.tick(TICK_BUDGET);
-		local.park();
-		filed
-			.borrow()
-			.as_ref()
-			.expect("the task filed its waker")
-			.wake_by_ref();
-		assert_eq!(
-			ring.0.load(Ordering::Acquire),
-			1,
-			"a task wake while parked did not ring the reactor"
-		);
-		assert!(local.ready.has_ready(), "the task wake was not queued");
-		drop(join);
+			}
+			SlotInner::Refused(response) => {
+				Poll::Ready(response.take().expect("a refused slot is polled only once"))
+			}
+		}
 	}
 }

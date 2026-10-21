@@ -16,7 +16,7 @@ use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
-use completion_async::{Config, ErrorKind, Executor, Readiness};
+use completion_async::{Config, Executor, Readiness, timeout};
 
 /// The async driver the waits run on: it owns the reactor, so `block_on` both
 /// polls the wait and drives the backend under it.
@@ -68,29 +68,27 @@ fn a_writable_descriptor_ends_a_write_wait() {
 /// A wait is an operation like any other, so a cancel ends it: nothing is owed
 /// on a pipe that never filled, and the wait yields having moved nothing.
 #[test]
-fn a_cancel_ends_a_wait_that_never_became_ready() {
+fn a_dropped_wait_gives_the_descriptor_back() {
 	let (reader, _peer) = std::io::pipe().unwrap();
 	let mut executor = executor();
 	let readiness = Readiness::new(OwnedFd::from(reader));
 
-	let scope = executor.scope();
-	let raiser = scope.clone();
-	let thread = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(50));
-		drop(raiser.cancel());
-	});
-
-	let started = Instant::now();
-	let result = executor
-		.block_on(async { scope.spawn(readiness.readable()).await })
+	executor
+		.block_on(async {
+			let mut wait = std::pin::pin!(readiness.readable());
+			std::future::poll_fn(|cx| {
+				let _ = wait.as_mut().poll(cx);
+				std::task::Poll::Ready(())
+			})
+			.await;
+		})
 		.unwrap();
-	thread.join().unwrap();
+	executor
+		.block_on(timeout(Duration::from_millis(50)))
+		.unwrap()
+		.unwrap();
 	assert!(
-		result.is_err_and(|error| error.kind() == ErrorKind::Cancelled),
-		"the wait ended with something other than the cancel"
-	);
-	assert!(
-		started.elapsed() < Duration::from_secs(5),
-		"the cancel did not reach the parked wait"
+		readiness.try_take().is_some(),
+		"the dropped wait still holds the descriptor"
 	);
 }

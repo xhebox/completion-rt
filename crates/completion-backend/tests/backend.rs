@@ -61,3 +61,85 @@ fn a_backend_is_send() {
 	fn assert_send<T: Send>() {}
 	assert_send::<Backend>();
 }
+
+#[cfg(unix)]
+mod waits {
+	use std::io::Write;
+	use std::time::Duration;
+
+	use completion_backend::{AsDescriptor, Backend, Config, Op};
+
+	/// How long one `poll` may block before `drain` polls again.
+	const TIMEOUT: Duration = Duration::from_secs(5);
+
+	/// Polls until `backend` is idle, returning each completion as `(id, data, succeeded)`.
+	fn drain(backend: &mut Backend<u32>) -> Vec<(u64, u32, bool)> {
+		let mut done = Vec::new();
+		for _ in 0..8 {
+			if backend.is_idle() {
+				break;
+			}
+			backend
+				.poll(Some(TIMEOUT), |id, data, result| {
+					done.push((id, data, result.is_ok()))
+				})
+				.unwrap();
+		}
+		assert!(backend.is_idle(), "the backend never went idle");
+		done
+	}
+
+	/// A finished wait leaves nothing behind: its descriptor can close, the backend
+	/// goes idle, and a later wait on a new descriptor completes as if the first
+	/// had never been submitted.
+	#[test]
+	fn a_finished_wait_leaves_nothing_behind() {
+		let mut backend: Backend<u32> = Backend::new(&Config::default()).unwrap();
+		let (reader, mut writer) = std::io::pipe().unwrap();
+		let id = backend
+			.submit(reader.as_descriptor(), Op::Readable, 1)
+			.unwrap();
+		writer.write_all(b"x").unwrap();
+		assert_eq!(drain(&mut backend), [(id, 1, true)]);
+
+		drop((reader, writer));
+		backend
+			.poll(Some(Duration::ZERO), |_, _, _| {
+				panic!("a finished wait completed again")
+			})
+			.unwrap();
+		assert!(backend.is_idle());
+
+		let (reader, mut writer) = std::io::pipe().unwrap();
+		let next = backend
+			.submit(reader.as_descriptor(), Op::Readable, 2)
+			.unwrap();
+		writer.write_all(b"y").unwrap();
+		assert_eq!(drain(&mut backend), [(next, 2, true)]);
+		assert_ne!(id, next);
+	}
+
+	/// A wait cancelled before its descriptor turns ready is reported once, and the
+	/// readiness that follows is not dispatched to it again.
+	#[test]
+	fn a_cancelled_wait_is_not_dispatched_when_its_descriptor_turns_ready() {
+		let mut backend: Backend<u32> = Backend::new(&Config::default()).unwrap();
+		let (reader, mut writer) = std::io::pipe().unwrap();
+		let id = backend
+			.submit(reader.as_descriptor(), Op::Readable, 7)
+			.unwrap();
+		backend.cancel(id);
+		writer.write_all(b"x").unwrap();
+
+		let done = drain(&mut backend);
+		assert_eq!(done.len(), 1, "the cancelled wait is reported once");
+		assert_eq!((done[0].0, done[0].1), (id, 7));
+
+		backend
+			.poll(Some(Duration::ZERO), |_, _, _| {
+				panic!("a cancelled wait was dispatched again")
+			})
+			.unwrap();
+		assert!(backend.is_idle());
+	}
+}

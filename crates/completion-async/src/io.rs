@@ -7,7 +7,7 @@ use std::sync::Arc;
 use completion_backend::{AsDescriptor, Error, Op, Response, Span};
 
 use crate::Result;
-use crate::global::submit;
+use crate::executor::submit;
 
 /// Result of a multi-step transfer, preserving partial progress (`value`)
 /// alongside the completion status (`result`).

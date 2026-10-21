@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use completion_async::{
-	Buffer, Config, Executor, File, Listener, Readiness, Scope, Socket, Span, Stream, timeout,
+	Buffer, Config, Executor, File, Listener, Readiness, Socket, Span, Stream, timeout,
 };
 
 /// Every handle the crate exposes is `Send + Sync`: none of them names a
@@ -17,13 +17,11 @@ use completion_async::{
 #[test]
 fn handles_are_send_and_sync() {
 	fn assert_send_sync<T: Send + Sync>() {}
-	fn assert_scope<T: Clone + Send + Sync + 'static>() {}
 	assert_send_sync::<File>();
 	assert_send_sync::<Stream>();
 	assert_send_sync::<Socket>();
 	assert_send_sync::<Listener>();
 	assert_send_sync::<Readiness>();
-	assert_scope::<Scope>();
 }
 
 /// Every operation over a handle is `Send + 'static`: the reactor it submits to

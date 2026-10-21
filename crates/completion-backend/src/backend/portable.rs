@@ -28,12 +28,9 @@ use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 use smallvec::SmallVec;
 use socket2::{SockAddr, SockRef};
 
-use super::Op;
+use super::{Config, Driver, IoVec, Op, Response};
 use crate::desc::{BorrowedDescriptor, OwnedSocket};
 use crate::error::{Error, Result};
-use crate::memory::IoVec;
-
-use super::{Config, Driver, Response};
 
 #[cfg(unix)]
 mod unix;
@@ -555,26 +552,18 @@ impl<T> Portable<T> {
 	fn submit_op(&mut self, fd: BorrowedDescriptor<'_>, op: Op, data: T) -> Result<u64> {
 		let raw = sys::raw(fd);
 		match op {
-			Op::Read { offset, span } => {
-				// Resolved before the operation is queued, whenever it lands: an
-				// span out of bounds refuses the submission.
-				let buffer = Some(span.resolve()?);
-				match sys::transfer(raw) {
-					Transfer::Pool => {
-						self.submit_pool(raw, offset.unwrap_or(0), Kind::Read, buffer, data)
-					}
-					Transfer::Watch => self.wait(raw, Op::Read { offset, span }, buffer, data),
+			Op::Read { offset, buf } => match sys::transfer(raw) {
+				Transfer::Pool => {
+					self.submit_pool(raw, offset.unwrap_or(0), Kind::Read, Some(buf), data)
 				}
-			}
-			Op::Write { offset, span } => {
-				let buffer = Some(span.resolve()?);
-				match sys::transfer(raw) {
-					Transfer::Pool => {
-						self.submit_pool(raw, offset.unwrap_or(0), Kind::Write, buffer, data)
-					}
-					Transfer::Watch => self.wait(raw, Op::Write { offset, span }, buffer, data),
+				Transfer::Watch => self.wait(raw, Op::Read { offset, buf }, Some(buf), data),
+			},
+			Op::Write { offset, buf } => match sys::transfer(raw) {
+				Transfer::Pool => {
+					self.submit_pool(raw, offset.unwrap_or(0), Kind::Write, Some(buf), data)
 				}
-			}
+				Transfer::Watch => self.wait(raw, Op::Write { offset, buf }, Some(buf), data),
+			},
 			Op::Fsync => match sys::sync_flush(raw)? {
 				SyncFlush::Pool => self.submit_pool(raw, 0, Kind::Fsync, None, data),
 				// A descriptor that is no regular file cannot be synced by the
@@ -601,21 +590,17 @@ impl<T> Portable<T> {
 				sys::reservable(raw)?;
 				self.submit_pool(raw, 0, Kind::Punch { offset, len }, None, data)
 			}
-			Op::Recv { span } => {
+			Op::Recv { buf } => {
 				sys::pollable(raw)?;
-				let buffer = Some(span.resolve()?);
-				self.wait(raw, Op::Recv { span }, buffer, data)
+				self.wait(raw, Op::Recv { buf }, Some(buf), data)
 			}
 			#[cfg(unix)]
-			Op::RecvWithFds { span } => {
-				let buffer = Some(span.resolve()?);
-				self.wait(raw, Op::RecvWithFds { span }, buffer, data)
-			}
+			Op::RecvWithFds { buf } => self.wait(raw, Op::RecvWithFds { buf }, Some(buf), data),
 			// A receive that carries descriptors has no form on a platform whose
 			// socket call has none.
 			#[cfg(windows)]
 			Op::RecvWithFds { .. } => Err(unsupported("this backend cannot receive descriptors")),
-			Op::Send { span, fds } => {
+			Op::Send { buf, fds } => {
 				// A send that carries no descriptor is a socket call, and one
 				// that does needs a control message.
 				if fds.is_empty() {
@@ -623,8 +608,7 @@ impl<T> Portable<T> {
 				} else {
 					sys::control_message(raw)?;
 				}
-				let buffer = Some(span.resolve()?);
-				self.wait(raw, Op::Send { span, fds }, buffer, data)
+				self.wait(raw, Op::Send { buf, fds }, Some(buf), data)
 			}
 			Op::Accept => {
 				sys::pollable(raw)?;

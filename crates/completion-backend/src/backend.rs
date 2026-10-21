@@ -6,7 +6,6 @@ use socket2::SockAddr;
 
 use crate::desc::{BorrowedDescriptor, OwnedDescriptor, OwnedSocket};
 use crate::error::Result;
-use crate::memory::Span;
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("completion-backend does not support this target");
@@ -42,12 +41,25 @@ impl Default for Config {
 	}
 }
 
+/// Resolved pointer and length for a byte transfer.
+#[derive(Clone, Copy, Debug)]
+pub struct IoVec {
+	/// Pointer to the first byte of the range.
+	pub ptr: *mut u8,
+	/// Byte length of the range.
+	pub len: usize,
+}
+
+// SAFETY: `IoVec` is a raw pointer into memory kept alive by the caller for
+// the duration of an I/O operation.
+unsafe impl Send for IoVec {}
+
 /// An I/O operation submitted to a [`Backend`].
 pub enum Op {
-	/// Reads into `span` at `offset` (or at the descriptor's current position when `None`).
-	Read { offset: Option<u64>, span: Span },
-	/// Writes from `span` at `offset` (or at the descriptor's current position when `None`).
-	Write { offset: Option<u64>, span: Span },
+	/// Reads into `buf` at `offset` (or at the descriptor's current position when `None`).
+	Read { offset: Option<u64>, buf: IoVec },
+	/// Writes from `buf` at `offset` (or at the descriptor's current position when `None`).
+	Write { offset: Option<u64>, buf: IoVec },
 	/// Flushes all modified data and metadata to disk (`fsync`).
 	Fsync,
 	/// Checks for deferred write-back errors without forcing data to disk.
@@ -58,13 +70,13 @@ pub enum Op {
 	/// Deallocates `len` bytes from `offset`, zeroing the range and keeping the
 	/// file's length.
 	Punch { offset: u64, len: u64 },
-	/// Receives into `span`.
-	Recv { span: Span },
-	/// Receives into `span`, also capturing ancillary file descriptors (`SCM_RIGHTS`).
-	RecvWithFds { span: Span },
-	/// Sends from `span`, attaching `fds` in an ancillary control message (`SCM_RIGHTS`).
+	/// Receives into `buf`.
+	Recv { buf: IoVec },
+	/// Receives into `buf`, also capturing ancillary file descriptors (`SCM_RIGHTS`).
+	RecvWithFds { buf: IoVec },
+	/// Sends from `buf`, attaching `fds` in an ancillary control message (`SCM_RIGHTS`).
 	Send {
-		span: Span,
+		buf: IoVec,
 		fds: Vec<OwnedDescriptor>,
 	},
 	/// Accepts the next connection on a listening socket.
@@ -77,29 +89,6 @@ pub enum Op {
 	Writable,
 	/// Waits until the peer closes both directions or the connection resets.
 	Hangup,
-}
-
-impl Op {
-	/// Returns the [`Span`] this operation transfers through, or `None` if it
-	/// transfers no bytes.
-	pub fn span(&self) -> Option<&Span> {
-		match self {
-			Op::Read { span, .. }
-			| Op::Write { span, .. }
-			| Op::Recv { span }
-			| Op::RecvWithFds { span }
-			| Op::Send { span, .. } => Some(span),
-			Op::Fsync
-			| Op::Flush
-			| Op::Allocate { .. }
-			| Op::Punch { .. }
-			| Op::Accept
-			| Op::Connect { .. }
-			| Op::Readable
-			| Op::Writable
-			| Op::Hangup => None,
-		}
-	}
 }
 
 /// Output of a completed [`Op`], reported by [`Backend::poll`].
@@ -129,48 +118,39 @@ trait Driver<T> {
 	fn waker(&self) -> Waker;
 }
 
-/// Completion mechanism used by a [`Backend`].
-#[derive(
-	Clone,
-	Copy,
-	Debug,
-	Default,
-	Eq,
-	PartialEq,
-	Hash,
-	strum::EnumString,
-	strum::Display,
-	strum::IntoStaticStr,
-	strum::VariantArray,
-)]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
-pub enum BackendKind {
-	/// Readiness polling (`polling`) with file I/O on a thread pool.
-	#[cfg_attr(all(unix, not(target_os = "linux")), default)]
-	Portable,
-	/// Linux `io_uring`.
-	#[cfg(target_os = "linux")]
-	#[default]
-	Uring,
-	/// Windows I/O completion port (IOCP).
-	#[cfg(windows)]
-	#[default]
-	Iocp,
-}
-
 /// Platform completion driver.
 ///
 /// Once [`Backend::submit`] returns `Ok(id)`, the caller must keep the
-/// descriptor and any [`Buffer`](crate::Buffer) referenced by the operation
-/// alive until [`Backend::poll`] yields a completion for `id`. Operation IDs
-/// carry a generation, so cancelling an ID whose operation already completed is
-/// a no-op.
+/// descriptor and any [`IoVec`] memory referenced by the operation alive until
+/// [`Backend::poll`] yields a completion for `id`. Operation IDs carry a
+/// generation, so cancelling an ID whose operation already completed is a
+/// no-op.
 #[enum_dispatch(Driver<T>)]
+#[derive(strum::EnumDiscriminants)]
+#[strum_discriminants(
+	name(BackendKind),
+	doc = "Completion mechanism used by a [`Backend`].",
+	derive(
+		Default,
+		Hash,
+		strum::EnumString,
+		strum::Display,
+		strum::IntoStaticStr,
+		strum::VariantArray,
+	),
+	strum(serialize_all = "lowercase", ascii_case_insensitive)
+)]
 pub enum Backend<T = ()> {
+	/// Readiness polling (`polling`) with file I/O on a thread pool.
+	#[strum_discriminants(cfg_attr(all(unix, not(target_os = "linux")), default))]
 	Portable(portable::Portable<T>),
+	/// Linux `io_uring`.
 	#[cfg(target_os = "linux")]
+	#[strum_discriminants(default)]
 	Uring(uring::Uring<T>),
+	/// Windows I/O completion port (IOCP).
 	#[cfg(windows)]
+	#[strum_discriminants(default)]
 	Iocp(iocp::Iocp<T>),
 }
 
@@ -189,21 +169,13 @@ impl<T> Backend<T> {
 
 	/// Returns the completion mechanism this backend runs on.
 	pub fn kind(&self) -> BackendKind {
-		match self {
-			Backend::Portable(_) => BackendKind::Portable,
-			#[cfg(target_os = "linux")]
-			Backend::Uring(_) => BackendKind::Uring,
-			#[cfg(windows)]
-			Backend::Iocp(_) => BackendKind::Iocp,
-		}
+		self.into()
 	}
 
 	/// Submits `op` on `fd`, and returns the id its completion reports under.
 	///
-	/// Resolves the [`Span`](crate::Span) of a transfer before submission, returning
-	/// [`InvalidInput`](std::io::ErrorKind::InvalidInput) if its range is out of
-	/// bounds. If this returns `Err`, the operation was not queued and no
-	/// completion will be produced for it.
+	/// If this returns `Err`, the operation was not queued and no completion
+	/// will be produced for it.
 	pub fn submit(&mut self, fd: BorrowedDescriptor<'_>, op: Op, data: T) -> Result<u64> {
 		Driver::submit(self, fd, op, data)
 	}

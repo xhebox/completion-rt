@@ -1,40 +1,56 @@
 # completion-rt
 
-Completion-model async I/O for Rust: io_uring on Linux, IOCP on Windows, and a readiness-based emulation (`polling`, with file I/O on `blocking`'s pool) on every target — the default on unix other than Linux, and what `Config::backend` selects on Linux and Windows too, as `BackendKind::Portable` or the string `"portable"`.
+Completion-based async I/O for Rust: `io_uring` on Linux, IOCP on Windows, and a portable fallback based on [`polling`](https://github.com/smol-rs/polling) and [`blocking`](https://github.com/smol-rs/blocking).
+
+- `completion-async` provides a single-threaded executor and async handles (`File`, `Stream`, `StreamSocket`, `DatagramSocket`, `Listener`, `Readiness`).
+- `completion-backend` provides the low-level completion driver (`Backend`, `Op`, `IoVec`) if you bring your own runtime.
 
 ```rust
-use completion_async::{Buffer, Config, Executor, File};
+use completion_async::{Buffer, File, block_on};
 
-let mut executor = Executor::new(Config::default())?;
 let file = File::new(std::fs::File::open("data")?);
-let buffer = Buffer::zeroed(5); // or `Buffer::new(Arc::new(memory))` for your own `Memory`
-let scope = executor.scope();
-
-let read = executor.block_on(async {
-	scope.spawn(file.read_exact_at(buffer.whole(), 0)).await
+let buffer = Buffer::zeroed(5);
+let read = block_on(async {
+	file.read_exact_at(&buffer, 0).await
 })?;
 assert_eq!(read.into_result()?, 5);
 ```
 
-A resource is wrapped in the handle whose operations it takes, and each handle is built from a standard resource — `impl Into<std::fs::File>`, `impl Into<OwnedDescriptor>`, `impl Into<OwnedSocket>`: `File` for a file, `Stream` for a pipe or a stream socket, `Socket` for a datagram socket, `Listener` for a listening socket, and `Readiness` for a descriptor that only signals readiness. A handle binds no reactor, so it is `Send + Sync` and can be built on any thread; each operation resolves the reactor it submits to when it is polled.
+## How it works
 
-## Semantics
+### Handles and executors
 
-- Dropping an operation's future cancels and detaches it without blocking: the reactor keeps its Buffer and descriptor alive until the kernel finishes, but the Span's bytes stay in flight until then. Cancel first, by running the operation as a task in a `Scope` — `executor.scope()`, a child of it, or `completion_async::scope()` — when the range is to be read or reused right away: `Scope::spawn` runs the task with every operation it submits filed under that scope, and `Scope::cancel` ends them and waits for the kernel.
-- Memory is shared, not moved: a `Buffer` is a cheap reference-counted handle (`Buffer::zeroed`, `Buffer::from`, or `Buffer::new(Arc::new(memory))` for a `Memory` you implement), and each operation names one `Span` of that buffer — `buffer.span(offset, len)`, or `buffer.whole()` for all of it. A range outside the memory fails the operation; it does not panic. `BufferPool` hands out pre-faulted, page-aligned buffers from a fixed set of blocks, for repeated I/O.
-- `File::read_at`, `File::write_at`, `Stream::recv` and `Stream::send` make exactly one system call, so they can move fewer bytes than asked, and report the count they moved. `read_exact_at`, `write_all_at`, `recv_exact` and `send_all` repeat the call until everything is moved; they report an `Outcome`, whose `value` still says how many bytes moved if one call stops early, on an error or a cancel.
-- A file's transfers name their offset. A stream — a pipe, a pty, a TAP, a socket — has none to name, so its transfers move the descriptor's own position, and the same `Stream` serves a pipe and a socket.
-- The reactor and the executor driving it stay on the thread that built it; only its waker crosses threads, along with the `Scope`s that cancel its work. A `Scope` is `Clone + Send + Sync`; a child scope is cancelled with its parent, and cancelling a child leaves the parent alone. Every executor has a root scope nothing can cancel, and the scopes handed out are children of it, so cancelling one never leaves the executor unable to run what follows. A handle is not bound to a reactor: an operation submits to the reactor of the executor whose `block_on` is polling it, or, outside one, the thread's default executor.
+Wrap a standard OS resource in the matching handle:
 
-## Usage notes
+- `File` for positioned file I/O (`read_at`, `write_at`, `sync`, `flush`, `allocate`, `punch`).
+- `Stream` for pipes, PTYs, and TAPs (`read`, `write`).
+- `StreamSocket` for stream sockets (`recv`, `send`, `recv_exact`, `send_all`, fd passing, `shutdown`, `hangup`).
+- `DatagramSocket` for datagram sockets (`recv`, `send`, fd passing).
+- `Listener` for listening sockets (`accept`).
+- `Readiness` for descriptors that only signal readiness (such as `eventfd`, `pidfd`, or `signalfd`).
 
-- On the portable backend, pass non-blocking descriptors for anything that is not a regular file: a blocking one stalls the reactor. Windows polls sockets only; every other handle's calls run on the pool.
-- io_uring requires Linux 5.11 or later: every blocking wait passes `IORING_ENTER_EXT_ARG` for its timeout. A stream's `hangup` needs 5.13, for a multishot poll; on an older kernel it fails.
-- On io_uring, waits carry `IORING_ENTER_NO_IOWAIT` (Linux 6.15+), so an idle reactor is not counted as iowait; enable the `iowait` feature to leave the flag off.
+Handles are `Send + Sync`, cheap to clone, and not bound to a specific executor: each operation submits to the executor driving the current thread when its future is first polled.
+
+Single-operation methods (`read_at`, `write_at`, `read`, `write`, `recv`, `send`) submit one I/O operation and return the number of bytes transferred, which may be less than requested. Loop methods (`read_exact_at`, `write_all_at`, `read_exact`, `write_all`, `recv_exact`, `send_all`) keep submitting until the `Buffer` is full and return an `Outcome`, preserving the byte count already transferred if an error or unexpected EOF occurs mid-way.
+
+### Buffers
+
+Create a `Buffer` with `Buffer::zeroed`, `Buffer::copy_from` (copies a slice), or `Buffer::from` (takes a `Vec<u8>` or `Box<[u8]>` without copying), or wrap a custom `Arc<dyn Memory>` when you need shared or custom-managed backing memory. A `Buffer` is itself a view with `(offset, len)`; use `buffer.slice(offset, len)`, `buffer.skip(n)`, or `buffer.take(n)` to narrow it.
+
+### Cancellation
+
+Dropping an in-flight I/O future requests asynchronous cancellation and returns immediately without blocking. The runtime keeps the `Buffer` and descriptor alive in the background until the kernel finishes with them.
+
+- For `File`, dropping a read or write is safe to retry at the same offset.
+- For `Stream`, `StreamSocket`, and `DatagramSocket`, the operation may complete in the kernel before cancellation takes effect, so any bytes already consumed are lost.
+
+## Platform notes
+
+- Linux `io_uring` requires kernel 5.11 or newer (`Stream::hangup` requires 5.13+). On 6.15+, the `completion-backend/iowait` feature re-enables counting idle ring waits as system iowait.
+- On Windows with the IOCP backend, files passed to `File::new` must be opened with `FILE_FLAG_OVERLAPPED` (use `completion_async::OpenOptions`, which sets it automatically), and `Readiness` is not supported.
 
 ## Development
 
 - `task build`, `task check`, `task test`. `check` never rewrites files; `task fmt` does. `test` passes `CLI_ARGS` to nextest: `task test -- -E 'test(cancel)'`. Run `task lock` after changing dependencies.
 - Logging goes through the `log` facade only; tests get a logger from `tests/common`.
 - Test through the public API in `crates/*/tests/`, scratch files via `common::tempdir(tag)`. A bug fix starts with a test that fails without it.
-- Comments say what the code cannot: ABI constants and their source, spec clauses, workarounds and why.

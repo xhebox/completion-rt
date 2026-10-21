@@ -16,14 +16,7 @@ use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
-use completion_async::{Config, Executor, Readiness, timeout};
-
-/// The async driver the waits run on: it owns the reactor, so `block_on` both
-/// polls the wait and drives the backend under it.
-fn executor() -> Executor {
-	common::init_logging();
-	Executor::new(Config::default()).unwrap()
-}
+use completion_async::{Readiness, block_on, timeout};
 
 /// A wait resolves on the readiness, not before it: an empty pipe has nothing
 /// to read, and the peer's write is what ends the wait.
@@ -32,7 +25,7 @@ fn a_wait_resolves_when_the_descriptor_becomes_ready() {
 	const DELAY: Duration = Duration::from_millis(50);
 
 	let (reader, mut peer) = std::io::pipe().unwrap();
-	let mut executor = executor();
+	common::init_logging();
 	let readiness = Readiness::new(OwnedFd::from(reader));
 
 	let writer = std::thread::spawn(move || {
@@ -41,7 +34,7 @@ fn a_wait_resolves_when_the_descriptor_becomes_ready() {
 	});
 
 	let started = Instant::now();
-	executor.block_on(readiness.readable()).unwrap().unwrap();
+	block_on(readiness.readable()).unwrap().unwrap();
 	let waited = started.elapsed();
 	writer.join().unwrap();
 	assert!(
@@ -59,10 +52,10 @@ fn a_wait_resolves_when_the_descriptor_becomes_ready() {
 #[test]
 fn a_writable_descriptor_ends_a_write_wait() {
 	let (_reader, writer) = std::io::pipe().unwrap();
-	let mut executor = executor();
+	common::init_logging();
 	let readiness = Readiness::new(OwnedFd::from(writer));
 
-	executor.block_on(readiness.writable()).unwrap().unwrap();
+	block_on(readiness.writable()).unwrap().unwrap();
 }
 
 /// A wait is an operation like any other, so a cancel ends it: nothing is owed
@@ -70,21 +63,19 @@ fn a_writable_descriptor_ends_a_write_wait() {
 #[test]
 fn a_dropped_wait_gives_the_descriptor_back() {
 	let (reader, _peer) = std::io::pipe().unwrap();
-	let mut executor = executor();
+	common::init_logging();
 	let readiness = Readiness::new(OwnedFd::from(reader));
 
-	executor
-		.block_on(async {
-			let mut wait = std::pin::pin!(readiness.readable());
-			std::future::poll_fn(|cx| {
-				let _ = wait.as_mut().poll(cx);
-				std::task::Poll::Ready(())
-			})
-			.await;
+	block_on(async {
+		let mut wait = std::pin::pin!(readiness.readable());
+		std::future::poll_fn(|cx| {
+			let _ = wait.as_mut().poll(cx);
+			std::task::Poll::Ready(())
 		})
-		.unwrap();
-	executor
-		.block_on(timeout(Duration::from_millis(50)))
+		.await;
+	})
+	.unwrap();
+	block_on(timeout(Duration::from_millis(50)))
 		.unwrap()
 		.unwrap();
 	assert!(

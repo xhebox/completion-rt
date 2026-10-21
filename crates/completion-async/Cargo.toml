@@ -1,29 +1,30 @@
 [package]
 name = "completion-async"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.96.1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "The async runtime over completion-backend: executor and resource handles."
-license = "MIT"
-repository = "https://github.com/xhebox/completion-rt"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 completion-backend = { path = "../completion-backend" }
 fastrace = "0.7.19"
-log ={ version = "0.4.34", features = ["std", "kv"] }
-slotmap = "1"
-smallvec = "1"
-socket2 = "0.6"
+log.workspace = true
+scopeguard.workspace = true
+slotmap.workspace = true
+smallvec.workspace = true
+socket2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["event", "fs", "net"] }
+rustix = { workspace = true, features = ["event", "fs", "net"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-env_logger = "0.11"
-tempfile = "3"
+env_logger.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

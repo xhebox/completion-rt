@@ -171,7 +171,7 @@ pub(crate) fn tracked(len: usize) -> (Buffer, Tracked) {
 pub(crate) struct Tracked(Arc<AtomicBool>);
 
 impl Tracked {
-	/// True while any `Buffer` or `Span` naming the memory is alive.
+	/// True while any [`Buffer`] naming the memory is alive.
 	pub(crate) fn alive(&self) -> bool {
 		self.0.load(Relaxed)
 	}

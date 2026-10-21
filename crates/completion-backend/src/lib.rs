@@ -8,22 +8,14 @@
 //! passed to [`Backend::poll`], `data` being the value the submission filed
 //! with the operation.
 //!
-//! The caller must keep each operation's descriptor and [`Buffer`] alive until
-//! [`Backend::poll`] reports its completion.
-//!
-//! [`Driver`] wraps a [`Backend`] with what a single-threaded runtime needs on
-//! top of it: the thread's wait, its timers, and the cancellation of what is in
-//! flight. [`enter`] runs a closure on the driver entered on this thread, and
-//! [`Slot`] tracks one submitted operation or timer through to its response.
-//! For the high-level async runtime, executor, and resource handles, use
-//! `completion-async`.
+//! The caller must keep each operation's descriptor and [`IoVec`] memory alive
+//! until [`Backend::poll`] reports its completion. For the high-level async
+//! runtime, executor, and resource handles, use `completion-async`.
 
 mod backend;
 mod desc;
 mod error;
-mod memory;
 
-pub use backend::{Backend, BackendKind, Config, Op, Response};
+pub use backend::{Backend, BackendKind, Config, IoVec, Op, Response};
 pub use desc::{AsDescriptor, BorrowedDescriptor, OwnedDescriptor, OwnedSocket};
 pub use error::{Error, ErrorKind, Result};
-pub use memory::{Buffer, BufferPool, IoVec, Memory, Span};

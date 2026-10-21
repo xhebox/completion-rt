@@ -4,7 +4,7 @@ use std::sync::Arc;
 use completion_backend::{AsDescriptor, Op, OwnedDescriptor};
 
 use crate::Result;
-use crate::executor::submit;
+use crate::executor::with_rt_or_default;
 
 /// Handle for descriptors that signal readiness without transferring bytes
 /// (such as `eventfd`, `pidfd`, or `signalfd`).
@@ -37,7 +37,11 @@ impl Readiness {
 	/// readiness events.
 	pub fn readable(&self) -> impl Future<Output = Result<()>> + use<> {
 		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
-		async move { submit(fd, Op::Readable).await.map(|_response| ()) }
+		async move {
+			with_rt_or_default(|rt| rt.submit(fd, Op::Readable, None))?
+				.await
+				.map(|_response| ())
+		}
 	}
 
 	/// Waits once until the descriptor becomes writable.
@@ -46,6 +50,10 @@ impl Readiness {
 	/// readiness events.
 	pub fn writable(&self) -> impl Future<Output = Result<()>> + use<> {
 		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
-		async move { submit(fd, Op::Writable).await.map(|_response| ()) }
+		async move {
+			with_rt_or_default(|rt| rt.submit(fd, Op::Writable, None))?
+				.await
+				.map(|_response| ())
+		}
 	}
 }

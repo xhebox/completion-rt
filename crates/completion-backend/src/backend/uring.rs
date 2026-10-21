@@ -537,17 +537,15 @@ impl<T> Uring<T> {
 	fn prepare(&mut self, fd: BorrowedDescriptor<'_>, op: Op, data: T) -> Result<u64> {
 		let raw = types::Fd(fd.as_raw_fd());
 		match op {
-			Op::Read { offset, span } => {
+			Op::Read { offset, buf } => {
 				let offset = offset.unwrap_or(CURRENT_POSITION);
-				let buf = span.resolve()?;
 				let request = opcode::Read::new(raw, buf.ptr, capped(buf.len))
 					.offset(offset)
 					.build();
 				self.queue(request, Active::new(Kind::Count, data), None)
 			}
-			Op::Write { offset, span } => {
+			Op::Write { offset, buf } => {
 				let offset = offset.unwrap_or(CURRENT_POSITION);
-				let buf = span.resolve()?;
 				let request = opcode::Write::new(raw, buf.ptr.cast_const(), capped(buf.len))
 					.offset(offset)
 					.build();
@@ -593,13 +591,11 @@ impl<T> Uring<T> {
 					.build();
 				self.queue(request, Active::new(Kind::Accepted, data), None)
 			}
-			Op::Recv { span } => {
-				let buf = span.resolve()?;
+			Op::Recv { buf } => {
 				let request = opcode::Recv::new(raw, buf.ptr, capped(buf.len)).build();
 				self.queue(request, Active::new(Kind::Count, data), None)
 			}
-			Op::RecvWithFds { span } => {
-				let buf = span.resolve()?;
+			Op::RecvWithFds { buf } => {
 				// The control area the kernel writes a receive's descriptors into
 				// moves into the operation's `active` entry.
 				let mut area = Control::receive(buf.ptr, buf.len);
@@ -616,8 +612,7 @@ impl<T> Uring<T> {
 					None,
 				)
 			}
-			Op::Send { span, fds } => {
-				let buf = span.resolve()?;
+			Op::Send { buf, fds } => {
 				// The descriptors a send carries move into the control area the
 				// kernel reads through, and that area into the operation's
 				// `active` entry.

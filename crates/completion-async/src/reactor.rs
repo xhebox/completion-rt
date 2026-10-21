@@ -1,295 +1,481 @@
-//! I/O reactor managing in-flight backend operations and timers.
-
 use std::cell::RefCell;
-use std::collections::BTreeSet;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::task::Waker;
+use std::collections::BTreeMap;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use completion_backend::{AsDescriptor, Backend, Config, Error, ErrorKind, Response, Result};
+use completion_backend::{AsDescriptor, Backend, Buffer, Config, Error, Op, Response, Result};
+use smallvec::SmallVec;
 
-mod entries;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use completion_backend::Op;
-
-use entries::{Entries, Entry};
-
-/// Key identifying an in-flight operation or timer in [`Reactor`].
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Key(u64);
-
-/// Internal state of a [`Reactor`], owning the operation table, timer queue,
-/// and OS [`Backend`].
-///
-/// Wrapped in a single `RefCell` so a `poll` pass borrows the table, timers, and
-/// backend only while draining completions, before waking tasks.
-struct Driver {
-	/// Set by teardown: refusing new submissions and timers, and making a second
-	/// teardown a no-op.
-	stopped: bool,
-	/// Armed deadlines, nearest first. Reached only through this borrow, so the
-	/// wakers a fire raises run under the same invariant as the operations'.
-	timers: BTreeSet<(Instant, u64)>,
-	entries: Entries,
-	backend: Backend,
+thread_local! {
+	pub(crate) static REACTOR: RefCell<Option<Driver>> = const { RefCell::new(None) };
 }
 
-impl Driver {
-	fn new(config: Config) -> Result<Driver> {
-		Ok(Driver {
-			stopped: false,
-			timers: BTreeSet::new(),
-			entries: Entries::new(),
-			backend: Backend::new(&config)?,
-		})
-	}
+#[derive(Clone, Copy)]
+enum Key {
+	Op(u64),
+	Timer(TimerKey),
+}
 
-	/// Collects the backend's completions and wakes whoever waits. The whole
-	/// pass runs on `&mut self`, so a waker that re-enters the reactor panics
-	/// instead of touching the driver mid-flight.
-	fn poll(&mut self, timeout: Option<Duration>) -> Result<()> {
-		let entries = &mut self.entries;
-		self.backend.poll(timeout, |id, response| {
-			if let Some(waker) = entries.land(id, response) {
-				waker.wake();
-			}
-		})
-	}
+type TimerKey = (Instant, u64);
 
-	/// Whether every operation the driver holds has landed. An armed timer counts
-	/// as landed: it is the reactor's own, so it holds no backend work up.
-	fn is_idle(&self) -> bool {
-		self.entries
-			.iter()
-			.all(|(_, entry)| entry.is_done() || entry.timer.is_some())
-	}
+struct Entry {
+	inner: Mutex<EntryInner>,
+}
 
-	fn wait(&mut self, timeout: Option<Duration>) -> Result<()> {
-		let nearest = self
-			.timers
-			.first()
-			.map(|&(deadline, _)| deadline.saturating_duration_since(Instant::now()));
-		let within = match (timeout, nearest) {
-			(Some(timeout), Some(nearest)) => Some(timeout.min(nearest)),
-			(timeout, nearest) => timeout.or(nearest),
-		};
-		self.poll(within)?;
-		let now = Instant::now();
-		while let Some(&(deadline, id)) = self.timers.first() {
-			if deadline > now {
-				break;
-			}
-			self.timers.pop_first();
-			if let Some(waker) = self.entries.land(id, Ok(Response::Done)) {
-				waker.wake();
-			}
-		}
-		Ok(())
-	}
+struct EntryInner {
+	response: Option<Result<Response>>,
+	wakers: SmallVec<[Waker; 2]>,
+	cancelled: bool,
+	/// Remains `true` after `response` has been taken so [`Slot::wait`] and
+	/// scope pruning still see the entry as resolved.
+	done: bool,
+	/// Kept alive while the operation is in flight in the backend.
+	descriptor: Option<Arc<dyn AsDescriptor>>,
+	/// Kept alive while the operation is in flight in the backend.
+	buffer: Option<Buffer>,
+}
 
-	/// Asks the backend to cancel `id` if it has not been cancelled or settled yet.
-	/// A timer is disarmed here instead, and its poll reports the cancel.
-	fn cancel(&mut self, id: u64) {
-		let Some(entry) = self.entries.get_mut(id) else {
-			return;
-		};
-		if std::mem::replace(&mut entry.cancelled, true) || entry.is_done() {
-			return;
-		}
-		if let Some(deadline) = entry.timer {
-			self.timers.remove(&(deadline, id));
-			if let Some(waker) = self.entries.land(id, Err(Error::cancelled())) {
-				waker.wake();
-			}
-		} else {
-			self.backend.cancel(id);
+impl Entry {
+	fn pending(descriptor: Option<Arc<dyn AsDescriptor>>, buffer: Option<Buffer>) -> Entry {
+		Entry {
+			inner: Mutex::new(EntryInner {
+				response: None,
+				wakers: SmallVec::new(),
+				cancelled: false,
+				done: false,
+				descriptor,
+				buffer,
+			}),
 		}
 	}
 
-	fn drive_to_idle(&mut self) -> Result<()> {
-		self.poll(Some(Duration::ZERO))?;
-		while !self.is_idle() {
-			self.poll(None)?;
-		}
-		Ok(())
+	fn lock(&self) -> MutexGuard<'_, EntryInner> {
+		self.inner.lock().unwrap_or_else(|p| p.into_inner())
 	}
 
-	/// The teardown behind [`Reactor::shutdown`] and the driver's own drop; only
-	/// the first call does anything. It ends with the driver holding nothing, and
-	/// leaves every entry whose key is not yet released to resolve.
-	fn shutdown(&mut self, force: bool) -> Result<()> {
-		if std::mem::replace(&mut self.stopped, true) {
-			return Ok(());
+	fn complete(&self, response: Result<Response>) {
+		let mut inner = self.lock();
+		inner.buffer = None;
+		inner.descriptor = None;
+		inner.response = Some(response);
+		inner.done = true;
+		let wakers = std::mem::take(&mut inner.wakers);
+		// Drop the lock before waking so a synchronous poll on the same thread
+		// does not deadlock.
+		drop(inner);
+		for waker in wakers {
+			waker.wake();
 		}
-		// Timers stop before the drain so their futures fail with the stopped
-		// error instead of re-arming.
-		for (_, id) in std::mem::take(&mut self.timers) {
-			if let Some(waker) = self.entries.land(id, Err(Error::stopped())) {
-				waker.wake();
-			}
-		}
-		let cut: Vec<u64> = if force {
-			self.entries
-				.iter()
-				.filter_map(|(id, entry)| (!entry.cancelled && !entry.is_done()).then_some(id))
-				.collect()
-		} else {
-			Vec::new()
-		};
-		for &id in &cut {
-			self.cancel(id);
-		}
-		let result = self.drive_to_idle();
-		for id in cut {
-			if let Some(entry) = self.entries.get_mut(id)
-				&& matches!(&entry.response, Some(Err(error)) if error.kind() == ErrorKind::Cancelled)
-			{
-				entry.response = Some(Err(Error::stopped()));
-			}
-		}
-		result
 	}
+
+	fn is_done(&self) -> bool {
+		self.lock().done
+	}
+
+	fn mark_cancelled(&self) -> bool {
+		let mut inner = self.lock();
+		!std::mem::replace(&mut inner.cancelled, true) && !inner.done
+	}
+
+	fn take_or_register(&self, waker: &Waker) -> Option<Result<Response>> {
+		let mut inner = self.lock();
+		if let Some(response) = inner.response.take() {
+			return Some(response);
+		}
+		if !inner.wakers.iter().any(|w| w.will_wake(waker)) {
+			inner.wakers.push(waker.clone());
+		}
+		None
+	}
+
+	fn register(&self, waker: &Waker) -> bool {
+		let mut inner = self.lock();
+		if inner.done {
+			return true;
+		}
+		if !inner.wakers.iter().any(|w| w.will_wake(waker)) {
+			inner.wakers.push(waker.clone());
+		}
+		false
+	}
+
+	fn take_response(&self) -> Option<Result<Response>> {
+		self.lock().response.take()
+	}
+}
+
+struct Shared {
+	inner: Mutex<SharedInner>,
+}
+
+struct SharedInner {
+	stopped: bool,
+	/// Cancellations queued from any thread or during `drive`, drained by the
+	/// driver before polling the backend.
+	cancellations: Vec<u64>,
+	timers: BTreeMap<TimerKey, Arc<Entry>>,
+	next_timer: u64,
+	waker: Waker,
+}
+
+pub(crate) struct Driver {
+	backend: Backend<Arc<Entry>>,
+	shared: Arc<Shared>,
 }
 
 impl Drop for Driver {
 	fn drop(&mut self) {
-		let _ = self.shutdown(true);
+		let _ = self.teardown(true);
 	}
 }
 
-/// Shared handle to the single-threaded I/O driver and timer queue.
-#[derive(Clone)]
-pub(crate) struct Reactor(Rc<RefCell<Driver>>);
+impl Shared {
+	fn lock(&self) -> MutexGuard<'_, SharedInner> {
+		self.inner.lock().unwrap_or_else(|p| p.into_inner())
+	}
 
-impl Reactor {
+	fn queue_cancel(&self, id: u64) {
+		let mut inner = self.lock();
+		inner.cancellations.push(id);
+		inner.waker.wake_by_ref();
+	}
+
+	fn release(&self, key: Key, entry: &Entry) {
+		match key {
+			Key::Op(id) => {
+				if !entry.mark_cancelled() {
+					return;
+				}
+				self.queue_cancel(id);
+			}
+			Key::Timer(key) => {
+				self.lock().timers.remove(&key);
+			}
+		}
+	}
+
+	fn cancel_timer(&self, key: TimerKey) {
+		let timer = self.lock().timers.remove(&key);
+		if let Some(timer) = timer {
+			timer.complete(Err(Error::cancelled()));
+		}
+	}
+
+	fn take_cancellations(&self) -> Vec<u64> {
+		std::mem::take(&mut self.lock().cancellations)
+	}
+
+	fn is_stopped(&self) -> bool {
+		self.lock().stopped
+	}
+
+	fn stop(&self) -> Option<BTreeMap<TimerKey, Arc<Entry>>> {
+		let mut inner = self.lock();
+		if std::mem::replace(&mut inner.stopped, true) {
+			return None;
+		}
+		Some(std::mem::take(&mut inner.timers))
+	}
+
+	fn add_timer(&self, deadline: Instant) -> Option<(Key, Arc<Entry>)> {
+		let mut inner = self.lock();
+		if inner.stopped {
+			return None;
+		}
+		let entry = Arc::new(Entry::pending(None, None));
+		let key = (deadline, inner.next_timer);
+		inner.next_timer += 1;
+		inner.timers.insert(key, Arc::clone(&entry));
+		Some((Key::Timer(key), entry))
+	}
+
+	fn expire_timers(&self) {
+		let mut inner = self.lock();
+		let now = Instant::now();
+		while let Some((&(deadline, _), _)) = inner.timers.first_key_value() {
+			if deadline > now {
+				break;
+			}
+			let (_, timer) = inner
+				.timers
+				.pop_first()
+				.expect("the first timer is present");
+			timer.complete(Ok(Response::Done));
+		}
+	}
+
+	fn within(&self, timeout: Option<Duration>) -> Option<Duration> {
+		let inner = self.lock();
+		let nearest = inner
+			.timers
+			.first_key_value()
+			.map(|(&(deadline, _), _)| deadline.saturating_duration_since(Instant::now()));
+		match (timeout, nearest) {
+			(Some(timeout), Some(nearest)) => Some(timeout.min(nearest)),
+			(timeout, nearest) => timeout.or(nearest),
+		}
+	}
+}
+
+impl Driver {
 	pub(crate) fn new(config: Config) -> Result<Self> {
-		Ok(Reactor(Rc::new(RefCell::new(Driver::new(config)?))))
+		let backend = Backend::new(&config)?;
+		let waker = backend.waker();
+		Ok(Driver {
+			backend,
+			shared: Arc::new(Shared {
+				inner: Mutex::new(SharedInner {
+					stopped: false,
+					cancellations: Vec::new(),
+					timers: BTreeMap::new(),
+					next_timer: 0,
+					waker,
+				}),
+			}),
+		})
 	}
 
-	/// Returns a thread-safe [`Waker`] that wakes a blocking [`Reactor::drive`].
 	pub(crate) fn waker(&self) -> Waker {
-		self.0.borrow().backend.waker()
+		self.backend.waker()
 	}
 
-	/// Polls the backend and fires expired timers, waiting up to `timeout`.
-	pub(crate) fn drive(&self, timeout: Option<Duration>) -> Result<()> {
-		self.0.borrow_mut().wait(timeout)
+	pub(crate) fn drive(&mut self, timeout: Option<Duration>) -> Result<()> {
+		self.flush();
+		let within = self.within(timeout);
+		let polled = self.backend.poll(within, |_id, entry, response| {
+			entry.complete(response);
+		});
+		self.expire_timers();
+		polled
 	}
 
-	/// Stops accepting new submissions and drives all in-flight operations to
-	/// completion (cancelling them first if `force` is true).
-	pub(crate) fn shutdown(&self, force: bool) -> Result<()> {
-		self.0.borrow_mut().shutdown(force)
+	fn flush(&mut self) {
+		for id in self.shared.take_cancellations() {
+			self.backend.cancel(id);
+		}
 	}
 
-	/// Returns `true` if no backend operations are currently in flight.
-	#[cfg(test)]
-	pub(crate) fn idle(&self) -> bool {
-		self.0.borrow().is_idle()
+	fn expire_timers(&self) {
+		self.shared.expire_timers();
 	}
 
-	/// Submits `op` on `fd`, keeping `fd` and any referenced [`Buffer`](completion_backend::Buffer)
-	/// alive until the operation completes and its entry is removed.
-	pub(crate) fn submit(&self, fd: Arc<dyn AsDescriptor>, op: Op) -> Result<Key> {
+	fn within(&self, timeout: Option<Duration>) -> Option<Duration> {
+		self.shared.within(timeout)
+	}
+
+	pub(crate) fn shutdown(mut self, force: bool) -> Result<()> {
+		self.teardown(force)
+	}
+
+	fn teardown(&mut self, force: bool) -> Result<()> {
+		let Some(timers) = self.shared.stop() else {
+			return Ok(());
+		};
+		for timer in timers.into_values() {
+			timer.complete(Err(Error::cancelled()));
+		}
+		if force {
+			self.backend.cancel_all();
+		}
+		let mut result = Ok(());
+		while !self.is_idle() {
+			if let Err(error) = self.drive(None) {
+				result = Err(error);
+				break;
+			}
+		}
+		result
+	}
+
+	pub(crate) fn is_idle(&self) -> bool {
+		self.backend.is_idle()
+	}
+
+	pub(crate) fn submit(&mut self, fd: Arc<dyn AsDescriptor>, op: Op) -> Slot {
 		let buffer = op
 			.span()
 			.filter(|span| span.len() > 0)
 			.map(|span| span.buffer().clone());
-		let entry = Entry {
-			response: None,
-			waker: None,
-			detached: false,
-			cancelled: false,
-			timer: None,
-			_descriptor: Some(Arc::clone(&fd)),
-			buffer,
-		};
-		// The entry goes in first, and the id it gets is what the backend files
-		// the operation under, so a refusal rolls the slot straight back out.
-		let mut driver = self.0.borrow_mut();
-		if driver.stopped {
-			return Err(Error::stopped());
+		let entry = Arc::new(Entry::pending(Some(Arc::clone(&fd)), buffer));
+		if self.shared.is_stopped() {
+			return Slot::refused(Error::stopped());
 		}
-		let id = driver.entries.insert(entry);
-		if let Err(error) = driver.backend.submit(id, fd.as_descriptor(), op) {
-			driver.entries.remove(id);
-			return Err(error);
+		match self
+			.backend
+			.submit(fd.as_descriptor(), op, Arc::clone(&entry))
+		{
+			Ok(id) => Slot::new(Arc::clone(&self.shared), Key::Op(id), entry),
+			Err(error) => Slot::refused(error),
 		}
-		Ok(Key(id))
 	}
 
-	/// Registers a timer expiring at `deadline`.
-	pub(crate) fn submit_timer(&self, deadline: Instant) -> Result<Key> {
-		let entry = Entry {
-			response: None,
-			waker: None,
-			detached: false,
-			cancelled: false,
-			timer: Some(deadline),
-			_descriptor: None,
-			buffer: None,
-		};
-		let mut driver = self.0.borrow_mut();
-		if driver.stopped {
-			return Err(Error::stopped());
+	pub(crate) fn submit_timer(&self, deadline: Instant) -> Slot {
+		match self.shared.add_timer(deadline) {
+			Some((key, entry)) => Slot::new(Arc::clone(&self.shared), key, entry),
+			None => Slot::refused(Error::stopped()),
 		}
-		let id = driver.entries.insert(entry);
-		driver.timers.insert((deadline, id));
-		Ok(Key(id))
 	}
+}
 
-	/// Takes the completed result for `key` if ready, or registers `waker` and
-	/// returns `None`.
-	pub(crate) fn poll(&self, key: Key, waker: &Waker) -> Option<Result<Response>> {
-		let mut driver = self.0.borrow_mut();
-		// The id names the entry's own slot: one the driver let go of names
-		// nothing, not whatever operation took the slot afterwards.
-		let Some(entry) = driver.entries.get_mut(key.0) else {
-			return Some(Err(Error::cancelled()));
-		};
-		if !entry.is_done() {
-			if !entry.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
-				entry.waker = Some(waker.clone());
+pub(crate) fn enter<R>(
+	driver: Option<Driver>,
+	f: impl FnOnce(&mut Driver) -> R,
+) -> (Option<Driver>, R) {
+	REACTOR.with(|cell| {
+		let previous = if let Some(driver) = driver {
+			cell.borrow_mut().replace(driver)
+		} else {
+			if cell.borrow().is_none() {
+				*cell.borrow_mut() = Some(
+					Driver::new(Config::default())
+						.expect("the thread's default reactor could not be created"),
+				);
 			}
-			return None;
+			None
+		};
+		let result = f(cell.borrow_mut().as_mut().unwrap());
+		(previous, result)
+	})
+}
+
+pub(crate) fn submit(fd: Arc<dyn AsDescriptor>, op: Op) -> Slot {
+	enter(None, |driver| driver.submit(fd, op)).1
+}
+
+pub(crate) fn submit_timer(deadline: Instant) -> Slot {
+	enter(None, |driver| driver.submit_timer(deadline)).1
+}
+
+#[allow(private_interfaces)]
+pub(crate) enum Slot {
+	Live {
+		shared: Arc<Shared>,
+		entry: Arc<Entry>,
+		key: Option<Key>,
+		/// Only the primary slot (returned by submission) releases the
+		/// operation on drop; cloned handles held by a [`Scope`](crate::Scope)
+		/// do not.
+		owner: bool,
+	},
+	Refused(Option<Result<Response>>),
+}
+
+impl Clone for Slot {
+	fn clone(&self) -> Self {
+		match self {
+			Slot::Live {
+				shared, entry, key, ..
+			} => Slot::Live {
+				shared: Arc::clone(shared),
+				entry: Arc::clone(entry),
+				key: *key,
+				owner: false,
+			},
+			Slot::Refused(_) => Slot::Refused(None),
 		}
-		let response = driver
-			.entries
-			.remove(key.0)
-			.and_then(|mut entry| entry.response.take())
-			.unwrap_or_else(|| Err(Error::cancelled()));
-		Some(response)
 	}
+}
 
-	/// Requests asynchronous cancellation of the operation or timer `key`.
-	pub(crate) fn cancel(&self, key: Key) {
-		self.0.borrow_mut().cancel(key.0);
-	}
-
-	/// Detaches `key` when its future is dropped.
-	///
-	/// If the operation is still in flight, requests cancellation and keeps its
-	/// [`Buffer`](completion_backend::Buffer) and descriptor alive until the backend
-	/// reports completion.
-	pub(crate) fn release(&self, key: Key) {
-		let id = key.0;
-		let mut driver = self.0.borrow_mut();
-		// A key for an entry the driver let go of names nothing: its slot may
-		// already belong to another operation.
-		let Some(entry) = driver.entries.get_mut(id) else {
+impl Drop for Slot {
+	fn drop(&mut self) {
+		let Slot::Live {
+			shared,
+			entry,
+			key,
+			owner: true,
+		} = self
+		else {
 			return;
 		};
-		if entry.is_done() {
-			driver.entries.remove(id);
-			return;
+		if let Some(key) = key.take() {
+			shared.release(key, entry);
 		}
-		if entry.detached {
-			return;
+		let response = entry.take_response();
+		drop(response);
+	}
+}
+
+impl Slot {
+	fn new(shared: Arc<Shared>, key: Key, entry: Arc<Entry>) -> Slot {
+		Slot::Live {
+			shared,
+			entry,
+			key: Some(key),
+			owner: true,
 		}
-		entry.detached = true;
-		driver.cancel(id);
+	}
+
+	pub(crate) fn refused(error: Error) -> Slot {
+		Slot::Refused(Some(Err(error)))
+	}
+
+	pub(crate) fn cancel(&self) {
+		let Slot::Live {
+			shared, entry, key, ..
+		} = self
+		else {
+			return;
+		};
+		let Some(key) = key else {
+			return;
+		};
+		match *key {
+			Key::Timer(key) => shared.cancel_timer(key),
+			Key::Op(id) => {
+				if !entry.mark_cancelled() {
+					return;
+				}
+				shared.queue_cancel(id);
+			}
+		}
+	}
+
+	pub(crate) fn is_done(&self) -> bool {
+		match self {
+			Slot::Live { entry, .. } => entry.is_done(),
+			Slot::Refused(_) => true,
+		}
+	}
+
+	pub(crate) fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
+		let entry = match self {
+			Slot::Live { entry, .. } => Some(Arc::clone(entry)),
+			Slot::Refused(_) => None,
+		};
+		poll_fn(move |cx| match &entry {
+			Some(entry) => {
+				if entry.register(cx.waker()) {
+					return Poll::Ready(());
+				}
+				Poll::Pending
+			}
+			None => Poll::Ready(()),
+		})
+	}
+}
+
+impl Future for Slot {
+	type Output = Result<Response>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Response>> {
+		let this = self.get_mut();
+		match this {
+			Slot::Live { entry, key, .. } => {
+				if let Some(response) = entry.take_or_register(cx.waker()) {
+					*key = None;
+					return Poll::Ready(response);
+				}
+				Poll::Pending
+			}
+			Slot::Refused(response) => {
+				Poll::Ready(response.take().expect("a refused slot is polled only once"))
+			}
+		}
 	}
 }

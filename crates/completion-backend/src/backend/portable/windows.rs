@@ -17,10 +17,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
 
-use super::{Kind, Op, Progress, Route, counted, first_buffer};
+use super::{Kind, MAX_TRANSFER, Progress, SyncFlush, Transfer, counted};
 use crate::backend::Response;
 use crate::desc::BorrowedDescriptor;
-use crate::memory::Resolved;
+use crate::memory::IoVec;
 
 /// A descriptor as the platform names one: the poller watches only sockets, so
 /// a handle and a socket are told apart before anything else.
@@ -64,43 +64,60 @@ pub(super) fn borrow(raw: Raw) -> io::Result<Borrowed<'static>> {
 	}
 }
 
-/// Where an operation on `raw` runs. Only a socket is a readiness source here,
-/// so every call on a handle is a pool job.
-pub(super) fn route(raw: Raw, op: &Op) -> Route {
-	match (raw, op) {
+/// Whether `error` is a connect the kernel has begun and not finished: Winsock
+/// reports the handshake going on as `WSAEWOULDBLOCK`, which Rust maps to
+/// `WouldBlock`, and the poller reports the outcome as the socket turning
+/// writable.
+pub(super) fn in_progress(error: &io::Error) -> bool {
+	error.kind() == io::ErrorKind::WouldBlock
+}
+
+/// Where a byte transfer on `raw` runs: a handle's transfers are pool jobs, and
+/// a socket's are the poller's, which is the only readiness source here.
+pub(super) fn transfer(raw: Raw) -> Transfer {
+	match raw {
 		// The offset in the `OVERLAPPED` is what makes a file call positional,
 		// and a handle opened for overlapped I/O and a synchronous one both
 		// take it.
-		(Raw::Handle(_), Op::Read { .. }) => Route::Pool(Kind::Read),
-		(Raw::Handle(_), Op::Write { .. }) => Route::Pool(Kind::Write),
-		(Raw::Handle(_), Op::Fsync) => Route::Pool(Kind::Fsync),
-		(Raw::Handle(_), Op::Flush) => Route::Pool(Kind::Flush),
-		(Raw::Handle(_), Op::Allocate { offset, len }) => Route::Pool(Kind::Allocate {
-			offset: *offset,
-			len: *len,
-		}),
-		(Raw::Handle(_), Op::Punch { offset, len }) => Route::Pool(Kind::Punch {
-			offset: *offset,
-			len: *len,
-		}),
-		// A socket call and a wait for readiness differ only in what the
-		// operation says to do once the poller reports the descriptor.
-		(Raw::Socket(_), Op::Read { .. })
-		| (Raw::Socket(_), Op::Write { .. })
-		| (Raw::Socket(_), Op::Recv { .. })
-		| (Raw::Socket(_), Op::Accept)
-		| (Raw::Socket(_), Op::Readable)
-		| (Raw::Socket(_), Op::Writable) => Route::Watch,
-		(Raw::Socket(_), Op::Send { fds, .. }) if fds.is_empty() => Route::Watch,
-		(Raw::Socket(_), Op::Send { .. }) => {
-			Route::Unsupported("this backend cannot send descriptors")
-		}
-		(_, Op::RecvWithFds { .. }) => {
-			Route::Unsupported("this backend cannot receive descriptors")
-		}
-		(_, Op::Hangup) => Route::Unsupported("this backend cannot wait for a hangup"),
-		_ => Route::Unsupported("this operation is not implemented on this backend"),
+		Raw::Handle(_) => Transfer::Pool,
+		Raw::Socket(_) => Transfer::Watch,
 	}
+}
+
+/// Where a sync or a flush on `raw` runs: only a handle takes one.
+pub(super) fn sync_flush(raw: Raw) -> io::Result<SyncFlush> {
+	match raw {
+		Raw::Handle(_) => Ok(SyncFlush::Pool),
+		Raw::Socket(_) => Err(unsupported(
+			"this operation is not implemented on this backend",
+		)),
+	}
+}
+
+/// Where a space reservation on `raw` runs: only a handle takes one.
+pub(super) fn reservable(raw: Raw) -> io::Result<()> {
+	match raw {
+		Raw::Handle(_) => Ok(()),
+		Raw::Socket(_) => Err(unsupported(
+			"this operation is not implemented on this backend",
+		)),
+	}
+}
+
+/// Where a socket call and a wait for readiness on `raw` run: only a socket
+/// takes one.
+pub(super) fn pollable(raw: Raw) -> io::Result<()> {
+	match raw {
+		Raw::Socket(_) => Ok(()),
+		Raw::Handle(_) => Err(unsupported(
+			"this operation is not implemented on this backend",
+		)),
+	}
+}
+
+/// A send carrying descriptors has no form here, whichever descriptor names it.
+pub(super) fn control_message(_raw: Raw) -> io::Result<()> {
+	Err(unsupported("this backend cannot send descriptors"))
 }
 
 /// Runs a file call on the pool.
@@ -108,7 +125,7 @@ pub(super) fn run_file(
 	raw: Raw,
 	fdoff: u64,
 	kind: Kind,
-	buffer: Option<Resolved>,
+	buffer: Option<IoVec>,
 ) -> io::Result<Response> {
 	let handle = raw.handle()?;
 	match kind {
@@ -124,11 +141,12 @@ pub(super) fn run_file(
 		Kind::Allocate { offset, len } => allocate(handle, offset, len).map(|()| Response::Done),
 		Kind::Punch { offset, len } => punch(handle, offset, len).map(|()| Response::Done),
 		Kind::Read | Kind::Write => {
-			let Some((ptr, len)) = first_buffer(buffer) else {
+			let Some(buffer) = buffer else {
 				return Ok(Response::Count(0));
 			};
+			let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
 			let read = matches!(kind, Kind::Read);
-			match transfer(handle, fdoff, ptr, len as u32, read) {
+			match positioned(handle, fdoff, ptr, len as u32, read) {
 				Ok(moved) => Ok(Response::Count(moved)),
 				// A read beginning at or past the end of the file moves
 				// nothing, as a unix file reports too.
@@ -141,28 +159,37 @@ pub(super) fn run_file(
 	}
 }
 
-/// Calls the operation the poller reported ready that only a Winsock socket
-/// takes here: `read`/`write` on a socket are `recv`/`send`.
-pub(super) fn run_op(raw: Raw, op: &mut Op, buffer: Option<Resolved>) -> io::Result<Progress> {
-	let Some((ptr, len)) = first_buffer(buffer) else {
+/// Reads into the one buffer `buffer` names, on a socket the poller reported
+/// readable.
+pub(super) fn read(raw: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
+	let Some(buffer) = buffer else {
 		return Ok(Progress::Done(Response::Count(0)));
 	};
+	let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
 	let source = borrow(raw)?;
 	let socket = SockRef::from(&source);
-	match op {
-		// SAFETY: the reactor holds the memory behind `ptr` until the operation
-		// lands, and the call is the only mover of the range while the slice
-		// stands: `recv` only writes it and `send` only reads it.
-		Op::Read { .. } => counted(
-			socket.recv(unsafe { slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), len) }),
-		),
-		Op::Write { .. } => counted(socket.send(unsafe { slice::from_raw_parts(ptr, len) })),
-		_ => unreachable!("only a read and a write reach the poller through this call"),
-	}
+	// SAFETY: the reactor holds the memory behind `ptr` until the operation
+	// lands, and the call is the only mover of the range while the slice stands:
+	// `recv` only writes it.
+	counted(socket.recv(unsafe { slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), len) }))
+}
+
+/// Writes from the one buffer `buffer` names, on a socket the poller reported
+/// writable.
+pub(super) fn write(raw: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
+	let Some(buffer) = buffer else {
+		return Ok(Progress::Done(Response::Count(0)));
+	};
+	let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
+	let source = borrow(raw)?;
+	let socket = SockRef::from(&source);
+	// SAFETY: the reactor holds the memory behind `ptr` until the operation
+	// lands, and the call only reads it.
+	counted(socket.send(unsafe { slice::from_raw_parts(ptr, len) }))
 }
 
 /// One positional read or write, through an `OVERLAPPED` that names `fdoff`.
-fn transfer(handle: HANDLE, fdoff: u64, ptr: *mut u8, len: u32, read: bool) -> io::Result<usize> {
+fn positioned(handle: HANDLE, fdoff: u64, ptr: *mut u8, len: u32, read: bool) -> io::Result<usize> {
 	run_overlapped(handle, fdoff, |overlapped| {
 		// SAFETY: the reactor holds the memory behind `ptr` until the job lands, and the call copies through it until the completion.
 		unsafe {

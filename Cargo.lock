@@ -149,6 +149,8 @@ dependencies = [
  "log",
  "rustix",
  "slotmap",
+ "smallvec",
+ "socket2",
  "tempfile",
  "windows-sys 0.60.2",
 ]

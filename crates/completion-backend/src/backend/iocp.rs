@@ -1,9 +1,8 @@
 //! Windows IOCP backend; file handles require `FILE_FLAG_OVERLAPPED`.
 //!
-//! The reactor files each operation under an id, and this backend files it again
-//! under a key of its own `active` slot map, which the `OVERLAPPED` the kernel
-//! completes on carries: the kernel's packet names the key, the entry names the
-//! reactor's id.
+//! Each operation is filed under a key of this backend's `active` slot map,
+//! which the `OVERLAPPED` the kernel completes on carries: the kernel's packet
+//! names the key, and the key's FFI form is the id the completion reports.
 
 use std::collections::HashSet;
 use std::io;
@@ -13,14 +12,18 @@ use std::sync::Arc;
 use std::task::{Wake, Waker};
 use std::time::Duration;
 
-use slotmap::{DefaultKey, SlotMap};
+use slotmap::{DefaultKey, Key, KeyData, SlotMap};
+use socket2::SockAddr;
 use windows_sys::Win32::Foundation::{
-	ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+	ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
+	RtlNtStatusToDosError, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-	AcceptEx, INVALID_SOCKET, IPPROTO_TCP, SO_UPDATE_ACCEPT_CONTEXT, SOCK_STREAM, SOCKADDR,
-	SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, WSA_FLAG_OVERLAPPED, WSABUF, WSAGetLastError, WSARecv,
-	WSASend, WSASocketW, closesocket, getsockname, setsockopt,
+	ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNIX, AcceptEx, INVALID_SOCKET, IPPROTO_TCP,
+	LPFN_CONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SO_UPDATE_ACCEPT_CONTEXT,
+	SO_UPDATE_CONNECT_CONTEXT, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
+	SOCKET, SOL_SOCKET, WSA_FLAG_OVERLAPPED, WSABUF, WSAEINVAL, WSAGetLastError, WSAID_CONNECTEX,
+	WSAIoctl, WSARecv, WSASend, WSASocketW, bind, closesocket, getsockname, setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{
 	FILE_ALLOCATION_INFO, FILE_END_OF_FILE_INFO, FileAllocationInfo, FileEndOfFileInfo,
@@ -31,11 +34,12 @@ use windows_sys::Win32::System::IO::{
 	OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
 };
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
+use windows_sys::core::GUID;
 
 use super::Op;
 use crate::desc::{BorrowedDescriptor, OwnedSocket};
 use crate::error::{Error, Result};
-use crate::memory::{Resolved, Span};
+use crate::memory::Span;
 
 use super::{Config, Driver, Response};
 
@@ -44,8 +48,8 @@ const WAIT_MILLIS: u32 = 1000;
 /// `ERROR_IO_PENDING`, the same number as `WSA_IO_PENDING`: the operation was
 /// accepted and will complete later.
 const IO_PENDING: u32 = 997;
-/// `ERROR_OPERATION_ABORTED`: what `CancelIoEx` makes a stopped operation
-/// report.
+/// `ERROR_OPERATION_ABORTED`, the error a stopped operation reports: a cancel
+/// completes with it once the status block's `STATUS_CANCELLED` is converted.
 const ERROR_OPERATION_ABORTED: u32 = 995;
 /// `STATUS_END_OF_FILE`: the status a read beginning at or past the end of a
 /// file completes with. The status block carries the NTSTATUS itself, not the
@@ -55,9 +59,13 @@ const STATUS_END_OF_FILE: usize = 0xC000_0011;
 /// takes `sizeof(SOCKADDR) + 16` per address, and `SOCKADDR_STORAGE` is the
 /// widest `SOCKADDR`.
 const ADDRESS_LEN: u32 = (size_of::<SOCKADDR_STORAGE>() + 16) as u32;
-/// The current NTSTATUS conversion uses only the low word; it is not a general NTSTATUS-to-Win32 mapping.
-const fn ntstatus_errno(status: usize) -> i32 {
-	(status & 0xFFFF) as i32
+/// The `ERROR_OPERATION_ABORTED` a cancelled completion reports. The status
+/// block carries an `NTSTATUS`, and only the kernel's own conversion reads one:
+/// masking the low word turns `STATUS_CANCELLED` into `ERROR_NOT_OWNER`, which
+/// names an unrelated failure.
+fn ntstatus_errno(status: usize) -> i32 {
+	// SAFETY: plain `ntdll` call on the status the kernel wrote into the block.
+	unsafe { RtlNtStatusToDosError(status as NTSTATUS) as i32 }
 }
 
 /// The completion port every operation completes on; a packet with no
@@ -94,16 +102,17 @@ impl Wake for Port {
 	}
 }
 
-pub(crate) struct Iocp {
+pub(super) struct Iocp<T = ()> {
 	port: Arc<Port>,
 	/// What the kernel holds for an operation, filed under a key of this map:
 	/// the `OVERLAPPED` box the completion packet points at, and the pending
 	/// accept whose socket and address buffer it fills. An operation whose entry
 	/// the reactor has already taken keeps its place here until the packet
 	/// arrives.
-	active: SlotMap<DefaultKey, Active>,
+	active: SlotMap<DefaultKey, Active<T>>,
 	/// The `OVERLAPPED` boxes no operation is using, each with its allocation
 	/// kept for the next one.
+	#[allow(clippy::vec_box)]
 	free_overlapped: Vec<Box<Overlapped>>,
 	/// Handles already associated with this port. A handle stays associated
 	/// until it is closed, and a second `CreateIoCompletionPort` on it fails
@@ -111,17 +120,20 @@ pub(crate) struct Iocp {
 	associated: HashSet<usize>,
 }
 
-struct Active {
-	/// The id the reactor gave the operation, which the completion reports.
-	id: u64,
+struct Active<T> {
 	ov: Box<Overlapped>,
 	/// An `AcceptEx` in flight. The socket the kernel fills in and the address
 	/// buffer it writes are both alive until the completion lands.
 	accept: Option<Pending>,
+	/// A `ConnectEx` in flight, and the socket it connects: the socket takes up
+	/// the connection's context once the completion lands.
+	connect: Option<SOCKET>,
 	/// Whether the completion reports the bytes that moved. A sync, a flush, an
 	/// allocation and a punch report the completion itself, and it is kept here
 	/// because the reactor's entry may be gone by the time the packet arrives.
 	bytes: bool,
+	/// The caller's data, handed back with the completion.
+	data: T,
 }
 
 /// An `AcceptEx` the kernel has not completed yet.
@@ -145,10 +157,9 @@ impl Drop for Pending {
 #[repr(C)]
 struct Overlapped {
 	inner: OVERLAPPED,
-	/// The key the operation is filed under in `active`.
+	/// The key the operation is filed under in `active`, whose FFI form is the
+	/// id its completion reports.
 	key: DefaultKey,
-	/// The id the reactor gave the operation.
-	id: u64,
 	submit_error: i32,
 	handle: HANDLE,
 }
@@ -161,15 +172,14 @@ impl Overlapped {
 			// event" state Windows documents for an unused one.
 			inner: unsafe { std::mem::zeroed() },
 			key: DefaultKey::default(),
-			id: 0,
 			submit_error: 0,
 			handle: std::ptr::null_mut(),
 		}
 	}
 }
 
-impl Iocp {
-	pub(super) fn new(config: &Config) -> io::Result<Iocp> {
+impl<T> Iocp<T> {
+	pub(super) fn new(config: &Config) -> io::Result<Iocp<T>> {
 		if config.iopoll || config.sqpoll {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
@@ -194,16 +204,16 @@ impl Iocp {
 		unsafe { PostQueuedCompletionStatus(self.port.handle(), 0, 0, ov_ptr) };
 	}
 
-	/// Files `id` in `active` and returns the key it is filed under, together
-	/// with the `OVERLAPPED` the kernel completes on, filling the offset `fdoff`
-	/// for a byte transfer.
+	/// Files the operation in `active` and returns the key it is filed under,
+	/// together with the `OVERLAPPED` the kernel completes on, filling the
+	/// offset `fdoff` for a byte transfer.
 	fn enqueue(
 		&mut self,
-		id: u64,
 		fd: HANDLE,
 		fdoff: u64,
 		accept: Option<Pending>,
 		bytes: bool,
+		data: T,
 	) -> (DefaultKey, *mut OVERLAPPED) {
 		let mut ov = self
 			.free_overlapped
@@ -220,7 +230,6 @@ impl Iocp {
 			},
 			hEvent: std::ptr::null_mut(),
 		};
-		ov.id = id;
 		ov.submit_error = 0;
 		ov.handle = fd;
 		// The box lives on the heap, so the `OVERLAPPED` the kernel is handed
@@ -229,10 +238,11 @@ impl Iocp {
 		let key = self.active.insert_with_key(move |key| {
 			ov.key = key;
 			Active {
-				id,
 				ov,
 				accept,
+				connect: None,
 				bytes,
+				data,
 			}
 		});
 		(key, ov_ptr)
@@ -253,27 +263,28 @@ impl Iocp {
 	/// A call with no overlapped form: the reactor thread runs it and queues
 	/// the completion itself. Nonzero is a code `io::Error::from_raw_os_error`
 	/// takes; neither is a negative NTSTATUS.
-	fn in_thread(&mut self, id: u64, handle: HANDLE, work: impl FnOnce(HANDLE) -> i32) {
+	fn in_thread(&mut self, handle: HANDLE, work: impl FnOnce(HANDLE) -> i32, data: T) -> u64 {
 		let code = work(handle);
-		let (key, _) = self.enqueue(id, handle, 0, None, false);
+		let (key, _) = self.enqueue(handle, 0, None, false, data);
 		self.refuse(key, code);
+		key.data().as_ffi()
 	}
 
-	fn punch(&mut self, id: u64, handle: HANDLE, offset: u64, len: u64) -> io::Result<()> {
+	fn punch(&mut self, handle: HANDLE, offset: u64, len: u64, data: T) -> io::Result<u64> {
 		self.associate(handle)?;
 		let Some(last) = offset.checked_add(len) else {
 			// The range cannot name one, and there is nothing to ask the kernel
 			// for: the refusal is this operation's completion.
-			let (key, _) = self.enqueue(id, handle, 0, None, false);
+			let (key, _) = self.enqueue(handle, 0, None, false, data);
 			self.refuse(key, ERROR_INVALID_PARAMETER as i32);
-			return Ok(());
+			return Ok(key.data().as_ffi());
 		};
 		let range = FILE_ZERO_DATA_INFORMATION {
 			FileOffset: offset as i64,
 			BeyondFinalZero: last as i64,
 		};
 		let mut done = 0u32;
-		let (key, ov_ptr) = self.enqueue(id, handle, 0, None, false);
+		let (key, ov_ptr) = self.enqueue(handle, 0, None, false, data);
 		// SAFETY: a `DeviceIoControl` on an associated handle completes through
 		// the port; the range outlives the call, which with an `OVERLAPPED`
 		// only starts the operation.
@@ -295,10 +306,10 @@ impl Iocp {
 				self.refuse(key, error);
 			}
 		}
-		Ok(())
+		Ok(key.data().as_ffi())
 	}
 
-	fn accept(&mut self, id: u64, listener: SOCKET) -> io::Result<()> {
+	fn accept(&mut self, listener: SOCKET, data: T) -> io::Result<u64> {
 		self.associate(listener as HANDLE)?;
 		let mut pending = Pending {
 			socket: None,
@@ -323,7 +334,7 @@ impl Iocp {
 			return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
 		}
 		pending.socket = Some(socket);
-		let (key, ov_ptr) = self.enqueue(id, listener as HANDLE, 0, Some(pending), false);
+		let (key, ov_ptr) = self.enqueue(listener as HANDLE, 0, Some(pending), false, data);
 		// SAFETY: the same buffer and socket `pending` owns, and `ov_ptr` the
 		// box `active` owns; both outlive the call and the completion.
 		let ok = unsafe {
@@ -344,7 +355,59 @@ impl Iocp {
 				self.refuse(key, error);
 			}
 		}
-		Ok(())
+		Ok(key.data().as_ffi())
+	}
+
+	/// Connects `socket` to `addr` through `ConnectEx`, the only overlapped form
+	/// a connection has.
+	fn connect(&mut self, socket: SOCKET, addr: &SockAddr, data: T) -> io::Result<u64> {
+		self.associate(socket as HANDLE)?;
+		bind_unnamed(socket, addr)?;
+		let mut connect_ex: LPFN_CONNECTEX = None;
+		let mut bytes = 0u32;
+		// SAFETY: the GUID names the extension, and `connect_ex` is where its
+		// pointer is written: both sizes are those of the values themselves.
+		let rc = unsafe {
+			WSAIoctl(
+				socket,
+				SIO_GET_EXTENSION_FUNCTION_POINTER,
+				&WSAID_CONNECTEX as *const _ as *const core::ffi::c_void,
+				size_of::<GUID>() as u32,
+				&mut connect_ex as *mut LPFN_CONNECTEX as *mut core::ffi::c_void,
+				size_of::<LPFN_CONNECTEX>() as u32,
+				&mut bytes,
+				std::ptr::null_mut(),
+				None,
+			)
+		};
+		if rc != 0 {
+			return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+		}
+		let connect_ex = connect_ex.expect("a taken extension function pointer is set");
+		let (key, ov_ptr) = self.enqueue(socket as HANDLE, 0, None, false, data);
+		// The socket takes up the connection's context when the completion lands,
+		// which is where `poll` runs it; until then this entry names it.
+		self.active[key].connect = Some(socket);
+		// SAFETY: the address outlives the call, which copies it, and `ov_ptr`
+		// names the box `active` owns until the completion lands.
+		let ok = unsafe {
+			connect_ex(
+				socket,
+				addr.as_ptr().cast(),
+				addr.len(),
+				std::ptr::null(),
+				0,
+				std::ptr::null_mut(),
+				ov_ptr,
+			)
+		};
+		if ok == 0 {
+			let error = unsafe { WSAGetLastError() };
+			if error != IO_PENDING as i32 {
+				self.refuse(key, error);
+			}
+		}
+		Ok(key.data().as_ffi())
 	}
 
 	fn associate(&mut self, fd: HANDLE) -> io::Result<()> {
@@ -360,18 +423,13 @@ impl Iocp {
 		Ok(())
 	}
 
-	fn issue(&mut self, id: u64, fd: HANDLE, read: bool, span: &Span, fdoff: u64) -> Result<()> {
+	fn issue(&mut self, fd: HANDLE, read: bool, span: &Span, fdoff: u64, data: T) -> Result<u64> {
 		self.associate(fd)?;
-		// `ReadFile` and `WriteFile` transfer through one buffer, and their
-		// scatter forms want page-aligned unbuffered I/O: a gathered span moves
-		// short through its first extent, and a caller after all of it repeats
-		// the call. Every extent is still resolved, so one out of bounds refuses
-		// the submission.
-		let buf = span.resolve_first()?.unwrap_or(Resolved {
-			ptr: std::ptr::null_mut(),
-			len: 0,
-		});
-		let (key, ov_ptr) = self.enqueue(id, fd, fdoff, None, true);
+		// `ReadFile` and `WriteFile` transfer through the span's one range.
+		// Resolving it first refuses an out-of-bounds span before anything is
+		// queued.
+		let buf = span.resolve()?;
+		let (key, ov_ptr) = self.enqueue(fd, fdoff, None, true, data);
 		// SAFETY: standard Win32 calls; `ov_ptr` names the box in `active`,
 		// alive until the completion is collected.
 		let ok = unsafe {
@@ -399,40 +457,29 @@ impl Iocp {
 				self.refuse(key, error as i32);
 			}
 		}
-		Ok(())
+		Ok(key.data().as_ffi())
 	}
 
-	fn transfer(&mut self, id: u64, socket: SOCKET, span: &Span, send: bool) -> Result<()> {
+	fn transfer(&mut self, socket: SOCKET, span: &Span, send: bool, data: T) -> Result<u64> {
 		self.associate(socket as HANDLE)?;
-		// The array only has to outlive the call: an overlapped `WSASend` or
-		// `WSARecv` copies it, and keeps only the buffers it names. Resolving
-		// first refuses an extent out of bounds before anything is queued.
-		let mut wsabufs: Vec<WSABUF> = Vec::with_capacity(span.extents().len());
-		span.resolve_with(|buf| {
-			wsabufs.push(WSABUF {
-				len: capped(buf.len),
-				buf: buf.ptr,
-			});
-		})?;
-		let (key, ov_ptr) = self.enqueue(id, socket as HANDLE, 0, None, true);
-		let count = wsabufs.len() as u32;
+		// The `WSABUF` only has to outlive the call: an overlapped `WSASend` or
+		// `WSARecv` copies it, and keeps only the buffer it names. Resolving
+		// first refuses an out-of-bounds span before anything is queued.
+		let buf = span.resolve()?;
+		let wsabuf = WSABUF {
+			len: capped(buf.len),
+			buf: buf.ptr,
+		};
+		let (key, ov_ptr) = self.enqueue(socket as HANDLE, 0, None, true, data);
 		let mut moved: u32 = 0;
 		let mut flags: u32 = 0;
-		// SAFETY: standard Winsock calls; `wsabufs`, `flags` and `ov_ptr` outlive
+		// SAFETY: standard Winsock calls; `wsabuf`, `flags` and `ov_ptr` outlive
 		// the call, and the kernel writes into them only until the completion.
 		let failed = unsafe {
 			if send {
-				WSASend(socket, wsabufs.as_ptr(), count, &mut moved, 0, ov_ptr, None)
+				WSASend(socket, &wsabuf, 1, &mut moved, 0, ov_ptr, None)
 			} else {
-				WSARecv(
-					socket,
-					wsabufs.as_ptr(),
-					count,
-					&mut moved,
-					&mut flags,
-					ov_ptr,
-					None,
-				)
+				WSARecv(socket, &wsabuf, 1, &mut moved, &mut flags, ov_ptr, None)
 			}
 		};
 		if failed != 0 {
@@ -441,7 +488,7 @@ impl Iocp {
 				self.refuse(key, error);
 			}
 		}
-		Ok(())
+		Ok(key.data().as_ffi())
 	}
 
 	fn unsupported() -> io::Error {
@@ -449,6 +496,25 @@ impl Iocp {
 			io::ErrorKind::Unsupported,
 			"this operation is not implemented on the IOCP backend",
 		)
+	}
+
+	/// Routes a byte transfer by what the descriptor is: a stream socket takes
+	/// `recv`/`send`, and a handle — or a transfer that names an offset — takes
+	/// `ReadFile`/`WriteFile`.
+	fn read_or_write(
+		&mut self,
+		fd: BorrowedDescriptor<'_>,
+		read: bool,
+		span: &Span,
+		offset: Option<u64>,
+		data: T,
+	) -> Result<u64> {
+		match (offset, fd) {
+			(None, BorrowedDescriptor::Socket(socket)) => {
+				self.transfer(socket.as_raw_socket() as SOCKET, span, !read, data)
+			}
+			(offset, fd) => self.issue(as_handle(fd)?, read, span, offset.unwrap_or(0), data),
+		}
 	}
 }
 
@@ -520,6 +586,70 @@ fn family(listener: SOCKET) -> io::Result<i32> {
 	Ok(storage.ss_family as i32)
 }
 
+/// Binds `socket` to an unnamed local address of `addr`'s family. `ConnectEx`
+/// takes only a bound socket, and the local address a client's own holds is the
+/// unnamed one: the wildcard address for an internet family, and a socket with
+/// no path for a unix one.
+fn bind_unnamed(socket: SOCKET, addr: &SockAddr) -> io::Result<()> {
+	let family = addr.family();
+	let len = match family {
+		AF_INET => size_of::<SOCKADDR_IN>(),
+		AF_INET6 => size_of::<SOCKADDR_IN6>(),
+		// The length is what makes a unix address unnamed: a bare family says
+		// the `sun_path` is not there.
+		AF_UNIX => size_of::<ADDRESS_FAMILY>(),
+		other => {
+			return Err(io::Error::new(
+				io::ErrorKind::Unsupported,
+				format!("a connect cannot bind a socket of address family {other}"),
+			));
+		}
+	};
+	let mut storage: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
+	storage.ss_family = family;
+	// SAFETY: `storage` is zeroed but for the family, and `len` says how much of
+	// it the call reads.
+	if unsafe {
+		bind(
+			socket,
+			&storage as *const SOCKADDR_STORAGE as *const SOCKADDR,
+			len as i32,
+		)
+	} == 0
+	{
+		return Ok(());
+	}
+	let error = unsafe { WSAGetLastError() };
+	// A socket the caller bound already is bound: `WSAEINVAL` is what binding
+	// one twice reports.
+	if error == WSAEINVAL {
+		return Ok(());
+	}
+	Err(io::Error::from_raw_os_error(error))
+}
+
+/// Turns a completed `ConnectEx` into the operation's result. The socket is a
+/// plain descriptor until it takes up the connection's context — the same step
+/// a completed `AcceptEx` needs — so `SO_UPDATE_CONNECT_CONTEXT` runs before the
+/// operation reports its completion.
+fn connected(socket: SOCKET) -> io::Result<Response> {
+	// SAFETY: the option takes no value, which is what the null pointer and the
+	// zero length say; the socket is the one the connect ran on.
+	let rc = unsafe {
+		setsockopt(
+			socket,
+			SOL_SOCKET,
+			SO_UPDATE_CONNECT_CONTEXT,
+			std::ptr::null(),
+			0,
+		)
+	};
+	if rc != 0 {
+		return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+	}
+	Ok(Response::Done)
+}
+
 /// Turns a completed `AcceptEx` into the socket it made. The accepted socket
 /// is a plain descriptor until it is bound to the listener's context, so
 /// `SO_UPDATE_ACCEPT_CONTEXT` runs before it is handed over; a failure closes
@@ -574,50 +704,61 @@ fn as_socket(fd: BorrowedDescriptor<'_>) -> io::Result<SOCKET> {
 	}
 }
 
-impl Driver for Iocp {
-	fn submit(&mut self, id: u64, fd: BorrowedDescriptor<'_>, op: Op) -> Result<()> {
+/// The error a wait for readiness reports: a completion port has none.
+fn no_readiness() -> Error {
+	Error::from(io::Error::new(
+		io::ErrorKind::Unsupported,
+		"a completion port has no readiness wait",
+	))
+}
+
+impl<T> Driver<T> for Iocp<T> {
+	fn submit(&mut self, fd: BorrowedDescriptor<'_>, op: Op, data: T) -> Result<u64> {
 		match op {
-			Op::Read { offset, span } => self.issue(id, as_handle(fd)?, true, &span, offset)?,
-			Op::Write { offset, span } => self.issue(id, as_handle(fd)?, false, &span, offset)?,
-			Op::Fsync => {
-				self.in_thread(id, as_handle(fd)?, |handle| {
-					// SAFETY: a plain Win32 call on a handle the facade owns.
+			Op::Read { offset, span } => self.read_or_write(fd, true, &span, offset, data),
+			Op::Write { offset, span } => self.read_or_write(fd, false, &span, offset, data),
+			Op::Fsync => Ok(self.in_thread(
+				as_handle(fd)?,
+				|handle| {
+					// SAFETY: a plain Win32 call on a handle the caller holds.
 					if unsafe { FlushFileBuffers(handle) } == 0 {
 						unsafe { GetLastError() as i32 }
 					} else {
 						0
 					}
-				});
-			}
-			Op::Flush => self.in_thread(id, as_handle(fd)?, |_| 0),
-			Op::Allocate { offset, len } => {
-				self.in_thread(id, as_handle(fd)?, move |handle| {
-					allocate(handle, offset, len)
-				});
-			}
-			Op::Punch { offset, len } => self.punch(id, as_handle(fd)?, offset, len)?,
-			Op::Recv { span } => self.transfer(id, as_socket(fd)?, &span, false)?,
+				},
+				data,
+			)),
+			Op::Flush => Ok(self.in_thread(as_handle(fd)?, |_| 0, data)),
+			Op::Allocate { offset, len } => Ok(self.in_thread(
+				as_handle(fd)?,
+				move |handle| allocate(handle, offset, len),
+				data,
+			)),
+			Op::Punch { offset, len } => self
+				.punch(as_handle(fd)?, offset, len, data)
+				.map_err(Error::from),
+			Op::Recv { span } => self.transfer(as_socket(fd)?, &span, false, data),
 			Op::Send { span, fds } => {
 				if !fds.is_empty() {
 					return Err(Self::unsupported().into());
 				}
-				self.transfer(id, as_socket(fd)?, &span, true)?;
+				self.transfer(as_socket(fd)?, &span, true, data)
 			}
-			Op::Accept => self.accept(id, as_socket(fd)?)?,
-			Op::RecvWithFds { .. } => return Err(Self::unsupported().into()),
-			Op::Readable | Op::Writable | Op::Hangup => {
-				return Err(io::Error::new(
-					io::ErrorKind::Unsupported,
-					"a completion port has no readiness wait",
-				)
-				.into());
-			}
+			Op::RecvWithFds { .. } => Err(Self::unsupported().into()),
+			Op::Accept => self.accept(as_socket(fd)?, data).map_err(Error::from),
+			Op::Connect { addr } => self
+				.connect(as_socket(fd)?, &addr, data)
+				.map_err(Error::from),
+			Op::Readable | Op::Writable | Op::Hangup => Err(no_readiness()),
 		}
-		Ok(())
 	}
 
 	fn cancel(&mut self, id: u64) {
-		let Some(active) = self.active.values().find(|active| active.id == id) else {
+		// The id is the key the operation is filed under: one the port never
+		// handed out, or one whose slot has been taken again since, names nothing.
+		let key = DefaultKey::from(KeyData::from_ffi(id));
+		let Some(active) = self.active.get(key) else {
 			return;
 		};
 		let pointer = &*active.ov as *const Overlapped as *const OVERLAPPED;
@@ -626,10 +767,23 @@ impl Driver for Iocp {
 		unsafe { CancelIoEx(active.ov.handle, pointer) };
 	}
 
+	fn cancel_all(&mut self) {
+		for active in self.active.values() {
+			let pointer = &*active.ov as *const Overlapped as *const OVERLAPPED;
+			// SAFETY: the box stays in `active` until its completion is collected,
+			// which is after the kernel has stopped touching the OVERLAPPED.
+			unsafe { CancelIoEx(active.ov.handle, pointer) };
+		}
+	}
+
+	fn is_idle(&self) -> bool {
+		self.active.is_empty()
+	}
+
 	fn poll(
 		&mut self,
 		timeout: Option<Duration>,
-		mut complete: impl FnMut(u64, Result<Response>),
+		mut complete: impl FnMut(u64, T, Result<Response>),
 	) -> Result<()> {
 		let timeout_ms = match timeout {
 			None => u32::MAX,
@@ -663,9 +817,8 @@ impl Driver for Iocp {
 			// SAFETY: the pointer names a box we inserted into `active` at
 			// submit time and that is alive until this collection.
 			let ov = entry.lpOverlapped as *mut Overlapped;
-			let (key, id, result) = unsafe {
+			let (key, result) = unsafe {
 				let key = (*ov).key;
-				let id = (*ov).id;
 				let result = if (*ov).submit_error != 0 {
 					Err(io::Error::from_raw_os_error((*ov).submit_error))
 				} else if (*ov).inner.Internal == STATUS_END_OF_FILE {
@@ -674,27 +827,35 @@ impl Driver for Iocp {
 					// file does too.
 					Ok(0)
 				} else if (*ov).inner.Internal == 0 {
-					Ok((*ov).inner.InternalHigh as usize)
+					Ok((*ov).inner.InternalHigh)
 				} else {
 					Err(io::Error::from_raw_os_error(ntstatus_errno(
 						(*ov).inner.Internal,
 					)))
 				};
-				(key, id, result)
+				(key, result)
 			};
 			// The kernel is done with what it held for this operation, whether
 			// or not the reactor still waits for one of its own. The box goes
 			// back to the free list with its allocation kept.
-			let active = self.active.remove(key);
-			let bytes = active.as_ref().is_some_and(|active| active.bytes);
-			let accept = active.and_then(|active| {
+			let Some(active) = self.active.remove(key) else {
+				// Nothing is left to report this packet with: the operation's
+				// entry went when the port collected it.
+				continue;
+			};
+			let bytes = active.bytes;
+			let data = active.data;
+			let (accept, connect) = {
 				self.free_overlapped.push(active.ov);
-				active.accept
-			});
-			let response = match (result, accept) {
+				(active.accept, active.connect)
+			};
+			let response = match (result, accept, connect) {
 				// An accept reports the socket, not the bytes it moved.
-				(Ok(_), Some(pending)) => accepted(pending),
-				(result, pending) => {
+				(Ok(_), Some(pending), _) => accepted(pending),
+				// A connect reports nothing it moved: the socket is the result, once
+				// it takes up the connection's context.
+				(Ok(_), None, Some(socket)) => connected(socket),
+				(result, pending, _) => {
 					// A failed accept closes the socket it created.
 					drop(pending);
 					result.map(|moved| match bytes {
@@ -703,7 +864,7 @@ impl Driver for Iocp {
 					})
 				}
 			};
-			complete(id, response.map_err(landed));
+			complete(key.data().as_ffi(), data, response.map_err(landed));
 		}
 		Ok(())
 	}
@@ -713,7 +874,7 @@ impl Driver for Iocp {
 	}
 }
 
-impl Drop for Iocp {
+impl<T> Drop for Iocp<T> {
 	fn drop(&mut self) {
 		// A packet may still be on its way for an operation the reactor let go
 		// of, and the box it points at must not go before it arrives. Ask the

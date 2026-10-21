@@ -2,58 +2,68 @@
 //! `polling`).
 //!
 //! Run futures on the current thread's default executor with [`block_on`] and
-//! [`spawn`], or create a dedicated [`Executor`].
+//! [`spawn`], or create a dedicated [`Executor`]. A [`Scope`] is the
+//! cancellation tree an operation, timer, or task runs in: [`Scope::spawn`]
+//! runs a task in it, every operation the task submits is filed with it, and a
+//! task spawned while it is active inherits it. [`Executor::scope`] and
+//! [`scope`] both derive a child of the root scope, which nothing can cancel.
 //!
-//! Wrap an I/O resource in [`Facade`] to issue async operations. Each operation
-//! returns a future ([`Transfer`], [`Receive`], [`Op`], or [`Accept`]) whose
-//! available methods depend on the resource type:
+//! A resource is wrapped in the handle whose operations it takes:
 //!
 //! | Resource | Operations |
 //! |---|---|
-//! | `std::fs::File` ([`File`]) | `read_at`, `read_exact_at`, `write_at`, `write_all_at`, `sync`, `flush`, `allocate`, `punch` |
-//! | Pipes, stdio, `OwnedFd`, `OwnedHandle` | `read_at`, `read_exact_at`, `write_at`, `write_all_at` |
-//! | `UdpSocket`, `UnixDatagram` ([`SocketHandle`]) | `recv`, `recv_with_fds`, `send`, `send_with_fds`, `take_error` |
-//! | `TcpStream`, `UnixStream` ([`StreamHandle`]) | All [`SocketHandle`] methods, plus `recv_exact`, `recv_exact_with_fds`, `send_all`, `send_all_with_fds`, `shutdown`, `hangup` |
-//! | `TcpListener`, `UnixListener` ([`ListenerHandle`]) | `accept` |
-//! | [`Signal`] | `wait_readable`, `wait_writable` |
+//! | [`File`] | `read_at`, `read_exact_at`, `write_at`, `write_all_at`, `sync`, `flush`, `allocate`, `punch` |
+//! | [`Stream`] (pipes, PTYs, TAPs, stream sockets) | `read`, `read_exact`, `write`, `write_all`, `recv`, `recv_exact`, `send`, `send_all`, the `_with_fds` forms, `shutdown`, `take_error`, `hangup` |
+//! | [`Socket`] (datagram sockets) | `recv`, `recv_with_fds`, `send`, `send_with_fds`, `take_error` |
+//! | [`Listener`] (listening sockets) | `accept` |
+//! | [`Readiness`] (eventfd, pidfd, signalfd) | `readable`, `writable` |
 //!
-//! Custom socket types can implement [`SocketHandle`], [`StreamHandle`], or
-//! [`ListenerHandle`], or convert into a supported resource via [`Into`] when
-//! calling [`Facade::new`] / [`Facade::with_executor`].
+//! A single call may transfer fewer bytes than requested and returns the byte
+//! count; `_exact` and `_all` repeat until the [`Span`] is full and return an
+//! [`Outcome`] preserving partial progress on error or cancellation.
 //!
-//! Data transfers operate on [`Span`]s sliced from a [`Buffer`] (use
-//! [`Buffer::gather`] for scatter/gather I/O). A [`BufferPool`] hands out
-//! pre-faulted, page-aligned buffers for repeated transfers.
+//! Each handle is built from a standard resource (`impl Into<std::fs::File>`,
+//! `impl Into<OwnedDescriptor>`, `impl Into<OwnedSocket>`), is cheap to clone,
+//! and is `Send + Sync`. It binds no reactor: each operation resolves the
+//! reactor when first polled — the [`Executor`] whose [`block_on`] is running
+//! on the thread, or else the thread's default one. `try_take` returns the
+//! underlying resource once no clones or in-flight operations remain.
 //!
-//! Attach a [`Cancel`] token to any operation or [`Timeout`] with `.until(&cancel)`
-//! to abort it and wait until the kernel releases its buffers:
+//! Data transfers operate on [`Span`]s sliced from a [`Buffer`]. A
+//! [`BufferPool`] hands out pre-faulted, page-aligned buffers for repeated
+//! transfers.
+//!
+//! Run operations and timers inside a [`Scope`] to abort them and wait
+//! until the kernel releases their buffers:
 //!
 //! ```no_run
-//! # use completion_async::{Buffer, Cancel, Facade};
-//! # async fn example(socket: Facade<std::net::TcpStream>, buffer: Buffer, cancel: Cancel) {
-//! let outcome = socket.send_all(buffer.span(0, 512)).until(&cancel).await;
+//! # use completion_async::{Buffer, File, Scope, block_on};
+//! # fn example(file: std::fs::File, buffer: Buffer, scope: Scope) -> completion_async::Result<()> {
+//! let file = File::new(file);
+//! let outcome = block_on(async {
+//! 	scope.spawn(file.write_all_at(buffer.span(0, 512), 0)).await
+//! })?;
+//! # Ok(())
 //! # }
 //! ```
 
-mod completion;
+mod cancel;
 mod executor;
 mod global;
 mod io;
 mod net;
-mod op;
 mod reactor;
-mod signal;
+mod readiness;
 mod timer;
 
-pub use completion::Cancel;
+pub use cancel::Scope;
 pub use completion_backend::{
 	AsDescriptor, BackendKind, BorrowedDescriptor, Buffer, BufferPool, Config, Error, ErrorKind,
-	Memory, OwnedDescriptor, OwnedSocket, Result, Span, Status,
+	IoVec, Memory, OwnedDescriptor, OwnedSocket, Result, Span,
 };
-pub use executor::{Executor, Spawner, Task};
-pub use global::{block_on, spawn, try_spawn};
-pub use io::{File, OpenOptions};
-pub use net::{Accept, ListenerHandle, SocketHandle, StreamHandle};
-pub use op::{Facade, Op, Outcome, Receive, Received, Transfer};
-pub use signal::Signal;
-pub use timer::Timeout;
+pub use executor::{Executor, JoinHandle};
+pub use global::{block_on, scope, spawn};
+pub use io::{File, OpenOptions, Outcome};
+pub use net::{Listener, Received, Socket, Stream, ToSockAddr};
+pub use readiness::Readiness;
+pub use timer::timeout;

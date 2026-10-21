@@ -3,7 +3,7 @@ name = "completion-async"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96.1"
-description = "The async runtime and facade over completion-backend."
+description = "The async runtime over completion-backend: executor and resource handles."
 license = "MIT"
 repository = "https://github.com/xhebox/completion-rt"
 
@@ -12,6 +12,8 @@ completion-backend = { path = "../completion-backend" }
 fastrace = "0.7.19"
 log ={ version = "0.4.34", features = ["std", "kv"] }
 slotmap = "1"
+smallvec = "1"
+socket2 = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["event", "fs", "net"] }

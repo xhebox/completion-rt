@@ -4,7 +4,9 @@ mod common;
 
 use std::io;
 
-use completion_async::{Buffer, Config, ErrorKind, Executor, Facade, File, OpenOptions};
+#[cfg(unix)]
+use completion_async::Stream;
+use completion_async::{Buffer, Config, ErrorKind, Executor, File, OpenOptions};
 
 /// The async driver the file operations run on: it owns the reactor, so
 /// `block_on` both polls the operation and drives the backend under it.
@@ -43,99 +45,37 @@ fn a_direct_open_asks_the_kernel_for_direct_io() {
 	}
 }
 
-/// A pipe is not seekable, so the vector path must not insist on an offset:
-/// the console's rotated output and its stdin are pipes.
+/// A pipe is a stream, not a file: it has no offset to name, and its transfers
+/// move the descriptor's own position instead. The console's rotated output and
+/// its stdin are pipes.
 ///
 /// Windows: an anonymous pipe is a synchronous handle, which a completion port
 /// cannot own.
 #[cfg(unix)]
 #[test]
-fn a_pipe_takes_offsets_that_it_cannot_seek_to() {
+fn a_pipe_transfers_at_its_own_position() {
 	let (reader, writer) = std::io::pipe().unwrap();
 	let mut executor = executor();
-	let reader: Facade<std::io::PipeReader> = Facade::with_executor(reader, &executor);
-	let writer: Facade<std::io::PipeWriter> = Facade::with_executor(writer, &executor);
+	let reader = Stream::new(reader);
+	let writer = Stream::new(writer);
 
-	let payload: Buffer = Buffer::from_slice(b"hello");
+	let payload: Buffer = Buffer::from(b"hello");
 	let memory = payload.whole();
 	let moved = executor
-		.block_on(writer.write_at(memory.take(5), 0))
+		.block_on(writer.write(memory.take(5)))
 		.unwrap()
-		.into_result()
 		.unwrap();
 	assert_eq!(moved, 5);
 
 	let read: Buffer = Buffer::zeroed(5);
 	let memory = read.whole();
 	let moved = executor
-		.block_on(reader.read_at(memory.take(5), 0))
+		.block_on(reader.read_exact(memory.take(5)))
 		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(moved, 5);
-	assert_eq!(read.to_vec(), b"hello");
-}
-
-/// The vector path names host memory through a backing instead of owning a
-/// buffer; the bytes are checked through an owned read, which is the only copy
-/// this test may look at while a transfer is in flight.
-#[test]
-fn the_vector_path_goes_through_the_backing() {
-	let directory = common::tempdir("completion-vector").unwrap();
-	let path = directory.path().join("data");
-	std::fs::write(&path, []).unwrap();
-	let mut executor = executor();
-	let file: File = Facade::with_executor(
-		OpenOptions::new()
-			.read(true)
-			.write(true)
-			.open(&path)
-			.unwrap(),
-		&executor,
-	);
-
-	let source: Buffer = Buffer::from_slice(b"payload");
-	let memory = source.whole();
-	assert_eq!(
-		executor
-			.block_on(file.write_at(memory, 0))
-			.unwrap()
-			.into_result()
-			.unwrap(),
-		7
-	);
-
-	let sink: Buffer = Buffer::zeroed(7);
-	let memory = sink.whole();
-	assert_eq!(
-		executor
-			.block_on(file.read_at(memory, 0))
-			.unwrap()
-			.into_result()
-			.unwrap(),
-		7
-	);
-
-	let memory = sink.whole();
-	assert_eq!(
-		executor
-			.block_on(file.write_at(memory, 7))
-			.unwrap()
-			.into_result()
-			.unwrap(),
-		7
-	);
-	let whole: Buffer = Buffer::zeroed(14);
-	let memory = whole.whole();
-	assert_eq!(
-		executor
-			.block_on(file.read_at(memory, 0))
-			.unwrap()
-			.into_result()
-			.unwrap(),
-		14
-	);
-	assert_eq!(whole.to_vec(), b"payloadpayload");
+	assert_eq!(read.whole().to_vec(), b"hello");
 }
 
 /// A read that stops short of the buffer is the count it reached, not an
@@ -147,20 +87,16 @@ fn read_exact_at_reports_the_file_ending_first() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file = File::with_executor(common::open(&path).unwrap(), &executor);
+	let file = File::new(common::open(&path).unwrap());
 
 	let buffer: Buffer = Buffer::zeroed(8);
 	// One call: five bytes are left, and that is what it reports.
 	let memory = buffer.whole();
 	assert_eq!(
-		executor
-			.block_on(file.read_at(memory, 0))
-			.unwrap()
-			.into_result()
-			.unwrap(),
+		executor.block_on(file.read_at(memory, 0)).unwrap().unwrap(),
 		5
 	);
-	assert_eq!(&buffer.to_vec()[..5], b"hello");
+	assert_eq!(&buffer.whole().to_vec()[..5], b"hello");
 
 	let buffer: Buffer = Buffer::zeroed(8);
 	// The loop stops where the file does, and the progress it made is the
@@ -168,7 +104,11 @@ fn read_exact_at_reports_the_file_ending_first() {
 	let memory = buffer.whole();
 	let outcome = executor.block_on(file.read_exact_at(memory, 0)).unwrap();
 	assert_eq!(outcome.value, 5);
-	assert_eq!(&buffer.to_vec()[..5], b"hello", "what did arrive stays");
+	assert_eq!(
+		&buffer.whole().to_vec()[..5],
+		b"hello",
+		"what did arrive stays"
+	);
 	match outcome
 		.result
 		.expect_err("the file has fewer bytes than the buffer holds")
@@ -188,18 +128,17 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
-	let file = File::with_executor(
+	let file = File::new(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&executor,
 	);
 
 	let len = 4 << 20;
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Buffer = Buffer::from_slice(&bytes);
+	let payload: Buffer = Buffer::from(bytes.as_slice());
 	let memory = payload.whole();
 	executor
 		.block_on(file.write_all_at(memory, 0))
@@ -215,14 +154,18 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 		.unwrap()
 		.into_result()
 		.unwrap();
-	assert_eq!(read.to_vec(), bytes, "the payload did not come back whole");
+	assert_eq!(
+		read.whole().to_vec(),
+		bytes,
+		"the payload did not come back whole"
+	);
 }
 
-/// The facade binds the file to the executor, so a call site names neither an
-/// offset of a whole-buffer transfer nor the extents behind one.
+/// A handle reads and writes a buffer, and gives the plain file back once
+/// nothing else names it.
 #[test]
-fn the_facade_reads_and_writes_a_whole_buffer() {
-	let directory = common::tempdir("completion-facade").unwrap();
+fn the_handle_reads_and_writes_a_whole_buffer() {
+	let directory = common::tempdir("completion-handle").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
@@ -231,15 +174,14 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 		.write(true)
 		.open(&path)
 		.unwrap();
-	let file: File = Facade::with_executor(file, &executor);
+	let file = File::new(file);
 
-	let written: Buffer = Buffer::from_slice(b"hello");
+	let written: Buffer = Buffer::from(b"hello");
 	let memory = written.whole();
 	assert_eq!(
 		executor
 			.block_on(file.write_at(memory, 0))
 			.unwrap()
-			.into_result()
 			.unwrap(),
 		5
 	);
@@ -248,35 +190,29 @@ fn the_facade_reads_and_writes_a_whole_buffer() {
 	let read: Buffer = Buffer::zeroed(5);
 	let memory = read.whole();
 	assert_eq!(
-		executor
-			.block_on(file.read_at(memory, 0))
-			.unwrap()
-			.into_result()
-			.unwrap(),
+		executor.block_on(file.read_at(memory, 0)).unwrap().unwrap(),
 		5
 	);
-	assert_eq!(read.to_vec(), b"hello");
+	assert_eq!(read.whole().to_vec(), b"hello");
 
-	// Back to the plain file: nothing names it any more, so the facade gives it
+	// Back to the plain file: nothing names it any more, so the handle gives it
 	// up; no binding holds it any longer.
 	let plain = match file.try_take() {
-		Ok(plain) => plain,
-		Err(_) => panic!("the facade still holds the file"),
+		Some(plain) => plain,
+		None => panic!("the handle still holds the file"),
 	};
 	drop(plain);
 }
 
-/// A transfer owns a clone of the facade's resource and the reactor, so a
-/// poll-driven state machine can keep it beside the facade, let the facade go
+/// A transfer owns a clone of the handle's resource and the reactor, so a
+/// poll-driven state machine can keep it beside the handle, let the handle go
 /// before the first poll, and still drive the transfer to its end.
 #[test]
-fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
-	use completion_async::Transfer;
-
+fn a_transfer_outlives_the_handle_it_was_made_from() {
 	/// What one hand-written poll loop holds across its polls.
-	struct Reading {
+	struct Reading<F> {
 		file: Option<File>,
-		read: Transfer,
+		read: F,
 	}
 
 	/// A state machine boxes what it is waiting for, which needs the future to
@@ -289,7 +225,7 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 	let path = directory.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file = File::with_executor(common::open(&path).unwrap(), &executor);
+	let file = File::new(common::open(&path).unwrap());
 
 	let buffer: Buffer = Buffer::zeroed(5);
 	let memory = buffer.whole();
@@ -298,39 +234,31 @@ fn a_transfer_outlives_the_facade_binding_it_was_made_from() {
 		file: Some(file),
 		read,
 	};
-	// The facade goes: the transfer names the file through its own clone of
+	// The handle goes: the transfer names the file through its own clone of
 	// the resource.
 	drop(reading.file.take());
 
-	assert_eq!(
-		executor
-			.block_on(reading.read)
-			.unwrap()
-			.into_result()
-			.unwrap(),
-		5
-	);
-	assert_eq!(buffer.to_vec(), b"hello");
+	assert_eq!(executor.block_on(reading.read).unwrap().unwrap(), 5);
+	assert_eq!(buffer.whole().to_vec(), b"hello");
 }
 
 /// `flush` reports the file's deferred write-back errors by closing a
-/// duplicate, so the facade keeps its own descriptor and goes on working.
+/// duplicate, so the handle keeps its own descriptor and goes on working.
 #[test]
-fn flush_leaves_the_facade_usable() {
+fn flush_leaves_the_handle_usable() {
 	let directory = common::tempdir("completion-flush").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, []).unwrap();
 	let mut executor = executor();
-	let file = File::with_executor(
+	let file = File::new(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&executor,
 	);
 
-	let first: Buffer = Buffer::from_slice(b"hello");
+	let first: Buffer = Buffer::from(b"hello");
 	let memory = first.whole();
 	executor
 		.block_on(file.write_all_at(memory, 0))
@@ -339,9 +267,9 @@ fn flush_leaves_the_facade_usable() {
 		.unwrap();
 	executor.block_on(file.flush()).unwrap().unwrap();
 
-	// The duplicate the flush closed was not the facade's descriptor: the same
-	// facade still writes and reads.
-	let second: Buffer = Buffer::from_slice(b"world");
+	// The duplicate the flush closed was not the handle's descriptor: the same
+	// handle still writes and reads.
+	let second: Buffer = Buffer::from(b"world");
 	let memory = second.whole();
 	executor
 		.block_on(file.write_all_at(memory, 5))
@@ -356,7 +284,7 @@ fn flush_leaves_the_facade_usable() {
 		.unwrap()
 		.into_result()
 		.unwrap();
-	assert_eq!(read.to_vec(), b"helloworld");
+	assert_eq!(read.whole().to_vec(), b"helloworld");
 }
 
 /// A descriptor nothing owns anymore: `flush` must report the error rather than
@@ -378,7 +306,7 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 		raw
 	};
 
-	let file = File::with_executor(unsafe { std::fs::File::from_raw_fd(dead) }, &executor);
+	let file = File::new(unsafe { std::fs::File::from_raw_fd(dead) });
 	match executor.block_on(file.flush()).unwrap() {
 		Err(error) if error.kind() == ErrorKind::Failed => {
 			let error = io::Error::from(error);
@@ -395,8 +323,8 @@ fn flush_reports_a_descriptor_that_is_not_open() {
 	// number again, which aborts under a debug assertion. Take it back and leak
 	// it instead.
 	let plain = match file.try_take() {
-		Ok(plain) => plain,
-		Err(_) => panic!("an operation still names the file"),
+		Some(plain) => plain,
+		None => panic!("an operation still names the file"),
 	};
 	std::mem::forget(plain);
 }
@@ -406,13 +334,12 @@ fn filled(tag: &str, len: usize) -> (common::Scratch, std::path::PathBuf, Execut
 	let path = directory.path().join("data");
 	std::fs::write(&path, vec![0xab; len]).unwrap();
 	let executor = executor();
-	let file = File::with_executor(
+	let file = File::new(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&executor,
 	);
 	(directory, path, executor, file)
 }

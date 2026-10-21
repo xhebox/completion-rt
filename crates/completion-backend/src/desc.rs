@@ -1,5 +1,3 @@
-//! Platform descriptor and socket handle wrappers.
-
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

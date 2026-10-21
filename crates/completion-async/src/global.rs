@@ -1,74 +1,104 @@
-//! Thread-local default [`Executor`].
-//!
-//! Each thread lazily initializes its own [`Executor`] with [`Config::default`]
-//! on the first call to [`block_on`], [`spawn`], [`try_spawn`], [`Facade::new`](crate::Facade::new),
-//! or [`Timeout::new`](crate::Timeout::new), and keeps it until the thread exits.
-//!
-//! [`block_on`] cannot be nested on the same thread; tasks running inside
-//! [`block_on`] can spawn additional tasks with [`spawn`] or [`try_spawn`].
-//! Do not call these functions from thread-local destructors during thread teardown.
-
 use std::cell::{OnceCell, RefCell};
 use std::future::Future;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
 
-use crate::reactor::Reactor;
+use completion_backend::{AsDescriptor, Error, Op};
 
-use crate::{Config, Executor, Result, Spawner, Task};
+use crate::executor::Local;
+use crate::reactor::{self, Slot};
+use crate::{Config, Executor, JoinHandle, Result, Scope};
 
 thread_local! {
-	static EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
-	static HANDLES: OnceCell<(Spawner, Reactor)> = const { OnceCell::new() };
+	static DEFAULT: OnceCell<Executor> = const { OnceCell::new() };
+	static LOCAL: RefCell<Option<Rc<Local>>> = const { RefCell::new(None) };
 }
 
-/// Creates the executor and its handles on the first call on this thread, and
-/// returns the handles.
-///
-/// The handles are set only together with the executor, so once `HANDLES` is
-/// set, `EXECUTOR` is too, and `EXECUTOR` is not borrowed by this path.
-fn handles<R>(f: impl FnOnce(&Spawner, &Reactor) -> R) -> R {
-	HANDLES.with(|handles| {
-		let (spawner, reactor) = handles.get_or_init(|| {
-			let executor = Executor::new(Config::default())
-				.expect("the thread's global executor could not be created");
-			let handles = (executor.spawner(), executor.reactor().clone());
-			EXECUTOR.with(|slot| *slot.borrow_mut() = Some(executor));
-			handles
+fn default<R>(f: impl FnOnce(&Executor) -> R) -> R {
+	DEFAULT.with(|cell| {
+		let executor = cell.get_or_init(|| {
+			Executor::new(Config::default())
+				.expect("the thread's global executor could not be created")
 		});
-		f(spawner, reactor)
+		f(executor)
 	})
 }
 
-/// Runs `future` to completion on the current thread's default [`Executor`].
+/// Runs `future` to completion on the current thread's default [`Executor`],
+/// in its root [`Scope`].
 ///
 /// # Panics
 /// Panics if called from inside another [`block_on`] on the same thread, or if
 /// the default executor could not be created.
 pub fn block_on<F: Future>(future: F) -> Result<F::Output> {
-	handles(|_, _| ());
-	EXECUTOR.with(|slot| {
-		let mut slot = slot
-			.try_borrow_mut()
-			.expect("the thread's global executor is already running; block_on cannot be nested");
-		slot.as_mut().expect("initialized above").block_on(future)
-	})
+	assert!(
+		LOCAL.with(|slot| slot.borrow().is_none()),
+		"the thread's global executor is already running; block_on cannot be nested"
+	);
+	default(|executor| executor.run(future))
 }
 
-/// Spawns a thread-local task on the current thread's default [`Executor`].
+/// Creates a child [`Scope`] of the scope active on this thread, or of a new
+/// root scope when no executor is running.
+pub fn scope() -> Scope {
+	current_scope().unwrap_or_else(Scope::new).child()
+}
+
+/// Spawns a thread-local task in the scope active on this thread, on the
+/// current thread's active [`Executor`] or else on the thread's default one.
 ///
-/// Can be called before or during [`block_on`]. Panics if the thread's executor
-/// has already been destroyed.
-pub fn spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Task<T> {
-	handles(|spawner, _| spawner.spawn(future))
+/// Can be called before or during [`block_on`].
+pub fn spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> JoinHandle<T> {
+	let local = local();
+	let join = local.spawn(local.current_scope(), future);
+	JoinHandle { join }
 }
 
-/// Spawns a thread-local task on the current thread's default [`Executor`], or
-/// returns [`ErrorKind::ExecutorClosed`](crate::ErrorKind::ExecutorClosed) if
-/// the thread's executor has been destroyed.
-pub fn try_spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> Result<Task<T>> {
-	handles(|spawner, _| spawner.try_spawn(future))
+pub(crate) fn submit(fd: Arc<dyn AsDescriptor>, op: Op) -> Slot {
+	submitted(|| reactor::submit(fd, op))
 }
 
-/// Returns the [`Reactor`] of the current thread's default [`Executor`].
-pub(crate) fn reactor() -> Reactor {
-	handles(|_, reactor| reactor.clone())
+pub(crate) fn submit_timer(deadline: Instant) -> Slot {
+	submitted(|| reactor::submit_timer(deadline))
+}
+
+fn submitted(make: impl FnOnce() -> Slot) -> Slot {
+	let Some(scope) = current_scope() else {
+		return make();
+	};
+	if scope.is_cancelled() {
+		return Slot::refused(Error::cancelled());
+	}
+	let slot = make();
+	scope.track(slot.clone());
+	slot
+}
+
+fn current_scope() -> Option<Scope> {
+	LOCAL.with(|slot| slot.borrow().as_ref().map(|local| local.current_scope()))
+}
+
+pub(crate) fn enter_local(local: &Rc<Local>) -> EnteredLocal {
+	EnteredLocal {
+		previous: LOCAL.with(|slot| slot.replace(Some(Rc::clone(local)))),
+	}
+}
+
+pub(crate) struct EnteredLocal {
+	previous: Option<Rc<Local>>,
+}
+
+impl Drop for EnteredLocal {
+	fn drop(&mut self) {
+		let previous = self.previous.take();
+		LOCAL.with(|slot| *slot.borrow_mut() = previous);
+	}
+}
+
+pub(crate) fn local() -> Rc<Local> {
+	if let Some(local) = LOCAL.with(|slot| slot.borrow().clone()) {
+		return local;
+	}
+	default(|executor| Rc::clone(&executor.local))
 }

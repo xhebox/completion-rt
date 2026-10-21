@@ -10,12 +10,12 @@ mod common;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use completion_async::{Buffer, Config, ErrorKind, Executor, File, Timeout};
+use completion_async::{Buffer, Config, ErrorKind, Executor, File, timeout};
 
 fn executor() -> Executor {
 	common::init_logging();
@@ -79,7 +79,7 @@ fn a_task_woken_from_another_thread_ends_block_on() {
 		let mut executor = executor();
 		// What is awaited this time is a task, whose waker is the executor's
 		// own: the task is made ready, and the reactor nothing.
-		let task = executor.spawner().spawn(handed_over(flag, handoff));
+		let task = executor.spawn(handed_over(flag, handoff));
 		executor.block_on(task).unwrap();
 		let _ = done.send(());
 	});
@@ -111,7 +111,9 @@ fn a_task_spawned_while_the_root_future_is_pending_runs_without_a_notify() {
 		let mut executor = executor();
 		let ran = Arc::new(AtomicBool::new(false));
 		let flag = Arc::clone(&ran);
-		let spawner = executor.spawner();
+		// The scope, not the executor: `block_on` holds the executor mutably for
+		// the whole run, and the scope is what a spawn goes through.
+		let scope = executor.scope();
 		let mut spawned = false;
 		let outcome = executor.block_on(std::future::poll_fn(move |_| {
 			if ran.load(Ordering::Acquire) {
@@ -122,9 +124,7 @@ fn a_task_spawned_while_the_root_future_is_pending_runs_without_a_notify() {
 				// raises no other, and nothing touches the reactor.
 				spawned = true;
 				let flag = Arc::clone(&flag);
-				spawner
-					.spawn(async move { flag.store(true, Ordering::Release) })
-					.detach();
+				drop(scope.spawn(async move { flag.store(true, Ordering::Release) }));
 			}
 			Poll::Pending
 		}));
@@ -138,103 +138,37 @@ fn a_task_spawned_while_the_root_future_is_pending_runs_without_a_notify() {
 	assert!(completed.unwrap(), "block_on failed before the task ran");
 }
 
-#[test]
-fn block_on_runs_the_tasks_it_finds_ready() {
-	let mut executor = executor();
-	let ran = Arc::new(AtomicUsize::new(0));
-	let flag = Arc::clone(&ran);
-	executor
-		.spawner()
-		.spawn(async move { flag.fetch_add(1, Ordering::AcqRel) })
-		.detach();
-	executor.block_on(async {}).unwrap();
-	assert_eq!(ran.load(Ordering::Acquire), 1);
-}
-
-/// The executor owns the reactor, so dropping it drops the reactor too. A
-/// facade built from that executor — the kibotos shape, where a
-/// mount's executor goes and a facade bound to it stays — is then left with
-/// nothing to drive its operations: the next one has to be refused at once, not
-/// accepted into a table no poller will ever reach.
+/// The executor owns the reactor, so dropping it drops the reactor too: an
+/// operation already in flight on that reactor resolves to `ErrorKind::Cancelled`
+/// when polled after the executor is dropped.
 #[test]
 fn an_operation_after_the_executor_drops_is_refused() {
-	let directory = common::tempdir("completion-drop").unwrap();
-	let path = directory.path().join("data");
-	std::fs::write(&path, b"hello").unwrap();
-
-	let executor = executor();
-	let file = File::with_executor(common::open(&path).unwrap(), &executor);
+	let mut executor = executor();
+	let (_peer, socket) = socket_pair();
 	let buffer: Buffer = Buffer::zeroed(5);
-	let payload = buffer.whole();
+	let mut recv = Box::pin(socket.recv(&buffer));
+	executor
+		.block_on(std::future::poll_fn(|cx| {
+			assert!(recv.as_mut().poll(cx).is_pending());
+			Poll::Ready(())
+		}))
+		.unwrap();
 	drop(executor);
 
-	let mut read = std::pin::pin!(file.read_at(payload, 0));
 	let mut cx = Context::from_waker(Waker::noop());
-	// Nothing drives this submission, so it either lands on this poll or never
-	// does. Failing here rather than parking keeps a regression from hanging the
-	// suite.
-	let Poll::Ready(outcome) = std::future::Future::poll(read.as_mut(), &mut cx) else {
-		panic!("the operation submitted after the executor dropped parked forever");
+	let Poll::Ready(outcome) = std::future::Future::poll(recv.as_mut(), &mut cx) else {
+		panic!("the operation parked forever after the executor dropped");
 	};
-	match outcome.into_result() {
-		Err(error) => assert_eq!(error.kind(), ErrorKind::Stopped, "{error}"),
+	match outcome {
+		Err(error) => assert_eq!(error.kind(), ErrorKind::Cancelled, "{error}"),
 		Ok(count) => panic!("a gone reactor took the operation and moved {count} bytes"),
 	}
 }
 
 #[test]
-fn a_local_executor_reads_a_real_file() {
-	let directory = common::tempdir("completion-local").unwrap();
-	let path = directory.path().join("data");
-	std::fs::write(&path, b"hello").unwrap();
-	let mut executor = executor();
-	let file = File::with_executor(common::open(&path).unwrap(), &executor);
-	let buffer = Buffer::zeroed(5);
-	let payload = buffer.whole();
-	let outcome = executor.block_on(file.read_at(payload, 0)).unwrap();
-	assert_eq!(outcome.into_result().unwrap(), 5);
-	assert_eq!(buffer.to_vec(), b"hello");
-}
-
-#[test]
-fn a_spawner_cannot_spawn_after_its_executor_drops() {
-	let executor = executor();
-	let spawner = executor.spawner();
-	drop(executor);
-	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-		spawner.spawn(async {}).detach();
-	}));
-	assert!(caught.is_err(), "a dead executor accepted a task");
-}
-
-#[test]
-fn try_spawn_reports_a_dropped_executor() {
-	let executor = executor();
-	let spawner = executor.spawner();
-	drop(executor);
-	assert!(
-		spawner
-			.try_spawn(async {})
-			.is_err_and(|error| error.kind() == ErrorKind::ExecutorClosed)
-	);
-}
-
-#[test]
-fn a_dropped_executor_error_is_other_in_io() {
-	let executor = executor();
-	let spawner = executor.spawner();
-	drop(executor);
-	let error = spawner.try_spawn(async {}).err().unwrap();
-	assert_eq!(
-		std::io::Error::from(error).kind(),
-		std::io::ErrorKind::Other
-	);
-}
-
-#[test]
 fn awaiting_a_task_after_its_executor_drops_panics() {
 	let executor = executor();
-	let mut task = Box::pin(executor.spawner().spawn(std::future::pending::<()>()));
+	let mut task = Box::pin(executor.spawn(std::future::pending::<()>()));
 	drop(executor);
 	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
 		task.as_mut().poll(&mut Context::from_waker(Waker::noop()))
@@ -252,7 +186,7 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 		let path = directory.path().join("data");
 		std::fs::write(&path, b"hello").unwrap();
 		let mut executor = executor();
-		let busy = executor.spawner().spawn(std::future::poll_fn(move |cx| {
+		let _busy = executor.spawn(std::future::poll_fn(move |cx| {
 			if flag.load(Ordering::Acquire) {
 				Poll::Ready(())
 			} else {
@@ -260,18 +194,17 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 				Poll::Pending
 			}
 		}));
-		let file = File::with_executor(common::open(&path).unwrap(), &executor);
+		let file = File::new(common::open(&path).unwrap());
 		let buffer = Buffer::zeroed(5);
 		let payload = buffer.whole();
-		let timeout = Timeout::with_executor(Duration::from_millis(1), &executor);
+		let timeout = timeout(Duration::from_millis(1));
 		executor
 			.block_on(async {
-				assert_eq!(file.read_at(payload, 0).await.into_result().unwrap(), 5);
+				assert_eq!(file.read_at(payload, 0).await.unwrap(), 5);
 				timeout.await.unwrap();
 			})
 			.unwrap();
-		assert_eq!(buffer.to_vec(), b"hello");
-		drop(busy);
+		assert_eq!(buffer.whole().to_vec(), b"hello");
 		let _ = done.send(());
 	});
 	let completed = finished.recv_timeout(Duration::from_secs(3));
@@ -280,45 +213,37 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 	completed.expect("a self-waking task starved real I/O or the timer");
 }
 
-fn socket_pair(
-	executor: &completion_async::Executor,
-) -> (
-	std::net::TcpStream,
-	completion_async::Facade<std::net::TcpStream>,
-) {
+fn socket_pair() -> (std::net::TcpStream, completion_async::Stream) {
 	let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
 	let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let (stream, _) = listener.accept().unwrap();
 	stream.set_nonblocking(true).unwrap();
-	(
-		peer,
-		completion_async::Facade::with_executor(stream, executor),
-	)
+	(peer, completion_async::Stream::new(stream))
 }
 
 fn stalled_task(
 	executor: &mut Executor,
 	buffer: &Buffer,
 ) -> (std::net::TcpStream, impl Future<Output = ()> + use<>) {
-	let (peer, socket) = socket_pair(&executor);
+	let (peer, socket) = socket_pair();
 	let payload = buffer.whole();
-	let task = executor.spawner().spawn(async move {
-		socket.recv(payload).await.into_result().unwrap();
+	let task = executor.spawn(async move {
+		socket.recv(payload).await.unwrap();
 	});
 	executor
-		.block_on(Timeout::with_executor(Duration::from_millis(1), &executor))
+		.block_on(timeout(Duration::from_millis(1)))
 		.unwrap()
 		.unwrap();
 	(peer, task)
 }
 
 /// The deadline is fixed when the timer is constructed, not when it is first
-/// polled: a `Timeout` held past its duration has already come due, so the
+/// polled: a timer held past its duration has already come due, so the
 /// first poll finds it fired rather than starting the wait then.
 #[test]
 fn a_timeout_held_past_its_duration_fires_on_its_first_poll() {
 	let mut executor = executor();
-	let timeout = Timeout::with_executor(Duration::from_millis(5), &executor);
+	let timeout = timeout(Duration::from_millis(5));
 	std::thread::sleep(Duration::from_millis(30));
 	let started = std::time::Instant::now();
 	executor.block_on(timeout).unwrap().unwrap();
@@ -328,59 +253,67 @@ fn a_timeout_held_past_its_duration_fires_on_its_first_poll() {
 	);
 }
 
-/// A timer armed before the reactor stops fails from the poll, where the
-/// constructor could not know, and the error names the shutdown rather than a
-/// failed call.
+/// A timer armed on an executor before that executor drops resolves to
+/// `ErrorKind::Cancelled` when polled after teardown.
 #[test]
 fn a_timer_armed_before_a_stop_reports_stopped_from_the_poll() {
-	let executor = executor();
-	let timeout = Timeout::with_executor(Duration::from_secs(3600), &executor);
+	let mut executor = executor();
+	let mut timeout = Box::pin(timeout(Duration::from_secs(3600)));
+	executor
+		.block_on(std::future::poll_fn(|cx| {
+			assert!(timeout.as_mut().poll(cx).is_pending());
+			Poll::Ready(())
+		}))
+		.unwrap();
 	drop(executor);
-	let mut timeout = Box::pin(timeout);
 	let mut cx = Context::from_waker(Waker::noop());
 	let Poll::Ready(error) = std::future::Future::poll(timeout.as_mut(), &mut cx) else {
 		panic!("a timer armed before the stop stayed pending");
 	};
 	let error = error.unwrap_err();
-	assert_eq!(error.kind(), ErrorKind::Stopped, "{error}");
+	assert_eq!(error.kind(), ErrorKind::Cancelled, "{error}");
 }
 
 #[test]
-fn dropping_a_task_defers_cancellation_and_returns_its_io_buffer() {
+fn dropping_a_join_handle_detaches_the_task() {
 	let mut executor = executor();
-	let (buffer, live) = common::tracked(8);
-	let (_peer, task) = stalled_task(&mut executor, &buffer);
-	drop(task);
-	drop(buffer);
-	assert!(live.alive(), "Task::drop destroyed its future inline");
-	// A pass over the executor drops the task's future, which releases its I/O
-	// as a detached cancel; a pass over the reactor then reaps that cancel.
-	executor.block_on(async {}).unwrap();
+	let ran = Arc::new(AtomicBool::new(false));
+	let flag = Arc::clone(&ran);
+	let handle = executor.spawn(async move {
+		timeout(Duration::from_millis(5)).await.unwrap();
+		flag.store(true, Ordering::Release);
+	});
+	drop(handle);
+	// Longer than the task's own timer, so a task left running has the time to
+	// reach the end of its body.
 	executor
-		.block_on(Timeout::with_executor(Duration::from_millis(10), &executor))
+		.block_on(timeout(Duration::from_millis(30)))
 		.unwrap()
 		.unwrap();
-	assert!(!live.alive(), "cancelled I/O kept the buffer");
+	assert!(
+		ran.load(Ordering::Acquire),
+		"dropping the join handle cancelled its task"
+	);
 }
 
 #[test]
-fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
+fn a_task_can_drop_its_own_join_handle_while_finishing() {
 	use std::cell::{Cell, RefCell};
 	use std::rc::Rc;
 
 	let mut executor = executor();
-	let (_peer, socket) = socket_pair(&executor);
+	let (_peer, socket) = socket_pair();
 	let (buffer, live) = common::tracked(8);
 	let payload = buffer.whole();
 	drop(buffer);
 	let mut receive = Box::pin(socket.recv(payload));
-	let handle = Rc::new(RefCell::new(None::<completion_async::Task<()>>));
-	let cancel = Rc::new(Cell::new(false));
+	let handle = Rc::new(RefCell::new(None::<completion_async::JoinHandle<()>>));
+	let finish = Rc::new(Cell::new(false));
 	let wake = Rc::new(RefCell::new(None::<Waker>));
 	let own_handle = Rc::clone(&handle);
-	let flag = Rc::clone(&cancel);
+	let flag = Rc::clone(&finish);
 	let task_wake = Rc::clone(&wake);
-	*handle.borrow_mut() = Some(executor.spawner().spawn(std::future::poll_fn(move |cx| {
+	*handle.borrow_mut() = Some(executor.spawn(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			drop(own_handle.borrow_mut().take());
 			return Poll::Ready(());
@@ -390,19 +323,19 @@ fn a_task_can_cancel_itself_while_finishing_with_io_still_in_flight() {
 		Poll::Pending
 	})));
 	executor
-		.block_on(Timeout::with_executor(Duration::from_millis(1), &executor))
+		.block_on(timeout(Duration::from_millis(1)))
 		.unwrap()
 		.unwrap();
-	cancel.set(true);
+	finish.set(true);
 	wake.borrow().as_ref().unwrap().wake_by_ref();
 	// The task's own end drops its in-flight receive, which the reactor reaps on
 	// a later pass.
 	executor.block_on(async {}).unwrap();
 	executor
-		.block_on(Timeout::with_executor(Duration::from_millis(10), &executor))
+		.block_on(timeout(Duration::from_millis(10)))
 		.unwrap()
 		.unwrap();
-	assert!(!live.alive(), "self-cancellation kept the I/O buffer");
+	assert!(!live.alive(), "the finished task kept its I/O buffer");
 }
 
 #[test]
@@ -411,7 +344,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	use std::rc::Rc;
 
 	let mut executor = executor();
-	let (_peer, socket) = socket_pair(&executor);
+	let (_peer, socket) = socket_pair();
 	let (buffer, live) = common::tracked(8);
 	let payload = buffer.whole();
 	drop(buffer);
@@ -419,7 +352,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	let panic_next = Rc::new(Cell::new(false));
 	let flag = Rc::clone(&panic_next);
 	let (handoff, handed) = std::sync::mpsc::channel();
-	let mut task = executor.spawner().spawn(std::future::poll_fn(move |cx| {
+	let mut task = executor.spawn(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			panic!("task failed while waiting for I/O");
 		}
@@ -428,7 +361,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		Poll::Pending::<()>
 	}));
 	executor
-		.block_on(Timeout::with_executor(Duration::from_millis(1), &executor))
+		.block_on(timeout(Duration::from_millis(1)))
 		.unwrap()
 		.unwrap();
 	panic_next.set(true);
@@ -443,7 +376,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	// Unwinding dropped the job and released its I/O as a detached cancel; a
 	// pass over the reactor reaps that cancel.
 	executor
-		.block_on(Timeout::with_executor(Duration::from_millis(10), &executor))
+		.block_on(timeout(Duration::from_millis(10)))
 		.unwrap()
 		.unwrap();
 	assert!(!live.alive(), "unwinding kept the I/O buffer");
@@ -451,7 +384,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		std::pin::Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()))
 	}));
 	assert!(gone.is_err(), "joining a failed task parked forever");
-	let next = executor.spawner().spawn(async { Rc::new(42) });
+	let next = executor.spawn(async { Rc::new(42) });
 	assert_eq!(*executor.block_on(next).unwrap(), 42);
 }
 
@@ -461,7 +394,7 @@ fn task_destructors_observe_other_joins_as_gone_during_executor_teardown() {
 	use std::rc::Rc;
 
 	struct Observe {
-		tasks: Rc<RefCell<Vec<completion_async::Task<()>>>>,
+		tasks: Rc<RefCell<Vec<completion_async::JoinHandle<()>>>>,
 		all_gone: Rc<Cell<bool>>,
 	}
 
@@ -485,12 +418,10 @@ fn task_destructors_observe_other_joins_as_gone_during_executor_teardown() {
 			tasks: Rc::clone(&tasks),
 			all_gone: Rc::clone(&all_gone),
 		};
-		tasks
-			.borrow_mut()
-			.push(executor.spawner().spawn(async move {
-				std::future::pending::<()>().await;
-				drop(observe);
-			}));
+		tasks.borrow_mut().push(executor.spawn(async move {
+			std::future::pending::<()>().await;
+			drop(observe);
+		}));
 	}
 	executor.block_on(async {}).unwrap();
 	drop(executor);
@@ -521,14 +452,12 @@ fn block_on_runs_a_detached_task_before_returning_when_the_root_future_is_ready_
 	let mut executor = executor();
 	let ran = Arc::new(AtomicBool::new(false));
 	let flag = Arc::clone(&ran);
-	let spawner = executor.spawner();
+	let scope = executor.scope();
 	let mut to_spawn = Some(flag);
 	executor
 		.block_on(std::future::poll_fn(move |_| {
 			if let Some(flag) = to_spawn.take() {
-				spawner
-					.spawn(async move { flag.store(true, Ordering::Release) })
-					.detach();
+				drop(scope.spawn(async move { flag.store(true, Ordering::Release) }));
 			}
 			Poll::Ready(())
 		}))
@@ -552,9 +481,7 @@ fn block_on_polls_the_root_future_before_a_task_queued_before_it() {
 	let ran = Arc::new(AtomicBool::new(false));
 	let flag = Arc::clone(&ran);
 	let polled = Arc::clone(&ran);
-	let task = executor
-		.spawner()
-		.spawn(async move { flag.store(true, Ordering::Release) });
+	let task = executor.spawn(async move { flag.store(true, Ordering::Release) });
 	let seen_unpolled = Rc::new(Cell::new(false));
 	let observed = Rc::clone(&seen_unpolled);
 	let mut first = true;

@@ -8,8 +8,6 @@ runs:
       with:
         repo-token: ${{ github.token }}
 
-    # No maintained official ast-grep setup action is pinned here; the npm package
-    # ships prebuilt binaries for linux, macos and windows on both architectures.
     - name: Install ast-grep
       shell: bash
       run: npm install -g @ast-grep/cli

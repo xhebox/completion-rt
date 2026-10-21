@@ -14,7 +14,7 @@ use std::sync::{Arc, Once};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 
-use completion_async::{Buffer, Error, Memory, Result};
+use completion_async::{Buffer, Error, IoVec, Memory, Result};
 
 /// Runs a future to completion on this thread, woken by whoever completes it.
 ///
@@ -193,7 +193,7 @@ impl Drop for TrackedMemory {
 // SAFETY: the bytes are owned outright and only reached through `resolve`,
 // which checks every extent against them.
 unsafe impl Memory for TrackedMemory {
-	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
+	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec> {
 		let fits = offset
 			.checked_add(len)
 			.is_some_and(|end| end <= self.bytes.len());
@@ -202,7 +202,10 @@ unsafe impl Memory for TrackedMemory {
 		}
 		// SAFETY: `offset..offset + len` is inside the vector, which the buffer
 		// keeps alive.
-		Ok(unsafe { self.bytes.as_ptr().add(offset).cast_mut() })
+		Ok(IoVec {
+			ptr: unsafe { self.bytes.as_ptr().add(offset).cast_mut() },
+			len,
+		})
 	}
 
 	fn len(&self) -> usize {

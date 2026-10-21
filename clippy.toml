@@ -1,0 +1,9 @@
+disallowed-methods = [
+	{ path = "std::env::temp_dir", reason = "use the in-tree test scratch helper under target/test-tmp instead of /tmp or TMPDIR" },
+	{ path = "tempfile::tempdir", reason = "use the in-tree test scratch helper under target/test-tmp instead of /tmp or TMPDIR" },
+	{ path = "tempfile::tempfile", reason = "use the in-tree test scratch helper under target/test-tmp instead of /tmp or TMPDIR" },
+	{ path = "tempfile::TempDir::new", reason = "use the in-tree test scratch helper under target/test-tmp instead of /tmp or TMPDIR" },
+	{ path = "tempfile::NamedTempFile::new", reason = "use the in-tree test scratch helper under target/test-tmp instead of /tmp or TMPDIR" },
+	{ path = "tempfile::Builder::tempdir", reason = "use tempfile::Builder::tempdir_in with an explicit in-tree base under target/test-tmp" },
+	{ path = "tempfile::Builder::tempfile", reason = "use tempfile::Builder::tempfile_in with an explicit in-tree base under target/test-tmp" },
+]

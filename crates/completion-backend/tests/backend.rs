@@ -16,7 +16,7 @@ fn a_kind_defaults_to_the_targets_own_backend() {
 	#[cfg(windows)]
 	assert_eq!(BackendKind::default(), BackendKind::Iocp);
 
-	let backend = Backend::new(&Config::default()).unwrap();
+	let backend: Backend = Backend::new(&Config::default()).unwrap();
 	assert_eq!(backend.kind(), BackendKind::default());
 }
 
@@ -46,7 +46,18 @@ fn every_target_offers_the_portable_backend() {
 		backend: "portable".parse().unwrap(),
 		..Config::default()
 	};
-	assert_eq!(Backend::new(&config).unwrap().kind(), BackendKind::Portable);
+	assert_eq!(
+		Backend::<()>::new(&config).unwrap().kind(),
+		BackendKind::Portable
+	);
 	#[cfg(any(target_os = "linux", windows))]
 	assert_ne!(BackendKind::default(), BackendKind::Portable);
+}
+
+/// A backend hands its mechanism to whichever thread drives it: the reactor
+/// moves one between threads, so every mechanism it can pick is `Send`.
+#[test]
+fn a_backend_is_send() {
+	fn assert_send<T: Send>() {}
+	assert_send::<Backend>();
 }

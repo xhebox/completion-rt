@@ -1,50 +1,37 @@
-//! Reference-counted buffers ([`Buffer`]), byte-range views ([`Span`]), and a
-//! pre-faulted, reusable [`BufferPool`] for completion transfers.
-
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::fmt;
 use std::io;
-use std::ops::Range;
+use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
-use smallvec::SmallVec;
-
 use crate::error::{Error, Result};
 
-/// One extent resolved against its [`Memory`]: the address of its first byte and
-/// the number of bytes it names.
-#[derive(Clone, Copy)]
-pub(crate) struct Resolved {
-	/// The first byte of the range.
-	pub(crate) ptr: *mut u8,
-	/// The number of bytes the range names.
-	pub(crate) len: usize,
+/// Resolved pointer and length within a [`Memory`] region.
+#[derive(Clone, Copy, Debug)]
+pub struct IoVec {
+	/// Pointer to the first byte of the range.
+	pub ptr: *mut u8,
+	/// Byte length of the range.
+	pub len: usize,
 }
 
-// SAFETY: `ptr` names memory the caller keeps alive until the backend reports
-// the completion — the reactor's own entry holds the [`Buffer`] — and a resolved
-// extent hands out no reference: sending one to a worker thread moves an
-// address into memory that thread is then the only one transferring through.
-unsafe impl Send for Resolved {}
+// SAFETY: `IoVec` is a raw pointer into a `Memory` kept alive by the caller
+// for the duration of an I/O operation.
+unsafe impl Send for IoVec {}
 
 /// Backing memory that resolves `(offset, len)` ranges into raw pointers for I/O.
 ///
 /// # Safety
-/// - Because the kernel, another thread, or a VM guest may concurrently read or
-///   write this memory during I/O, implementations must not expose `&[u8]` or
-///   `&mut [u8]` references that could alias in-flight transfers.
-/// - [`Memory::resolve`] must return a pointer that remains valid for as long as
-///   the `Memory` value is alive, or fail with
-///   [`InvalidInput`](io::ErrorKind::InvalidInput) if the range is out of bounds.
+/// [`Memory::resolve`] must return a pointer and length that remain valid for as
+/// long as the `Memory` value is alive, or fail with
+/// [`InvalidInput`](io::ErrorKind::InvalidInput) if the range is out of bounds.
 pub unsafe trait Memory: Send + Sync {
-	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8>;
+	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec>;
 
 	fn len(&self) -> usize;
 }
 
-/// Checks that the `len` bytes at `offset` are inside `bound`, or fails with an
-/// `InvalidInput` error. A range of zero bytes still has to start inside `bound`.
 fn check_extent(offset: usize, len: usize, bound: usize) -> Result<()> {
 	match offset.checked_add(len) {
 		Some(end) if end <= bound => Ok(()),
@@ -52,7 +39,6 @@ fn check_extent(offset: usize, len: usize, bound: usize) -> Result<()> {
 	}
 }
 
-/// Heap-backed [`Memory`] owning the bytes of one `Box<[u8]>`.
 struct Bytes {
 	ptr: *mut u8,
 	len: usize,
@@ -66,40 +52,31 @@ impl Bytes {
 			len,
 		}
 	}
-
-	/// The bytes as a `Vec`, taking the allocation rather than dropping it.
-	fn into_vec(self) -> Vec<u8> {
-		let this = std::mem::ManuallyDrop::new(self);
-		// SAFETY: `ptr` and `len` come from `Box::<[u8]>::into_raw`, and the
-		// box is rebuilt here instead of being freed by `Drop`, which the
-		// `ManuallyDrop` above skips.
-		unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(this.ptr, this.len)).into_vec() }
-	}
 }
 
-// SAFETY: the allocation is owned outright and never handed out as a slice;
-// `resolve` bounds-checks every extent, and the bytes are plain storage that a
-// kernel may write while another thread reads.
+// SAFETY: `Bytes` owns its heap allocation outright and never exposes `&[u8]`
+// directly; `resolve` bounds-checks every range.
 unsafe impl Send for Bytes {}
-// SAFETY: see the `Send` impl: `&Bytes` only reaches memory through `resolve`.
+// SAFETY: `&Bytes` only accesses the allocation through bounds-checked `resolve`.
 unsafe impl Sync for Bytes {}
 
 impl Drop for Bytes {
 	fn drop(&mut self) {
-		// SAFETY: `ptr` and `len` come from `Box::<[u8]>::into_raw` and are
-		// turned back into a box only here. A zero-length box needs no
-		// deallocation but is still a valid box.
+		// SAFETY: `ptr` and `len` came from `Box::<[u8]>::into_raw` in `Bytes::new`.
 		drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(self.ptr, self.len)) });
 	}
 }
 
-// SAFETY: `ptr..ptr + len` is the box's own allocation, which lives as long as
-// `&self`; `check_extent` keeps every resolved range inside it.
+// SAFETY: `ptr..ptr + len` is valid for the lifetime of `self` and
+// `check_extent` bounds-checks every resolved range.
 unsafe impl Memory for Bytes {
-	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
+	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec> {
 		check_extent(offset, len, self.len)?;
-		// SAFETY: `offset..offset + len` is inside the allocation, checked above.
-		Ok(unsafe { self.ptr.add(offset) })
+		// SAFETY: `offset..offset + len` was bounds-checked above.
+		Ok(IoVec {
+			ptr: unsafe { self.ptr.add(offset) },
+			len,
+		})
 	}
 
 	fn len(&self) -> usize {
@@ -110,37 +87,17 @@ unsafe impl Memory for Bytes {
 /// Reference-counted handle to a [`Memory`] region.
 ///
 /// Cloning a `Buffer` is cheap (`Arc` clone) and refers to the same underlying
-/// memory. Create a host buffer with [`Buffer::zeroed`], [`Buffer::from_slice`],
-/// or `Buffer::from(vec)`, or wrap a custom [`Memory`] implementation with
-/// [`Buffer::new`]. Use [`Buffer::span`], [`Buffer::whole`], or
-/// [`Buffer::gather`] to select byte ranges for an I/O operation.
+/// memory. Create a host buffer with [`Buffer::zeroed`] or `Buffer::from(...)`,
+/// or wrap a custom [`Memory`] implementation with [`Buffer::new`]. Use
+/// [`Buffer::span`] or [`Buffer::whole`] to select a byte range for an I/O
+/// operation.
 #[derive(Clone)]
-pub struct Buffer(Inner);
-
-/// What a [`Buffer`] holds.
-///
-/// A block this crate allocated is kept apart from a caller's [`Memory`] so the
-/// bytes can be handed back whole once nothing else holds them
-/// ([`Buffer::try_into_vec`]); a caller's memory has no such shape to recover.
-#[derive(Clone)]
-enum Inner {
-	Owned(Arc<Bytes>),
-	Custom(Arc<dyn Memory>),
-}
-
-impl Inner {
-	fn memory(&self) -> &dyn Memory {
-		match self {
-			Inner::Owned(bytes) => bytes.as_ref(),
-			Inner::Custom(memory) => memory.as_ref(),
-		}
-	}
-}
+pub struct Buffer(Arc<dyn Memory>);
 
 impl Buffer {
 	/// Wraps `memory` in a [`Buffer`].
 	pub fn new(memory: Arc<dyn Memory>) -> Buffer {
-		Buffer(Inner::Custom(memory))
+		Buffer(memory)
 	}
 
 	/// Allocates `len` zeroed bytes.
@@ -148,129 +105,24 @@ impl Buffer {
 		Buffer::from(vec![0u8; len])
 	}
 
-	/// Copies `bytes` into a new [`Buffer`].
-	pub fn from_slice(bytes: &[u8]) -> Buffer {
-		Buffer::from(bytes.to_vec())
-	}
-
-	/// The bytes of a block this crate allocated, once this is the last holder.
-	///
-	/// `Err(self)` when another `Buffer`, or a [`Span`] taken from one, is still
-	/// alive — the bytes are still theirs — and also for a buffer wrapped around
-	/// a caller's [`Memory`], whose shape cannot be handed back as a `Vec`.
-	/// Nothing is copied on the way out: this is how a transfer's bytes leave
-	/// without a second trip through memory that a read already filled.
-	pub fn try_into_vec(self) -> Result<Vec<u8>, Buffer> {
-		match self.0 {
-			Inner::Owned(bytes) => match Arc::try_unwrap(bytes) {
-				Ok(bytes) => Ok(bytes.into_vec()),
-				Err(bytes) => Err(Buffer(Inner::Owned(bytes))),
-			},
-			custom @ Inner::Custom(_) => Err(Buffer(custom)),
-		}
-	}
-
 	/// Total byte length of the underlying [`Memory`].
 	pub fn len(&self) -> usize {
-		self.0.memory().len()
+		self.0.len()
 	}
 
 	/// Selects `len` bytes starting at `offset`. Bounds are checked when an
 	/// operation is submitted.
 	pub fn span(&self, offset: usize, len: usize) -> Span {
-		self.gather([(offset, len)])
+		Span {
+			buffer: self.clone(),
+			offset,
+			len,
+		}
 	}
 
 	/// Selects the entire `[0, self.len())` range.
 	pub fn whole(&self) -> Span {
 		self.span(0, self.len())
-	}
-
-	/// Combines multiple `(offset, len)` ranges into a single scatter/gather [`Span`].
-	pub fn gather(&self, extents: impl IntoIterator<Item = (usize, usize)>) -> Span {
-		Span {
-			buffer: self.clone(),
-			extents: extents.into_iter().collect(),
-		}
-	}
-
-	/// The `(offset, len)` range `offset..offset + len` names, panicking when it
-	/// is outside the buffer.
-	fn extent(&self, offset: usize, len: usize) -> (usize, usize) {
-		let end = offset
-			.checked_add(len)
-			.expect("the range must not overflow a usize");
-		assert!(
-			end <= self.len(),
-			"the range {offset}..{end} is outside the {}-byte buffer",
-			self.len()
-		);
-		(offset, len)
-	}
-
-	/// Copies `dst.len()` bytes starting at `offset` into `dst`.
-	///
-	/// Panics if the range is outside the buffer or the [`Memory`] refuses it.
-	/// Reads go through [`Memory::resolve`] rather than a `&[u8]`, so an in-flight
-	/// transfer through the same memory is never aliased by a reference.
-	pub fn copy_to(&self, offset: usize, dst: &mut [u8]) {
-		let (offset, len) = self.extent(offset, dst.len());
-		let source = self
-			.0
-			.memory()
-			.resolve(offset, len)
-			.expect("the memory resolves the range just checked");
-		// SAFETY: `resolve` names `dst.len()` readable bytes, in bounds and alive
-		// for `&self`; `dst` cannot overlap it, coming from the caller.
-		unsafe { ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len()) }
-	}
-
-	/// Copies `src.len()` bytes from `src` into the buffer starting at `offset`.
-	///
-	/// Panics if the range is outside the buffer or the [`Memory`] refuses it.
-	/// Writes go through [`Memory::resolve`], like [`Buffer::copy_to`].
-	pub fn copy_from(&self, offset: usize, src: &[u8]) {
-		let (offset, len) = self.extent(offset, src.len());
-		let target = self
-			.0
-			.memory()
-			.resolve(offset, len)
-			.expect("the memory resolves the range just checked");
-		// SAFETY: `resolve` names `src.len()` writable bytes, in bounds and alive
-		// for `&self`; `src` cannot overlap it, coming from the caller.
-		unsafe { ptr::copy_nonoverlapping(src.as_ptr(), target, src.len()) }
-	}
-
-	/// Writes `src` at `offset`: [`Buffer::copy_from`] under the name callers
-	/// reach for.
-	pub fn write(&self, offset: usize, src: &[u8]) {
-		self.copy_from(offset, src);
-	}
-
-	/// Copies the entire buffer into a new `Vec<u8>`.
-	pub fn to_vec(&self) -> Vec<u8> {
-		self.slice_to_vec(0..self.len())
-	}
-
-	/// Copies `range` into a new `Vec<u8>`.
-	///
-	/// Panics if `range.start > range.end` or `range.end` is past the buffer.
-	pub fn slice_to_vec(&self, range: Range<usize>) -> Vec<u8> {
-		assert!(
-			range.start <= range.end,
-			"the range starts at {} and ends before it at {}",
-			range.start,
-			range.end
-		);
-		assert!(
-			range.end <= self.len(),
-			"the range ends at {} past the {}-byte buffer",
-			range.end,
-			self.len()
-		);
-		let mut out = vec![0; range.end - range.start];
-		self.copy_to(range.start, &mut out);
-		out
 	}
 }
 
@@ -280,12 +132,11 @@ impl fmt::Debug for Buffer {
 	}
 }
 
-// SAFETY: `self.0.memory()` is the `Arc`'d [`Memory`] this buffer holds, so
-// every range it resolves stays alive as long as `&self` does, and `Buffer`
-// never hands out a reference over those bytes.
+// SAFETY: delegates to the inner `Arc<dyn Memory>`, which lives at least as
+// long as `self`.
 unsafe impl Memory for Buffer {
-	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
-		self.0.memory().resolve(offset, len)
+	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec> {
+		self.0.resolve(offset, len)
 	}
 
 	fn len(&self) -> usize {
@@ -301,13 +152,19 @@ impl From<Vec<u8>> for Buffer {
 
 impl From<Box<[u8]>> for Buffer {
 	fn from(bytes: Box<[u8]>) -> Buffer {
-		Buffer(Inner::Owned(Arc::new(Bytes::new(bytes))))
+		Buffer(Arc::new(Bytes::new(bytes)))
 	}
 }
 
 impl From<&[u8]> for Buffer {
 	fn from(bytes: &[u8]) -> Buffer {
 		Buffer::from(bytes.to_vec())
+	}
+}
+
+impl<const N: usize> From<&[u8; N]> for Buffer {
+	fn from(bytes: &[u8; N]) -> Buffer {
+		Buffer::from(&bytes[..])
 	}
 }
 
@@ -323,12 +180,16 @@ impl From<Arc<dyn Memory>> for Buffer {
 	}
 }
 
-/// One or more byte ranges within a [`Buffer`] passed to a read, write, send, or
-/// receive operation.
+/// A byte range within a [`Buffer`] passed to a read, write, send, or receive
+/// operation.
+///
+/// A [`Buffer`], `Vec<u8>`, `Box<[u8]>`, or `&[u8]` converts directly into a
+/// `Span` covering its entire length.
 #[derive(Clone)]
 pub struct Span {
 	buffer: Buffer,
-	extents: SmallVec<[(usize, usize); 2]>,
+	offset: usize,
+	len: usize,
 }
 
 impl Span {
@@ -337,187 +198,121 @@ impl Span {
 		&self.buffer
 	}
 
-	/// Returns the ordered list of `(offset, len)` ranges in this span.
-	pub fn extents(&self) -> &[(usize, usize)] {
-		&self.extents
+	/// Returns the byte offset in the [`Buffer`] where this span starts.
+	pub fn offset(&self) -> usize {
+		self.offset
 	}
 
-	/// Resolves every extent in order, handing each one to `visit`. A span that
-	/// names no bytes visits nothing.
-	pub(crate) fn resolve_with(&self, mut visit: impl FnMut(Resolved)) -> Result<()> {
-		let memory = self.buffer.0.memory();
-		for &(offset, len) in &self.extents {
-			visit(Resolved {
-				ptr: memory.resolve(offset, len)?,
-				len,
-			});
-		}
-		Ok(())
+	pub(crate) fn resolve(&self) -> Result<IoVec> {
+		self.buffer.0.resolve(self.offset, self.len)
 	}
 
-	/// The first extent of this span, with every extent resolved so one out of
-	/// bounds refuses the span; `None` for a span that names no bytes.
-	pub(crate) fn resolve_first(&self) -> Result<Option<Resolved>> {
-		let mut first = None;
-		self.resolve_with(|buf| {
-			if first.is_none() {
-				first = Some(buf);
-			}
-		})?;
-		Ok(first)
-	}
-
-	/// Resolves a span of at most one extent without an array: an empty span is a
-	/// null pointer of no bytes, and a single extent its one range. `None` for a
-	/// span that needs an array to hold it.
-	///
-	/// Only the ring backend has a request that takes one buffer's address from
-	/// the submission entry itself; every other backend resolves through
-	/// [`Span::resolve_with`] or [`Span::resolve_first`], so the memory tests are
-	/// what keep this shape checked on the other targets.
-	#[cfg(any(target_os = "linux", test))]
-	pub(crate) fn resolve_single(&self) -> Option<Result<Resolved>> {
-		match self.extents.as_slice() {
-			[] => Some(Ok(Resolved {
-				ptr: ptr::null_mut(),
-				len: 0,
-			})),
-			[(offset, len)] => Some(
-				self.buffer
-					.0
-					.memory()
-					.resolve(*offset, *len)
-					.map(|ptr| Resolved { ptr, len: *len }),
-			),
-			_ => None,
-		}
-	}
-
-	/// Total number of bytes across all extents in this span.
+	/// Byte length of this span.
 	pub fn len(&self) -> usize {
-		self.extents
-			.iter()
-			.fold(0, |total, &(_, len)| total.saturating_add(len))
+		self.len
 	}
 
 	/// Returns a new [`Span`] with the first `bytes` removed.
 	pub fn skip(self, bytes: usize) -> Span {
-		let mut remaining = bytes;
-		let mut extents = SmallVec::new();
-		for &(offset, len) in &self.extents {
-			if remaining >= len {
-				remaining -= len;
-				continue;
-			}
-			extents.push((offset + remaining, len - remaining));
-			remaining = 0;
+		let skipped = bytes.min(self.len);
+		Span {
+			buffer: self.buffer,
+			offset: self.offset + skipped,
+			len: self.len - skipped,
 		}
-		Span { extents, ..self }
 	}
 
 	/// Returns a new [`Span`] truncated to at most the first `bytes`.
 	pub fn take(self, bytes: usize) -> Span {
-		let mut remaining = bytes;
-		let mut extents = SmallVec::new();
-		for &(offset, len) in &self.extents {
-			if remaining == 0 {
-				break;
-			}
-			let len = len.min(remaining);
-			remaining -= len;
-			extents.push((offset, len));
+		Span {
+			buffer: self.buffer,
+			offset: self.offset,
+			len: self.len.min(bytes),
 		}
-		Span { extents, ..self }
-	}
-
-	/// The offset into the span `offset..offset + len` names, panicking when it
-	/// is outside the span.
-	fn extent_range(&self, offset: usize, len: usize) -> (usize, usize) {
-		let end = offset
-			.checked_add(len)
-			.expect("the range must not overflow a usize");
-		assert!(
-			end <= self.len(),
-			"the range {offset}..{end} is outside the {}-byte span",
-			self.len()
-		);
-		(offset, len)
-	}
-
-	/// Copies `dst.len()` bytes starting `offset` bytes into the span into `dst`.
-	///
-	/// Panics if the range is outside the span or an extent does not resolve.
-	/// The bytes are read through [`Buffer::copy_to`], so a byte range straddling
-	/// two gathered extents is copied one extent at a time without a reference
-	/// over the underlying [`Memory`].
-	pub fn copy_to(&self, offset: usize, dst: &mut [u8]) {
-		self.extent_range(offset, dst.len());
-		let mut copied = 0;
-		let mut skip = offset;
-		for &(extent_offset, extent_len) in &self.extents {
-			if copied == dst.len() {
-				break;
-			}
-			if skip >= extent_len {
-				skip -= extent_len;
-				continue;
-			}
-			let len = (extent_len - skip).min(dst.len() - copied);
-			let start = extent_offset
-				.checked_add(skip)
-				.expect("the span offset stays inside a usize");
-			self.buffer.copy_to(start, &mut dst[copied..copied + len]);
-			copied += len;
-			skip = 0;
-		}
-	}
-
-	/// Copies `src.len()` bytes from `src` into the span starting `offset` bytes
-	/// into it.
-	///
-	/// Panics if the range is outside the span or an extent does not resolve.
-	pub fn copy_from(&self, offset: usize, src: &[u8]) {
-		self.extent_range(offset, src.len());
-		let mut copied = 0;
-		let mut skip = offset;
-		for &(extent_offset, extent_len) in &self.extents {
-			if copied == src.len() {
-				break;
-			}
-			if skip >= extent_len {
-				skip -= extent_len;
-				continue;
-			}
-			let len = (extent_len - skip).min(src.len() - copied);
-			let start = extent_offset
-				.checked_add(skip)
-				.expect("the span offset stays inside a usize");
-			self.buffer.copy_from(start, &src[copied..copied + len]);
-			copied += len;
-			skip = 0;
-		}
-	}
-
-	/// Copies all `self.len()` bytes of the span into a `Vec<u8>`.
-	pub fn to_vec(&self) -> Vec<u8> {
-		let mut out = vec![0; self.len()];
-		self.copy_to(0, &mut out);
-		out
 	}
 }
 
-/// Bytes in the pages a [`BufferPool`] aligns to and pre-faults.
+impl Deref for Span {
+	type Target = [u8];
+
+	fn deref(&self) -> &[u8] {
+		let vec = self
+			.resolve()
+			.expect("the span's range is outside the buffer");
+		if vec.len == 0 {
+			return &[];
+		}
+		// SAFETY: `resolve` returns `vec.len` valid bytes within `self.buffer`,
+		// which remains alive for `&self`.
+		unsafe { std::slice::from_raw_parts(vec.ptr, vec.len) }
+	}
+}
+
+impl DerefMut for Span {
+	fn deref_mut(&mut self) -> &mut [u8] {
+		let vec = self
+			.resolve()
+			.expect("the span's range is outside the buffer");
+		if vec.len == 0 {
+			return &mut [];
+		}
+		// SAFETY: `resolve` returns `vec.len` valid bytes within `self.buffer`,
+		// which remains alive for `&mut self`.
+		unsafe { std::slice::from_raw_parts_mut(vec.ptr, vec.len) }
+	}
+}
+
+impl AsRef<[u8]> for Span {
+	fn as_ref(&self) -> &[u8] {
+		self
+	}
+}
+
+impl AsMut<[u8]> for Span {
+	fn as_mut(&mut self) -> &mut [u8] {
+		self
+	}
+}
+
+impl From<Buffer> for Span {
+	fn from(buffer: Buffer) -> Span {
+		buffer.whole()
+	}
+}
+
+impl From<&Buffer> for Span {
+	fn from(buffer: &Buffer) -> Span {
+		buffer.whole()
+	}
+}
+
+impl From<Vec<u8>> for Span {
+	fn from(bytes: Vec<u8>) -> Span {
+		Buffer::from(bytes).whole()
+	}
+}
+
+impl From<Box<[u8]>> for Span {
+	fn from(bytes: Box<[u8]>) -> Span {
+		Buffer::from(bytes).whole()
+	}
+}
+
+impl From<&[u8]> for Span {
+	fn from(bytes: &[u8]) -> Span {
+		Buffer::from(bytes).whole()
+	}
+}
+
 const PAGE_SIZE: usize = 4096;
 
-/// A fixed set of page-aligned, pre-faulted blocks handed out as [`Buffer`]s.
+/// Pool of reusable, page-aligned, pre-faulted [`Buffer`]s.
 ///
-/// A pool avoids the allocation, the zeroing, and the page faults a fresh
-/// buffer would cost on every operation: its arena is aligned to a 4096-byte
-/// page (and so is every block when `block_size` is a multiple of it, which
-/// `O_DIRECT` needs), and every page is touched once when the pool is created,
-/// so a transfer never faults a page in. A block goes back to the pool when the
-/// last [`Buffer`] — and every [`Span`] cloned from it, including one a reactor
-/// holds while the kernel is still transferring through it — drops.
+/// The pool allocates a single 4096-byte-aligned arena and touches every page
+/// up front so transfers do not fault pages in during I/O. When `block_size` is
+/// a multiple of 4096, every block is page-aligned (suitable for `O_DIRECT`).
+/// Blocks return to the pool automatically when the last [`Buffer`] or [`Span`]
+/// referencing them is dropped.
 ///
 /// ```
 /// # use completion_backend::BufferPool;
@@ -525,33 +320,28 @@ const PAGE_SIZE: usize = 4096;
 /// let buffer = pool.get();
 /// assert_eq!(buffer.len(), 4096);
 /// drop(buffer);
-/// assert_eq!(pool.available(), 16, "the block returned itself");
+/// assert_eq!(pool.available(), 16);
 /// ```
 #[derive(Clone)]
 pub struct BufferPool(Arc<PoolInner>);
 
 struct PoolInner {
-	/// Base of the arena, aligned to [`PAGE_SIZE`].
 	ptr: *mut u8,
 	total: usize,
 	block_size: usize,
 	capacity: usize,
-	/// Indices of the blocks not handed out, most recently returned first.
 	free: Mutex<Vec<usize>>,
 }
 
-// SAFETY: the arena is owned by the pool and every block in it is disjoint, so
-// a slot's `resolve` hands out memory no other slot names; the free list guards
-// its own state.
+// SAFETY: the arena is owned by `PoolInner`, each checked-out slot covers a
+// disjoint block, and the free list is synchronized by `Mutex`.
 unsafe impl Send for PoolInner {}
-// SAFETY: see the `Send` impl: `&PoolInner` only reaches memory through
-// `resolve`, which bounds-checks against the arena.
+// SAFETY: `&PoolInner` only exposes memory through bounds-checked `resolve`.
 unsafe impl Sync for PoolInner {}
 
 impl Drop for PoolInner {
 	fn drop(&mut self) {
-		// SAFETY: the arena was allocated with this exact layout and is freed
-		// once, here.
+		// SAFETY: allocated with this layout in `BufferPool::new`.
 		unsafe {
 			dealloc(
 				self.ptr,
@@ -561,13 +351,15 @@ impl Drop for PoolInner {
 	}
 }
 
-// SAFETY: every extent is bounds-checked against the arena, which lives as long
-// as `&self`.
+// SAFETY: `check_extent` bounds-checks every range against `self.total`.
 unsafe impl Memory for PoolInner {
-	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
+	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec> {
 		check_extent(offset, len, self.total)?;
-		// SAFETY: `offset..offset + len` is inside the arena, checked above.
-		Ok(unsafe { self.ptr.add(offset) })
+		// SAFETY: `offset..offset + len` was bounds-checked above.
+		Ok(IoVec {
+			ptr: unsafe { self.ptr.add(offset) },
+			len,
+		})
 	}
 
 	fn len(&self) -> usize {
@@ -575,7 +367,6 @@ unsafe impl Memory for PoolInner {
 	}
 }
 
-/// One block of a [`BufferPool`], in the shape an operation names memory.
 struct Slot {
 	pool: Arc<PoolInner>,
 	offset: usize,
@@ -583,8 +374,6 @@ struct Slot {
 
 impl Drop for Slot {
 	fn drop(&mut self) {
-		// Every slot offset is a multiple of the block size, so dividing it
-		// recovers the index `BufferPool::try_get` popped.
 		self.pool
 			.free
 			.lock()
@@ -593,14 +382,17 @@ impl Drop for Slot {
 	}
 }
 
-// SAFETY: the slot's range is inside the arena, which the pool keeps alive;
-// `check_extent` keeps every resolved extent inside its own block.
+// SAFETY: `self.pool` keeps the arena alive and `check_extent` restricts every
+// resolved range to this slot's block.
 unsafe impl Memory for Slot {
-	fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
+	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec> {
 		check_extent(offset, len, self.pool.block_size)?;
-		// SAFETY: `offset..offset + len` is inside the arena, and this slot's
-		// own block, both checked above.
-		Ok(unsafe { self.pool.ptr.add(self.offset + offset) })
+		// SAFETY: `self.offset + offset..self.offset + offset + len` lies within
+		// this slot's block inside the arena.
+		Ok(IoVec {
+			ptr: unsafe { self.pool.ptr.add(self.offset + offset) },
+			len,
+		})
 	}
 
 	fn len(&self) -> usize {
@@ -611,11 +403,12 @@ unsafe impl Memory for Slot {
 impl BufferPool {
 	/// Allocates a pool of `capacity` blocks of `block_size` bytes each.
 	///
-	/// The arena is one contiguous allocation aligned to 4096 bytes. Each block
-	/// is page-aligned when `block_size` is a multiple of 4096.
+	/// The arena is aligned to 4096 bytes; each block is page-aligned when
+	/// `block_size` is a multiple of 4096.
 	///
+	/// # Panics
 	/// Panics if `block_size` or `capacity` is zero, if their product overflows
-	/// `isize::MAX`, or if the allocator fails.
+	/// `isize::MAX`, or if allocation fails.
 	pub fn new(block_size: usize, capacity: usize) -> BufferPool {
 		assert!(block_size > 0, "a pool block holds at least one byte");
 		assert!(capacity > 0, "a pool holds at least one block");
@@ -625,18 +418,14 @@ impl BufferPool {
 			.expect("a pool's blocks must fit one allocation");
 		let layout =
 			Layout::from_size_align(total, PAGE_SIZE).expect("the pool layout is representable");
-		// SAFETY: `total` is non-zero, so the layout names a real allocation.
+		// SAFETY: `total > 0`.
 		let ptr = unsafe { alloc_zeroed(layout) };
 		if ptr.is_null() {
 			handle_alloc_error(layout);
 		}
-		// `alloc_zeroed` may hand back lazily zeroed pages — `calloc`'s large
-		// path or an `mmap` mapping — so the bytes are zero but their pages are
-		// not there yet, and the first transfer into each one would take a page
-		// fault. Write one byte per page now, when the cost belongs to pool
-		// creation rather than to I/O.
-		// SAFETY: `ptr` names `total` writable bytes; the loop and the last byte
-		// both stay inside them.
+		// `alloc_zeroed` may return lazily mapped zero pages (`mmap`), which would
+		// fault on first I/O. Touch each page up front to fault it in now.
+		// SAFETY: `ptr` is valid for `total` writable bytes and `total > 0`.
 		unsafe {
 			for offset in (0..total).step_by(PAGE_SIZE) {
 				ptr.add(offset).write_volatile(0);
@@ -652,17 +441,14 @@ impl BufferPool {
 		}))
 	}
 
-	/// Checks out a block, or `None` if every block is in use.
+	/// Checks out a pooled block, or returns `None` if all blocks are in use.
 	pub fn try_get(&self) -> Option<Buffer> {
 		let slot = self.0.free.lock().unwrap().pop()?;
 		Some(self.buffer(slot))
 	}
 
-	/// Checks out a block.
-	///
-	/// Falls back to a standalone zeroed [`Buffer`] when every block is in use,
-	/// so a burst above `capacity` never fails or blocks; that buffer simply is
-	/// not pooled.
+	/// Checks out a pooled block, falling back to a standalone zeroed [`Buffer`]
+	/// if all pooled blocks are in use.
 	pub fn get(&self) -> Buffer {
 		match self.try_get() {
 			Some(buffer) => buffer,
@@ -670,7 +456,6 @@ impl BufferPool {
 		}
 	}
 
-	/// The [`Buffer`] for the block at `slot`.
 	fn buffer(&self, slot: usize) -> Buffer {
 		Buffer::new(Arc::new(Slot {
 			offset: slot * self.0.block_size,
@@ -678,17 +463,17 @@ impl BufferPool {
 		}))
 	}
 
-	/// Byte length of one block.
+	/// Byte length of each block.
 	pub fn block_size(&self) -> usize {
 		self.0.block_size
 	}
 
-	/// Number of blocks the pool holds.
+	/// Total number of blocks in the pool.
 	pub fn capacity(&self) -> usize {
 		self.0.capacity
 	}
 
-	/// Number of blocks currently checked in.
+	/// Number of blocks currently available in the pool.
 	pub fn available(&self) -> usize {
 		self.0.free.lock().unwrap().len()
 	}
@@ -698,70 +483,8 @@ impl BufferPool {
 mod tests {
 	use super::*;
 
-	#[test]
-	fn a_span_of_at_most_one_extent_resolves_without_an_array() {
-		let buffer = Buffer::zeroed(8);
-
-		let empty = buffer
-			.gather([])
-			.resolve_single()
-			.expect("an empty span is one empty buffer")
-			.expect("and it resolves");
-		assert_eq!(empty.ptr, ptr::null_mut());
-		assert_eq!(empty.len, 0);
-
-		let single = buffer.span(2, 3).resolve_single().expect("one extent");
-		assert_eq!(single.expect("it resolves").len, 3);
-
-		let mut out = Vec::new();
-		buffer
-			.gather([(0, 1), (2, 3)])
-			.resolve_with(|buf| out.push(buf))
-			.unwrap();
-		assert_eq!(out.len(), 2, "every extent is visited in order");
-		assert!(
-			buffer.gather([(0, 1), (2, 3)]).resolve_single().is_none(),
-			"more than one extent needs an array"
-		);
-	}
-
-	#[test]
-	fn an_extent_outside_the_buffer_refuses_the_span() {
-		let buffer = Buffer::zeroed(8);
-
-		assert!(
-			buffer
-				.gather([(0, 1), (4, 5)])
-				.resolve_with(|_| {})
-				.is_err()
-		);
-		assert!(buffer.span(4, 5).resolve_first().is_err());
-		assert!(
-			buffer
-				.span(4, 5)
-				.resolve_single()
-				.expect("one extent")
-				.is_err()
-		);
-	}
-
-	#[test]
-	fn a_span_copies_bytes_across_its_extents() {
-		let buffer = Buffer::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
-		let span = buffer.gather([(0, 2), (4, 3)]);
-
-		let mut out = [0u8; 5];
-		span.copy_to(0, &mut out);
-		assert_eq!(out, [0, 1, 4, 5, 6]);
-
-		span.copy_from(1, &[9, 8, 7, 6]);
-		assert_eq!(buffer.to_vec(), [0, 9, 2, 3, 8, 7, 6, 7]);
-		assert_eq!(span.to_vec(), [0, 9, 8, 7, 6]);
-	}
-
-	/// The address a buffer's own memory starts at.
 	fn address(buffer: &Buffer) -> usize {
-		buffer.0.memory().resolve(0, 1).unwrap() as usize
+		buffer.0.resolve(0, 1).unwrap().ptr as usize
 	}
 
 	#[test]
@@ -780,52 +503,5 @@ mod tests {
 			start,
 			"the block the pool took back is the one it hands out"
 		);
-	}
-
-	#[test]
-	fn a_buffer_gives_its_bytes_back_once_it_is_the_only_holder() {
-		let buffer = Buffer::from_slice(b"hello");
-		let held = buffer.clone();
-		let buffer = buffer
-			.try_into_vec()
-			.expect_err("a clone still holds the bytes");
-		drop(held);
-		assert_eq!(buffer.try_into_vec().ok(), Some(b"hello".to_vec()));
-
-		let buffer = Buffer::from_slice(b"pooled");
-		let span = buffer.span(0, 6);
-		let buffer = buffer
-			.try_into_vec()
-			.expect_err("a span still names the bytes");
-		assert_eq!(span.to_vec(), b"pooled", "the span still reads them");
-		drop(span);
-		assert_eq!(buffer.try_into_vec().ok(), Some(b"pooled".to_vec()));
-	}
-
-	#[test]
-	fn a_caller_s_memory_has_no_bytes_to_hand_back() {
-		/// A [`Memory`] the test owns, in no shape this crate can recover.
-		struct Custom(Vec<u8>);
-
-		// SAFETY: the bytes outlive the memory, and `check_extent` refuses a
-		// range that does not fit them.
-		unsafe impl Memory for Custom {
-			fn resolve(&self, offset: usize, len: usize) -> Result<*mut u8> {
-				check_extent(offset, len, self.0.len())?;
-				// SAFETY: `offset..offset + len` is inside the vector, which the
-				// buffer keeps alive.
-				Ok(unsafe { self.0.as_ptr().add(offset).cast_mut() })
-			}
-
-			fn len(&self) -> usize {
-				self.0.len()
-			}
-		}
-
-		let buffer = Buffer::new(Arc::new(Custom(b"custom".to_vec())));
-		let buffer = buffer
-			.try_into_vec()
-			.expect_err("a caller's memory is not a block to hand back");
-		assert_eq!(buffer.to_vec(), b"custom");
 	}
 }

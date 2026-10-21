@@ -1,0 +1,38 @@
+id: no-foreign-reexport
+language: rust
+severity: error
+message: Re-export your own children only (`mod child; pub use child::...`).
+ignores:
+  - crates/completion-async/src/lib.rs
+# Flags `pub use` of a path that goes through `crate`, `super`, or a leading `::`.
+# Not checked: `pub use x::...` where no `mod x` is declared in the same file.
+# ast-grep cannot relate a use to a sibling item by name, so that needs a lint
+# outside ast-grep.
+rule:
+  kind: use_declaration
+  all:
+    - has:
+        kind: visibility_modifier
+        stopBy: neighbor
+    - has:
+        field: argument
+        any:
+          - regex: '^::'
+          - kind: scoped_identifier
+            has:
+              any:
+                - kind: crate
+                - kind: super
+              stopBy: end
+          - kind: scoped_use_list
+            has:
+              any:
+                - kind: crate
+                - kind: super
+              stopBy: end
+          - kind: use_list
+            has:
+              any:
+                - kind: crate
+                - kind: super
+              stopBy: end

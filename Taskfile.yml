@@ -27,7 +27,7 @@ tasks:
     desc: "Check formatting and cross-check every target, without rewriting files"
     cmds:
       - cargo fmt --all --check
-      - ast-grep scan --report-style short
+      - ast-grep scan
       - for: { var: TARGETS }
         task: check-target
         vars: { TARGET: '{{.ITEM}}' }
@@ -42,7 +42,7 @@ tasks:
     cmds:
       # `--all-targets` covers the tests too, which are where the platform
       # cfgs and the scratch helpers live.
-      - cargo check {{.PROFILE_ARG}} --all-targets --locked --target {{.TARGET}}
+      - cargo clippy {{.PROFILE_ARG}} --all-targets --locked --target {{.TARGET}}
 
   test:
     desc: "Run every test on the host"

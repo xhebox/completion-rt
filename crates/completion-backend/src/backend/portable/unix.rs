@@ -7,10 +7,10 @@ use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 
-use super::{Kind, Op, Progress, Route, blockable, counted, first_buffer, one_buffer};
+use super::{Kind, MAX_TRANSFER, Progress, SyncFlush, Transfer, blockable, counted, one_buffer};
 use crate::backend::Response;
 use crate::desc::{BorrowedDescriptor, OwnedDescriptor};
-use crate::memory::Resolved;
+use crate::memory::IoVec;
 
 /// The most descriptors one control message carries.
 const MAX_FDS: usize = 8;
@@ -33,54 +33,50 @@ pub(super) fn borrow(raw: Raw) -> io::Result<Borrowed<'static>> {
 	Ok(unsafe { BorrowedFd::borrow_raw(raw) })
 }
 
-/// Where an operation on `raw` runs. A regular file has no readiness to wait
-/// on, so every transfer on one is a pool job; everything else is the poller's.
-pub(super) fn route(raw: Raw, op: &Op) -> Route {
-	match op {
-		Op::Read { .. } if regular(raw) => Route::Pool(Kind::Read),
-		Op::Write { .. } if regular(raw) => Route::Pool(Kind::Write),
-		Op::Fsync if regular(raw) => Route::Pool(Kind::Fsync),
-		Op::Flush if regular(raw) => Route::Pool(Kind::Flush),
-		Op::Allocate { offset, len } => Route::Pool(Kind::Allocate {
-			offset: *offset,
-			len: *len,
-		}),
-		Op::Punch { offset, len } => Route::Pool(Kind::Punch {
-			offset: *offset,
-			len: *len,
-		}),
-		// A descriptor that is no regular file cannot be synced or flushed
-		// by the pool: the call is made here.
-		Op::Fsync | Op::Flush => Route::Inline,
-		// `polling`'s interrupt interest is a no-op on kqueue, and its
-		// events carry no `EV_EOF`, so a peer gone cannot be told from one
-		// that half-closed.
-		Op::Hangup => Route::Unsupported("this backend cannot wait for a hangup"),
-		// A socket call and a wait for readiness differ only in what the
-		// operation says to do once the poller reports the descriptor.
-		Op::Read { .. }
-		| Op::Write { .. }
-		| Op::Recv { .. }
-		| Op::RecvWithFds { .. }
-		| Op::Send { .. }
-		| Op::Accept
-		| Op::Readable
-		| Op::Writable => Route::Watch,
+/// Whether `error` is a connect the kernel has begun and not finished:
+/// `EINPROGRESS`, which Rust may report as `WouldBlock` here, is the handshake
+/// going on, and the poller reports its outcome as the socket turning writable.
+pub(super) fn in_progress(error: &io::Error) -> bool {
+	error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::EINPROGRESS)
+}
+
+/// Where a byte transfer on `raw` runs: a regular file has no readiness to wait
+/// on, so every transfer on one is a pool job; every other descriptor is the
+/// poller's.
+pub(super) fn transfer(raw: Raw) -> Transfer {
+	if regular(raw) {
+		Transfer::Pool
+	} else {
+		Transfer::Watch
 	}
 }
 
-/// Runs an operation on the reactor thread, for the one kind a descriptor that
-/// is no regular file can still take.
-pub(super) fn run_inline(raw: Raw, op: &Op) -> io::Result<Response> {
-	// SAFETY: the descriptor stays open for the call.
-	let fd = unsafe { BorrowedFd::borrow_raw(raw) };
-	match op {
-		Op::Fsync => rustix::fs::fsync(fd)
-			.map(|()| Response::Done)
-			.map_err(io::Error::from),
-		Op::Flush => flush(fd).map(|()| Response::Done),
-		_ => unreachable!("only a sync and a flush run on the reactor thread"),
-	}
+/// Where a sync or a flush on `raw` runs: the pool for a regular file, and here
+/// for a descriptor that is no file, which the pool has no job for.
+pub(super) fn sync_flush(raw: Raw) -> io::Result<SyncFlush> {
+	Ok(if regular(raw) {
+		SyncFlush::Pool
+	} else {
+		SyncFlush::Inline
+	})
+}
+
+/// A space reservation runs on the pool whichever descriptor names the range:
+/// the call itself reports one it cannot take.
+pub(super) fn reservable(_raw: Raw) -> io::Result<()> {
+	Ok(())
+}
+
+/// A socket call and a wait for readiness run on the poller, whichever
+/// descriptor names them.
+pub(super) fn pollable(_raw: Raw) -> io::Result<()> {
+	Ok(())
+}
+
+/// A send carrying descriptors is a control message, and `sendmsg` takes one on
+/// any descriptor.
+pub(super) fn control_message(_raw: Raw) -> io::Result<()> {
+	Ok(())
 }
 
 fn regular(raw: Raw) -> bool {
@@ -95,7 +91,7 @@ pub(super) fn run_file(
 	raw: Raw,
 	fdoff: u64,
 	kind: Kind,
-	buffer: Option<Resolved>,
+	buffer: Option<IoVec>,
 ) -> io::Result<Response> {
 	let fd = unsafe { BorrowedFd::borrow_raw(raw) };
 	match kind {
@@ -106,9 +102,10 @@ pub(super) fn run_file(
 		Kind::Allocate { offset, len } => allocate(fd, offset, len).map(|()| Response::Done),
 		Kind::Punch { offset, len } => punch(fd, offset, len).map(|()| Response::Done),
 		Kind::Read | Kind::Write => {
-			let Some((ptr, len)) = first_buffer(buffer) else {
+			let Some(buffer) = buffer else {
 				return Ok(Response::Count(0));
 			};
+			let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
 			// SAFETY: the reactor holds the memory behind this pointer until the job lands; the syscall copies through its pointer without forming a Rust reference.
 			let offset = fdoff as libc::off_t;
 			count(unsafe {
@@ -131,14 +128,14 @@ fn allocate(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {
 		.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
 	let before = rustix::fs::fstat(fd)?.st_size.max(0) as u64;
 	if end > before {
-		reserve(fd, offset, len, end)?;
+		preallocate(fd, offset, len, end)?;
 		rustix::fs::ftruncate(fd, end)?;
 	}
 	Ok(())
 }
 
 #[cfg(target_vendor = "apple")]
-fn reserve(fd: BorrowedFd<'_>, _offset: u64, _len: u64, end: u64) -> io::Result<()> {
+fn preallocate(fd: BorrowedFd<'_>, _offset: u64, _len: u64, end: u64) -> io::Result<()> {
 	// F_PREALLOCATE, asked for a contiguous run first and a scattered one after,
 	// as rustix's own fallocate does here.
 	let mut store = libc::fstore_t {
@@ -163,7 +160,7 @@ fn reserve(fd: BorrowedFd<'_>, _offset: u64, _len: u64, end: u64) -> io::Result<
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn reserve(fd: BorrowedFd<'_>, offset: u64, len: u64, _end: u64) -> io::Result<()> {
+fn preallocate(fd: BorrowedFd<'_>, offset: u64, len: u64, _end: u64) -> io::Result<()> {
 	let status =
 		unsafe { libc::posix_fallocate(fd.as_raw_fd(), offset as libc::off_t, len as libc::off_t) };
 	if status != 0 {
@@ -283,74 +280,75 @@ fn count(result: libc::ssize_t) -> io::Result<usize> {
 	}
 }
 
-/// Calls the operation the poller reported ready that only a unix descriptor
-/// takes here: `read`/`write`, which a watched pipe takes as well as a socket,
-/// and the ones that carry descriptors.
-pub(super) fn run_op(fd: Raw, op: &mut Op, buffer: Option<Resolved>) -> io::Result<Progress> {
+/// Receives into the one buffer `buffer` names on a socket, also collecting the
+/// descriptors the call carried in a control message.
+pub(super) fn recv_with_fds(fd: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 	// SAFETY: the descriptor stays open for the operation's flight.
 	let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-	match op {
-		Op::Read { .. } | Op::Write { .. } => counted(stream(fd, op, buffer)),
-		Op::RecvWithFds { .. } => {
-			let (ptr, len) = one_buffer(buffer)?;
-			// The received descriptors are this call's own: nothing waits on
-			// them after the response carries them out.
-			let mut fds: Vec<OwnedDescriptor> = Vec::new();
-			let mut iov = libc::iovec {
-				iov_base: ptr.cast(),
-				iov_len: len,
-			};
-			let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
-			let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-			msg.msg_iov = &mut iov;
-			msg.msg_iovlen = 1;
-			msg.msg_control = space.as_mut_ptr().cast();
-			msg.msg_controllen = space.len() as _;
-			// MSG_DONTWAIT: the caller's socket may be in blocking mode, and a
-			// call that blocked would stall the reactor thread behind it.
-			let result =
-				count(unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) });
-			match blockable(result)? {
-				Some(moved) => {
-					take_fds(&msg, &mut fds);
-					Ok(Progress::Done(Response::CountWithFds(moved, fds)))
-				}
-				None => Ok(Progress::Blocked),
-			}
+	let (ptr, len) = one_buffer(buffer)?;
+	// The received descriptors are this call's own: nothing waits on them
+	// after the response carries them out.
+	let mut fds: Vec<OwnedDescriptor> = Vec::new();
+	let mut iov = libc::iovec {
+		iov_base: ptr.cast(),
+		iov_len: len,
+	};
+	let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
+	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+	msg.msg_iov = &mut iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = space.as_mut_ptr().cast();
+	msg.msg_controllen = space.len() as _;
+	// MSG_DONTWAIT: the caller's socket may be in blocking mode, and a call
+	// that blocked would stall the reactor thread behind it.
+	let result = count(unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) });
+	match blockable(result)? {
+		Some(moved) => {
+			take_fds(&msg, &mut fds);
+			Ok(Progress::Done(Response::CountWithFds(moved, fds)))
 		}
-		Op::Send { fds, .. } => send_with_fds(fd, buffer, fds),
-		_ => unreachable!("only a socket call and a readiness wait reach the poller"),
+		None => Ok(Progress::Blocked),
 	}
 }
 
-/// Transfers one buffer on a watched descriptor.
+/// Reads into the one buffer `buffer` names, on a watched descriptor.
 ///
 /// A watched descriptor here may be a pipe, which only `read`/`write` take; a
 /// socket takes them too, where Windows has only `recv`/`send`.
-fn stream(fd: BorrowedFd<'_>, op: &Op, buffer: Option<Resolved>) -> io::Result<usize> {
-	let Some((ptr, len)) = first_buffer(buffer) else {
-		return Ok(0);
+pub(super) fn read(fd: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
+	let Some(buffer) = buffer else {
+		return Ok(Progress::Done(Response::Count(0)));
 	};
+	let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
 	// SAFETY: the reactor holds the memory this buffer names until the
 	// operation lands, and the call is the only mover of the range while the
 	// slice stands.
 	let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-	match op {
-		Op::Read { .. } => rustix::io::read(fd, bytes).map_err(io::Error::from),
-		Op::Write { .. } => rustix::io::write(fd, bytes).map_err(io::Error::from),
-		_ => unreachable!("only a read and a write run through a stream"),
-	}
+	counted(rustix::io::read(borrow(fd)?, bytes).map_err(io::Error::from))
 }
 
-/// Sends one buffer on `fd`, carrying `fds` in a control message: the
-/// descriptors are this operation's own, and the peer holds its own copies once
-/// the call takes the bytes, so they go with the call. A send that carries none
-/// is the shared socket call.
-fn send_with_fds(
-	fd: BorrowedFd<'_>,
-	buffer: Option<Resolved>,
+/// Writes from the one buffer `buffer` names, on a watched descriptor.
+pub(super) fn write(fd: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
+	let Some(buffer) = buffer else {
+		return Ok(Progress::Done(Response::Count(0)));
+	};
+	let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
+	// SAFETY: the reactor holds the memory this buffer names until the
+	// operation lands, and the call only reads it.
+	let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+	counted(rustix::io::write(borrow(fd)?, bytes).map_err(io::Error::from))
+}
+
+/// Sends the one buffer `buffer` names on `fd`, carrying `fds` in a control
+/// message: the descriptors are this operation's own, and the peer holds its own
+/// copies once the call takes the bytes, so they go with the call.
+pub(super) fn send_with_fds(
+	fd: Raw,
+	buffer: Option<IoVec>,
 	fds: &mut Vec<OwnedDescriptor>,
 ) -> io::Result<Progress> {
+	// SAFETY: the descriptor stays open for the operation's flight.
+	let fd = unsafe { BorrowedFd::borrow_raw(fd) };
 	if fds.len() > MAX_FDS {
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidInput,

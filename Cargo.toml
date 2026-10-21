@@ -6,5 +6,9 @@ resolver = "3"
 unreachable_pub = "deny"
 
 [workspace.lints.clippy]
+disallowed_methods = "deny"
 len_without_is_empty = "allow"
+len_zero = "allow"
+tabs_in_doc_comments = "allow"
+wildcard_imports = "deny"
 

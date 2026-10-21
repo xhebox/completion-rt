@@ -1,0 +1,9 @@
+id: no-mod-visibility-modifier
+language: rust
+severity: error
+message: Do not add a visibility modifier to `mod`; keep modules private and re-export items with `pub use` or `pub(crate) use` instead.
+rule:
+  kind: mod_item
+  has:
+    kind: visibility_modifier
+    stopBy: neighbor

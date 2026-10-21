@@ -43,6 +43,38 @@ impl From<OwnedSocket> for OwnedDescriptor {
 	}
 }
 
+macro_rules! from_handle {
+	($($handle:ty),* $(,)?) => {
+		$(
+			impl From<$handle> for OwnedDescriptor {
+				fn from(handle: $handle) -> Self {
+					OwnedDescriptor::Handle(OwnedHandle::from(handle))
+				}
+			}
+		)*
+	};
+}
+
+from_handle!(std::fs::File, std::io::PipeReader, std::io::PipeWriter);
+
+macro_rules! from_socket {
+	($($socket:ty),* $(,)?) => {
+		$(
+			impl From<$socket> for OwnedDescriptor {
+				fn from(socket: $socket) -> Self {
+					OwnedDescriptor::Socket(OwnedSocket::from(socket))
+				}
+			}
+		)*
+	};
+}
+
+from_socket!(
+	std::net::TcpStream,
+	std::net::TcpListener,
+	std::net::UdpSocket,
+);
+
 /// Borrows the underlying OS descriptor or handle.
 pub trait AsDescriptor: Send + Sync {
 	fn as_descriptor(&self) -> BorrowedDescriptor<'_>;

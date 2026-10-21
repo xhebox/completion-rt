@@ -1,0 +1,8 @@
+id: no-doc-hidden
+language: rust
+severity: error
+message: Do not use `#[doc(hidden)]`; keep internal items private, or document public items openly instead of hiding them from rustdoc.
+rule:
+  any:
+    - pattern: '#[doc(hidden)]'
+    - pattern: '#![doc(hidden)]'

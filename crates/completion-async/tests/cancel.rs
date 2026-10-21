@@ -1,5 +1,5 @@
-//! Cancellation through the async surface: the cooperative path ([`Cancel`] and
-//! `until`), and the [`Cancel`] tree and wait that the async API exposes.
+//! Cancellation through the async surface: the [`Scope`] an operation runs
+//! under, and the token tree and wait a scope exposes.
 //!
 //! What a drop does — cancel the operation and detach it, without waiting for
 //! the backend to let go of the caller's memory — is a reactor concern the
@@ -11,14 +11,11 @@
 mod common;
 
 use std::future::Future;
+use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::pin::pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use completion_async::{Buffer, Cancel, Config, ErrorKind, Executor, Facade, File, Span, Timeout};
+use completion_async::{Buffer, Config, ErrorKind, Executor, File, Span, Stream, timeout};
 
 /// The async driver the operations run on.
 fn executor() -> Executor {
@@ -32,38 +29,103 @@ fn span(buf: &Buffer) -> Span {
 	buf.whole()
 }
 
-/// `until` returns `Ok` when the operation completes first, even with a cancel
-/// that has not fired.
+/// A socket pair with both ends non-blocking: a receive on one waits in front
+/// of the kernel until the peer writes, or until a cancel gives it up.
+fn pair() -> (UnixStream, Stream) {
+	let (left, right) = UnixStream::pair().unwrap();
+	left.set_nonblocking(true).unwrap();
+	right.set_nonblocking(true).unwrap();
+	(left, Stream::new(right))
+}
+
+/// A scope returns the operation's own result when it completes first, even
+/// with a scope that has not been cancelled.
 #[test]
-fn until_completes_when_the_op_lands_first() {
-	let dir = common::tempdir("completion-until-ok").unwrap();
+fn a_scope_returns_the_op_that_lands_first() {
+	let dir = common::tempdir("completion-scope-ok").unwrap();
 	let path = dir.path().join("data");
 	std::fs::write(&path, b"hello").unwrap();
 	let mut executor = executor();
-	let file = File::with_executor(std::fs::File::open(path).unwrap(), &executor);
+	let file = File::new(std::fs::File::open(path).unwrap());
 
 	let buf = Buffer::zeroed(5);
-	let cancel = Cancel::new();
-	let outcome = executor
-		.block_on(file.read_at(span(&buf), 0).until(&cancel))
+	let scope = executor.scope();
+	let read = executor
+		.block_on(async { scope.spawn(file.read_at(span(&buf), 0)).await })
+		.unwrap()
 		.unwrap();
-	assert_eq!(outcome.value, 5, "the read completed first");
-	assert!(outcome.result.is_ok(), "the cancel never fired");
-	assert_eq!(buf.to_vec(), b"hello");
+	assert_eq!(read, 5, "the read completed first");
+	assert_eq!(buf.whole().to_vec(), b"hello");
+}
+
+/// A task spawned in a scope runs in it: the I/O it submits is given up when
+/// the scope is cancelled, while an operation outside the scope — here one run
+/// in the executor's root scope — is left to its peer.
+#[test]
+fn a_spawned_task_takes_the_cancel_of_the_scope_it_was_spawned_in() {
+	let mut executor = executor();
+	let (scoped_left, scoped_right) = pair();
+	let (mut root_left, root_right) = pair();
+	let scope = executor.scope();
+
+	let (task_buf, task_live) = common::tracked(8);
+	// The spawn resolves the executor `block_on` runs, so it has to happen inside
+	// it; one pass over the executor then submits the spawned receive, so it is in
+	// flight before the cancel lands.
+	let mut task = None;
+	executor
+		.block_on(async {
+			let spawned = scope.spawn(async move { scoped_right.recv(task_buf.whole()).await });
+			timeout(Duration::from_millis(1)).await.unwrap();
+			task = Some(spawned);
+		})
+		.unwrap();
+	let task = task.expect("the root future spawned its task");
+
+	// The other receive belongs to no child scope, only the root one, and is in
+	// flight too.
+	let (root_buf, _root_live) = common::tracked(8);
+	let mut receive = Box::pin(root_right.recv(root_buf.whole()));
+	executor
+		.block_on(std::future::poll_fn(|cx| {
+			assert!(receive.as_mut().poll(cx).is_pending());
+			std::task::Poll::Ready(())
+		}))
+		.unwrap();
+
+	drop(scope.cancel());
+
+	// The task's receive ends with the scope it was spawned in...
+	let error = executor.block_on(task).unwrap().unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::Cancelled, "{error}");
+	assert!(
+		!task_live.alive(),
+		"the kernel let go of the cancelled buffer"
+	);
+
+	// ...while the operation outside the scope is still waiting for its peer.
+	root_left.write_all(b"hello").unwrap();
+	let read = executor
+		.block_on(std::future::poll_fn(|cx| receive.as_mut().poll(cx)))
+		.unwrap()
+		.unwrap();
+	assert_eq!(read, 5, "the operation outside the scope was cancelled too");
+	assert_eq!(&root_buf.whole().to_vec()[..5], b"hello");
+	let _ = scoped_left;
 }
 
 /// Cancelling a parent cancels its children; cancelling a child leaves the
 /// parent alone; and a child of an already-raised parent starts raised.
 #[test]
-fn a_child_follows_its_parent() {
-	let parent = Cancel::new();
+fn a_child_scope_follows_its_parent() {
+	let parent = completion_async::scope();
 	let child = parent.child();
 	assert!(!parent.is_cancelled());
 	assert!(!child.is_cancelled());
-	child.cancel();
+	drop(child.cancel());
 	assert!(child.is_cancelled());
 	assert!(!parent.is_cancelled(), "a child does not cancel its parent");
-	parent.cancel();
+	drop(parent.cancel());
 	assert!(child.is_cancelled(), "a parent cancels its child");
 
 	let grandchild = parent.child().child();
@@ -79,134 +141,27 @@ fn a_child_follows_its_parent() {
 	);
 }
 
-#[derive(Default)]
-struct Woken(AtomicBool);
-
-impl Wake for Woken {
-	fn wake(self: Arc<Self>) {
-		self.0.store(true, Ordering::SeqCst);
-	}
-}
-
-/// A wait on a cancel that already fired resolves on its first poll.
-#[test]
-fn a_wait_on_a_fired_cancel_is_ready_at_once() {
-	let cancel = Cancel::new();
-	cancel.cancel();
-	let mut cx = Context::from_waker(Waker::noop());
-	assert!(
-		pin!(cancel.wait()).poll(&mut cx).is_ready(),
-		"the wait missed a cancel that had already fired"
-	);
-}
-
-/// A cancel raised on another thread while a wait's first poll is checking and
-/// registering either resolves that poll or wakes the waker it registered.
-///
-/// Both threads spin on one counter to start each round together, so the raise
-/// lands inside the poll's window in some rounds. Lost rounds are counted, not
-/// asserted in the loop: a panic there would leave the raiser spinning on a
-/// round that never starts.
-#[test]
-fn a_cancel_racing_the_wait_registration_is_not_lost() {
-	const ROUNDS: usize = 20_000;
-	let cancels: Vec<Cancel> = (0..ROUNDS).map(|_| Cancel::new()).collect();
-	let round = AtomicUsize::new(0);
-	let mut lost = 0;
-	let mut stuck = 0;
-	std::thread::scope(|scope| {
-		scope.spawn(|| {
-			for (at, cancel) in cancels.iter().enumerate() {
-				while round.load(Ordering::Acquire) != at * 2 + 1 {
-					std::hint::spin_loop();
-				}
-				cancel.cancel();
-				round.store(at * 2 + 2, Ordering::Release);
-			}
-		});
-		for (at, cancel) in cancels.iter().enumerate() {
-			let woken = Arc::new(Woken::default());
-			let waker = Waker::from(Arc::clone(&woken));
-			let mut cx = Context::from_waker(&waker);
-			let mut wait = pin!(cancel.wait());
-			round.store(at * 2 + 1, Ordering::Release);
-			let ready = wait.as_mut().poll(&mut cx).is_ready();
-			while round.load(Ordering::Acquire) != at * 2 + 2 {
-				std::hint::spin_loop();
-			}
-			if !ready && !woken.0.load(Ordering::SeqCst) {
-				lost += 1;
-			}
-			if wait.as_mut().poll(&mut cx).is_pending() {
-				stuck += 1;
-			}
-		}
-	});
-	assert_eq!(
-		lost, 0,
-		"a cancel fired around the registration and nothing woke the wait"
-	);
-	assert_eq!(stuck, 0, "a wait stayed pending on a fired cancel");
-}
-
-/// A wait dropped before its cancel fires gives its waker back, so a
-/// long-lived cancel holds nothing of the futures that gave up on it.
-#[test]
-fn a_dropped_wait_lets_go_of_its_waker() {
-	let cancel = Cancel::new();
-	let woken = Arc::new(Woken::default());
-	let waker = Waker::from(Arc::clone(&woken));
-	let held = Arc::strong_count(&woken);
-	{
-		let mut wait = pin!(cancel.wait());
-		assert!(
-			wait.as_mut()
-				.poll(&mut Context::from_waker(&waker))
-				.is_pending()
-		);
-		assert!(
-			Arc::strong_count(&woken) > held,
-			"the pending wait registered no waker"
-		);
-	}
-	assert_eq!(
-		Arc::strong_count(&woken),
-		held,
-		"the dropped wait left its waker in the cancel"
-	);
-	cancel.cancel();
-	assert!(
-		!woken.0.load(Ordering::SeqCst),
-		"the cancel woke a wait that was gone"
-	);
-}
-
 /// A `cancel()` on another thread raises the reactor's wake-up, so a thread
-/// parked in `block_on` comes back and the `until` future resolves.
+/// parked in `block_on` comes back and the scoped operation resolves.
 #[test]
 fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 	let mut executor = executor();
-	let (left, right) = UnixStream::pair().unwrap();
-	left.set_nonblocking(true).unwrap();
-	right.set_nonblocking(true).unwrap();
-	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
+	let (left, right) = pair();
 	let (buf, live) = common::tracked(8);
-	let cancel = Cancel::new();
-	let raiser = cancel.clone();
+	let scope = executor.scope();
+	let raiser = scope.clone();
 	let thread = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(50));
-		raiser.cancel();
+		drop(raiser.cancel());
 	});
 	let started = Instant::now();
-	let outcome = executor
-		.block_on(right.recv(buf.whole()).until(&cancel))
+	let result = executor
+		.block_on(async { scope.spawn(right.recv(buf.whole())).await })
 		.unwrap();
 	thread.join().unwrap();
-	assert!(
-		outcome
-			.result
-			.as_ref()
-			.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
+	assert_eq!(
+		result.expect_err("the cancelled receive resolved").kind(),
+		ErrorKind::Cancelled
 	);
 	assert!(
 		started.elapsed() < Duration::from_secs(5),
@@ -217,59 +172,44 @@ fn a_cancel_from_another_thread_wakes_a_parked_block_on() {
 	let _ = left;
 }
 
-/// A child a holder keeps still goes with its parent.
-#[test]
-fn a_raised_cancel_fires_a_child_that_is_still_held() {
-	let cancel = Cancel::new();
-	let child = cancel.child();
-	assert!(!child.is_cancelled(), "a child starts unraised");
-	cancel.cancel();
-	assert!(child.is_cancelled(), "the child went with the parent");
-}
-
-/// One cancel spans every executor its waiters run on, not just the one it was
-/// first polled through: a raise on a third thread has to reach both parked
-/// `block_on`s, so each registers its own reactor's wake-up with the cancel.
+/// One scope spans every executor its operations run on, not just the one it
+/// names for spawning: a fire on a third thread has to reach both parked
+/// `block_on`s, so each registers its own reactor's wake-up with the token.
 #[test]
 fn a_cancel_shared_by_two_executors_wakes_both() {
-	let cancel = Cancel::new();
+	let shared = completion_async::scope();
 	let (done, finished) = std::sync::mpsc::channel();
 	for _ in 0..2 {
-		let cancel = cancel.clone();
+		let shared = shared.clone();
 		let done = done.clone();
 		std::thread::spawn(move || {
 			let mut executor = executor();
-			let (left, right) = UnixStream::pair().unwrap();
-			left.set_nonblocking(true).unwrap();
-			right.set_nonblocking(true).unwrap();
-			let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
+			let (left, right) = pair();
 			let (buf, live) = common::tracked(8);
 			let started = Instant::now();
-			let outcome = executor
-				.block_on(right.recv(buf.whole()).until(&cancel))
+			let result = executor
+				.block_on(async { shared.spawn(right.recv(buf.whole())).await })
 				.unwrap();
 			// `left` outlives the receive: a peer that went would end it with EOF,
 			// not leave it stalled for the cancel to reach.
 			let _ = left;
 			drop(buf);
-			let _ = done.send((outcome, started.elapsed(), live));
+			let _ = done.send((result, started.elapsed(), live));
 		});
 	}
-	let raiser = cancel.clone();
+	let raiser = shared.clone();
 	let raising = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(50));
-		raiser.cancel();
+		drop(raiser.cancel());
 	});
 	raising.join().unwrap();
 	for _ in 0..2 {
-		let (outcome, elapsed, live) = finished
+		let (result, elapsed, live) = finished
 			.recv_timeout(Duration::from_secs(5))
 			.expect("a parked block_on never woke: the shared cancel was lost");
-		assert!(
-			outcome
-				.result
-				.as_ref()
-				.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
+		assert_eq!(
+			result.expect_err("the cancelled receive resolved").kind(),
+			ErrorKind::Cancelled
 		);
 		assert!(
 			elapsed < Duration::from_secs(1),
@@ -279,71 +219,23 @@ fn a_cancel_shared_by_two_executors_wakes_both() {
 	}
 }
 
-/// A cancel fired on another thread has to reach a reactor asleep in its
-/// backend, not one spinning on a short poll: the reactor is driven with
-/// `poll(None)`, so after the cancel's own raise is spent the only thing that can
-/// bring it back is the wake the cancel raises for the `until` it races. The
-/// future then resolves cancelled and the kernel lets go of the buffer.
-///
-/// A wake lost on the way to a park that waits forever is a hang, so the
-/// resolver is watched by a deadline rather than left to time out.
-#[test]
-fn a_cancel_from_another_thread_wakes_a_parked_reactor() {
-	let (done, finished) = std::sync::mpsc::channel();
-	let resolving = std::thread::spawn(move || {
-		let mut executor = executor();
-		let (left, right) = UnixStream::pair().unwrap();
-		left.set_nonblocking(true).unwrap();
-		right.set_nonblocking(true).unwrap();
-		let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-		let (buf, live) = common::tracked(8);
-		let cancel = Cancel::new();
-		let raiser = cancel.clone();
-		let raising = std::thread::spawn(move || {
-			// Let the reactor reach the park, so the cancel lands on a reactor that is
-			// genuinely asleep rather than one about to poll and find the give-up itself.
-			std::thread::sleep(Duration::from_millis(200));
-			raiser.cancel();
-		});
-		let outcome = executor
-			.block_on(right.recv(buf.whole()).until(&cancel))
-			.unwrap();
-		raising.join().unwrap();
-		assert!(
-			outcome
-				.result
-				.as_ref()
-				.is_err_and(|error| error.kind() == ErrorKind::Cancelled),
-			"the receive completed instead of cancelling"
-		);
-		drop(buf);
-		assert!(!live.alive(), "the cancelled receive kept its buffer");
-		done.send(()).unwrap();
-	});
-	let finished = finished.recv_timeout(Duration::from_secs(5));
-	assert!(
-		!matches!(finished, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
-		"a cancel from another thread did not reach the parked reactor, so the \
-		 receive it gave up on never settled"
-	);
-	resolving.join().unwrap();
-}
-
-/// A timer given a cancel resolves with the cancel, not with its deadline: the
+/// A timer given a scope resolves with the cancel, not with its deadline: the
 /// reactor disarms it and the future reports `Cancelled` instead of waiting an
 /// hour.
 #[test]
 fn a_cancelled_timeout_reports_the_cancel() {
 	let mut executor = executor();
-	let cancel = Cancel::new();
-	let raiser = cancel.clone();
+	let scope = executor.scope();
+	let raiser = scope.clone();
 	let raising = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(50));
-		raiser.cancel();
+		drop(raiser.cancel());
 	});
-	let timeout = Timeout::with_executor(Duration::from_secs(3600), &executor);
+	let timeout = timeout(Duration::from_secs(3600));
 	let started = Instant::now();
-	let result = executor.block_on(timeout.until(&cancel)).unwrap();
+	let result = executor
+		.block_on(async { scope.spawn(timeout).await })
+		.unwrap();
 	raising.join().unwrap();
 	let error = result.expect_err("the cancelled timeout resolved instead of reporting the cancel");
 	assert_eq!(error.kind(), ErrorKind::Cancelled, "{error}");

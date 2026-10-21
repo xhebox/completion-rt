@@ -35,7 +35,7 @@ fn a_pool_hands_out_and_takes_back_its_blocks() {
 fn a_pooled_block_is_zeroed() {
 	let pool = BufferPool::new(64, 1);
 	let buffer = pool.get();
-	assert!(buffer.to_vec().iter().all(|&byte| byte == 0));
+	assert!(buffer.whole().to_vec().iter().all(|&byte| byte == 0));
 }
 
 #[test]

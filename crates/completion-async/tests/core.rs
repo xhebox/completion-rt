@@ -7,15 +7,12 @@
 //! low crate's tests.
 mod common;
 
-use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io;
-use std::pin::pin;
-use std::task::{Context, Poll, Waker};
 
+use completion_async::{Buffer, Config, Executor, File, Span};
 #[cfg(unix)]
-use completion_async::Facade;
-use completion_async::{Buffer, Config, ErrorKind, Executor, File, Span};
+use completion_async::{ErrorKind, Stream};
 
 /// The async driver the operations run on: it owns the reactor, and `block_on`
 /// drives both the future and the backend beneath it.
@@ -24,13 +21,13 @@ fn executor() -> Executor {
 	Executor::new(Config::default()).unwrap()
 }
 
-/// A file with `contents`, wrapped in a facade bound to `executor`.
-fn seeded(executor: &Executor, contents: &[u8]) -> File {
+/// A file with `contents`, wrapped in a handle bound to `executor`.
+fn seeded(contents: &[u8]) -> File {
 	let dir = common::tempdir("completion-seed").unwrap();
 	let path = dir.path().join("data");
 	std::fs::write(&path, contents).unwrap();
 	// The returned descriptor outlives the deleted directory entry.
-	File::with_executor(common::open(path).unwrap(), executor)
+	File::new(common::open(path).unwrap())
 }
 
 /// The whole of `buf` in a span: the span holds its own handle on the buffer,
@@ -45,15 +42,14 @@ fn span(buf: &Buffer) -> Span {
 #[test]
 fn a_read_short_of_the_buffer_completes_with_its_count() {
 	let mut executor = executor();
-	let file = seeded(&executor, b"hello");
+	let file = seeded(b"hello");
 	let buf: Buffer = Buffer::zeroed(8);
 	let n = executor
 		.block_on(file.read_at(span(&buf), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
 	assert_eq!(n, 5, "the completion is one call's bytes");
-	assert_eq!(&buf.to_vec()[..5], b"hello");
+	assert_eq!(&buf.whole().to_vec()[..5], b"hello");
 }
 
 /// An operation holds the descriptor it was submitted for. The caller's copy
@@ -74,12 +70,12 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 
 	let plain = std::fs::File::open(&first).unwrap();
 	let number: RawFd = plain.as_raw_fd();
-	let facade = File::with_executor(plain, &executor);
+	let file = File::new(plain);
 	let buf: Buffer = Buffer::zeroed(5);
-	let read = facade.read_at(span(&buf), 0);
-	// The facade goes before anything reaches the kernel; the read names the
+	let read = file.read_at(span(&buf), 0);
+	// The handle goes before anything reaches the kernel; the read names the
 	// file through the entry's own clone of the resource.
-	drop(facade);
+	drop(file);
 
 	// `open` takes the lowest free number, so one pass over every number up to
 	// the operation's own fills anything below it: were the number free, a file
@@ -95,8 +91,12 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 		squatters.push(squatter);
 	}
 
-	assert_eq!(executor.block_on(read).unwrap().into_result().unwrap(), 5);
-	assert_eq!(buf.to_vec(), b"first", "the read landed on another file");
+	assert_eq!(executor.block_on(read).unwrap().unwrap(), 5);
+	assert_eq!(
+		buf.whole().to_vec(),
+		b"first",
+		"the read landed on another file"
+	);
 }
 
 /// A dropped operation whose request never reached a `poll` still releases the
@@ -104,7 +104,7 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 #[test]
 fn a_dropped_operation_releases_an_unsubmitted_request() {
 	let mut executor = executor();
-	let file = seeded(&executor, b"data");
+	let file = seeded(b"data");
 	let (buf, live) = common::tracked(4);
 	let read = file.read_at(buf.whole(), 0);
 	drop(buf);
@@ -116,7 +116,7 @@ fn a_dropped_operation_releases_an_unsubmitted_request() {
 	assert!(!live.alive(), "and nothing held it after");
 }
 
-/// `until` returns `Cancelled` only after the kernel has let go of the buffer:
+/// A cancel ends the receive only after the kernel has let go of the buffer:
 /// the caller's handle is all that is left of it when it does, and a byte
 /// written to the peer afterwards lands nowhere.
 #[test]
@@ -126,58 +126,34 @@ fn cancelling_waits_for_the_kernel() {
 	use std::os::unix::net::UnixStream;
 	use std::time::Duration;
 
-	use completion_async::Cancel;
-
 	let (left, right) = UnixStream::pair().unwrap();
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
-	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
+	let right: Stream = Stream::new(right);
 	let buf = Buffer::zeroed(8);
-	let cancel = Cancel::new();
-	let raiser = cancel.clone();
+	let scope = executor.scope();
+	let raiser = scope.clone();
 	std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(20));
-		raiser.cancel();
+		drop(raiser.cancel());
 	});
-	let outcome = executor
-		.block_on(right.recv(span(&buf)).until(&cancel))
+	let result = executor
+		.block_on(async { scope.spawn(right.recv(span(&buf))).await })
 		.unwrap();
-	assert!(
-		outcome
-			.result
-			.as_ref()
-			.is_err_and(|error| error.kind() == ErrorKind::Cancelled)
+	assert_eq!(
+		result.expect_err("the cancelled receive resolved").kind(),
+		ErrorKind::Cancelled
 	);
 	// A write after the cancel lands nowhere: the kernel is no longer reading
 	// into the buffer.
 	(&left).write_all(b"late data").unwrap();
 	std::thread::sleep(Duration::from_millis(20));
-	assert_eq!(buf.to_vec(), &[0u8; 8], "a byte arrived after the cancel");
-}
-
-#[test]
-fn concurrent_submits_all_complete() {
-	let mut executor = executor();
-	let mut tasks = Vec::new();
-	for i in 0..8u8 {
-		let file = seeded(&executor, &[i; 64]);
-		let buf: Buffer = Buffer::zeroed(64);
-		let read = buf.clone();
-		let span = span(&read);
-		tasks.push(executor.spawner().spawn(async move {
-			let n = file.read_at(span, 0).await.into_result().unwrap();
-			assert_eq!(n, 64);
-			assert!(read.to_vec().iter().all(|&b| b == i));
-		}));
-	}
-	executor
-		.block_on(async {
-			for task in tasks {
-				task.await;
-			}
-		})
-		.unwrap();
+	assert_eq!(
+		buf.whole().to_vec(),
+		&[0u8; 8],
+		"a byte arrived after the cancel"
+	);
 }
 
 /// The pool runs a fixed number of file operations at a time and the rest
@@ -186,17 +162,17 @@ fn concurrent_submits_all_complete() {
 #[test]
 fn many_transfers_all_complete() {
 	let mut executor = executor();
-	let file = seeded(&executor, &[7u8; 4096]);
+	let file = seeded(&[7u8; 4096]);
 	let mut tasks = Vec::new();
 	for _ in 0..4096 {
 		let buf: Buffer = Buffer::zeroed(4096);
 		let read = buf.clone();
 		let span = span(&read);
 		let file = file.clone();
-		tasks.push(executor.spawner().spawn(async move {
-			let n = file.read_at(span, 0).await.into_result().unwrap();
+		tasks.push(executor.spawn(async move {
+			let n = file.read_at(span, 0).await.unwrap();
 			assert_eq!(n, 4096);
-			assert!(read.to_vec().iter().all(|&byte| byte == 7));
+			assert!(read.whole().to_vec().iter().all(|&byte| byte == 7));
 		}));
 	}
 	executor
@@ -208,45 +184,12 @@ fn many_transfers_all_complete() {
 		.unwrap();
 }
 
-/// The socket ops move bytes: one send on one end, one receive on the other.
-#[cfg(unix)]
-#[test]
-fn a_socket_send_lands_in_the_receive_buffer() {
-	use std::os::unix::net::UnixStream;
-
-	let (left, right) = UnixStream::pair().unwrap();
-	let mut executor = executor();
-	let left: Facade<UnixStream> = Facade::with_executor(left, &executor);
-	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-
-	let sent: Buffer = Buffer::from_slice(b"over the socket");
-	assert_eq!(
-		executor
-			.block_on(left.send(span(&sent)))
-			.unwrap()
-			.into_result()
-			.unwrap(),
-		15
-	);
-
-	let received: Buffer = Buffer::zeroed(15);
-	assert_eq!(
-		executor
-			.block_on(right.recv(span(&received)))
-			.unwrap()
-			.into_result()
-			.unwrap(),
-		15
-	);
-	assert_eq!(received.to_vec(), b"over the socket");
-}
-
 /// A socket op waits for data even when the descriptor says not to block:
 /// the backend arms the readiness itself, so a device can keep a non-blocking
 /// socket (a connect still needs one) and still transfer through the engine.
 /// The completion is the bytes one call moved — four here, of the eight the
 /// buffer has room for; a caller that wants the eight loops over
-/// [`Facade::recv_exact`].
+/// [`Stream::recv_exact`].
 #[cfg(unix)]
 #[test]
 fn a_receive_waits_on_a_nonblocking_socket() {
@@ -258,7 +201,7 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 	left.set_nonblocking(true).unwrap();
 	right.set_nonblocking(true).unwrap();
 	let mut executor = executor();
-	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
+	let right: Stream = Stream::new(right);
 	let buffer: Buffer = Buffer::zeroed(8);
 
 	// Nothing has been sent yet, so the receive stays in flight until the peer
@@ -270,11 +213,10 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 	let n = executor
 		.block_on(right.recv(span(&buffer)))
 		.unwrap()
-		.into_result()
 		.unwrap();
 	sender.join().unwrap();
 	assert_eq!(n, 4, "the completion is one call's bytes");
-	assert_eq!(&buffer.to_vec()[..4], b"data");
+	assert_eq!(&buffer.whole().to_vec()[..4], b"data");
 }
 
 /// SQPOLL hands submissions to a kernel thread; the completions come back the
@@ -301,15 +243,14 @@ fn sqpoll_rings_complete_too() {
 			return;
 		}
 	};
-	let file = seeded(&executor, b"hello");
+	let file = seeded(b"hello");
 	let buf: Buffer = Buffer::zeroed(5);
 	let n = executor
 		.block_on(file.read_at(span(&buf), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
 	assert_eq!(n, 5);
-	assert_eq!(buf.to_vec(), b"hello");
+	assert_eq!(buf.whole().to_vec(), b"hello");
 }
 
 /// A fsync has no overlapped form, so an IOPOLL ring refuses it instead of
@@ -322,7 +263,7 @@ fn fsync_is_refused_on_an_iopoll_ring() {
 		..Config::default()
 	})
 	.unwrap();
-	let file = seeded(&executor, b"data");
+	let file = seeded(b"data");
 	// The reactor is the backend's only caller, so the refusal lands on the
 	// first poll rather than at submit time.
 	match executor.block_on(file.sync()).unwrap() {
@@ -343,7 +284,7 @@ fn allocate_is_refused_on_an_iopoll_ring() {
 		..Config::default()
 	})
 	.unwrap();
-	let file = seeded(&executor, b"data");
+	let file = seeded(b"data");
 	match executor.block_on(file.allocate(0, 4096)).unwrap() {
 		Ok(()) => panic!("allocate on an IOPOLL ring must be refused"),
 		Err(error) if error.kind() == ErrorKind::Failed => {
@@ -371,13 +312,12 @@ fn the_portable_backend_serves_a_file_and_a_socket() {
 	let directory = common::tempdir("completion-portable").unwrap();
 	let path = directory.path().join("data");
 	std::fs::write(&path, [0xab; 8192]).unwrap();
-	let file = File::with_executor(
+	let file = File::new(
 		OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
 			.unwrap(),
-		&executor,
 	);
 
 	// A regular file has no readiness to wait on, so its transfers run on the pool.
@@ -385,10 +325,9 @@ fn the_portable_backend_serves_a_file_and_a_socket() {
 	let n = executor
 		.block_on(file.read_at(span(&buf), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
 	assert_eq!(n, 4);
-	assert_eq!(buf.to_vec(), [0xab; 4]);
+	assert_eq!(buf.whole().to_vec(), [0xab; 4]);
 
 	// A punch is a pool job too, and it cuts the hole the ring cuts.
 	executor.block_on(file.punch(0, 4096)).unwrap().unwrap();
@@ -396,14 +335,13 @@ fn the_portable_backend_serves_a_file_and_a_socket() {
 
 	// A socket is a readiness source: the poller reports it, the call runs.
 	let (left, right) = UnixStream::pair().unwrap();
-	let left: Facade<UnixStream> = Facade::with_executor(left, &executor);
-	let right: Facade<UnixStream> = Facade::with_executor(right, &executor);
-	let payload: Buffer = Buffer::from_slice(b"portable");
+	let left: Stream = Stream::new(left);
+	let right: Stream = Stream::new(right);
+	let payload: Buffer = Buffer::from(b"portable");
 	assert_eq!(
 		executor
 			.block_on(left.send(span(&payload)))
 			.unwrap()
-			.into_result()
 			.unwrap(),
 		8
 	);
@@ -412,22 +350,21 @@ fn the_portable_backend_serves_a_file_and_a_socket() {
 		executor
 			.block_on(right.recv(span(&received)))
 			.unwrap()
-			.into_result()
 			.unwrap(),
 		8
 	);
-	assert_eq!(received.to_vec(), b"portable");
+	assert_eq!(received.whole().to_vec(), b"portable");
 }
 
 /// An accept on the portable backend, on every target: the listener is a
-/// readiness source, the connection comes back as a facade, and the two ends
+/// readiness source, the connection comes back as a stream, and the two ends
 /// are live both ways.
 #[test]
 fn the_portable_backend_accepts_a_connection() {
 	use std::io::{Read, Write};
 	use std::net::{TcpListener, TcpStream};
 
-	use completion_async::Facade;
+	use completion_async::{Listener, Stream};
 
 	let mut executor = Executor::new(Config {
 		backend: "portable".parse().unwrap(),
@@ -437,19 +374,18 @@ fn the_portable_backend_accepts_a_connection() {
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 	let address = listener.local_addr().unwrap();
 	listener.set_nonblocking(true).unwrap();
-	let listener: Facade<TcpListener> = Facade::with_executor(listener, &executor);
+	let listener: Listener = Listener::new(listener);
 	let mut client = TcpStream::connect(address).unwrap();
-	let stream: Facade<TcpStream> = executor
+	let stream: Stream = executor
 		.block_on(listener.accept())
 		.unwrap()
 		.expect("the accept landed");
 
-	let payload: Buffer = Buffer::from_slice(b"hello");
+	let payload: Buffer = Buffer::from(b"hello");
 	assert_eq!(
 		executor
 			.block_on(stream.send(span(&payload)))
 			.unwrap()
-			.into_result()
 			.unwrap(),
 		5
 	);
@@ -463,11 +399,10 @@ fn the_portable_backend_accepts_a_connection() {
 		executor
 			.block_on(stream.recv(span(&received)))
 			.unwrap()
-			.into_result()
 			.unwrap(),
 		5
 	);
-	assert_eq!(received.to_vec(), b"world");
+	assert_eq!(received.whole().to_vec(), b"world");
 
 	// The accepted socket is the backend's to run: a unix one carries the flags
 	// a watched descriptor needs, non-blocking and closed on exec.
@@ -475,33 +410,10 @@ fn the_portable_backend_accepts_a_connection() {
 	{
 		let socket = stream
 			.try_take()
-			.unwrap_or_else(|_| panic!("a settled operation still named the socket"));
+			.unwrap_or_else(|| panic!("a settled operation still named the socket"));
 		let flags = rustix::fs::fcntl_getfl(&socket).unwrap();
 		assert!(flags.contains(rustix::fs::OFlags::NONBLOCK));
 		let descriptor = rustix::io::fcntl_getfd(&socket).unwrap();
 		assert!(descriptor.contains(rustix::io::FdFlags::CLOEXEC));
-	}
-}
-
-/// Dropping the executor stops the reactor it owns: a facade left over — every
-/// clone a caller kept is one — is refused from then on, so the caller has an
-/// error to act on instead of a completion nothing drives.
-#[test]
-fn a_submission_after_the_executor_drops_is_refused() {
-	let executor = executor();
-	let file = seeded(&executor, b"hello");
-	let buf: Buffer = Buffer::zeroed(5);
-	let span = span(&buf);
-	drop(executor);
-	let mut read = pin!(file.read_at(span, 0));
-	let mut cx = Context::from_waker(Waker::noop());
-	// Nothing drives this submission, so it either lands on this poll or never
-	// does.
-	let Poll::Ready(outcome) = Future::poll(read.as_mut(), &mut cx) else {
-		panic!("the operation submitted after the executor dropped parked forever");
-	};
-	match outcome.into_result() {
-		Err(error) => assert_eq!(error.kind(), ErrorKind::Stopped, "{error}"),
-		Ok(count) => panic!("a gone reactor moved {count} bytes"),
 	}
 }

@@ -102,7 +102,7 @@ impl Wake for Port {
 	}
 }
 
-pub(super) struct Iocp<T = ()> {
+pub struct Iocp<T = ()> {
 	port: Arc<Port>,
 	/// What the kernel holds for an operation, filed under a key of this map:
 	/// the `OVERLAPPED` box the completion packet points at, and the pending

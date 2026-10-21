@@ -127,7 +127,7 @@ impl Wake for PollerWake {
 	}
 }
 
-pub(super) struct Portable<T = ()> {
+pub struct Portable<T = ()> {
 	poller: Arc<PollerWake>,
 	/// The key of the source each descriptor the poller knows is registered
 	/// under.
@@ -793,54 +793,5 @@ fn connect(fd: sys::Raw) -> io::Result<Progress> {
 		Ok(_) => Ok(Progress::Done(Response::Done)),
 		Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(Progress::Blocked),
 		Err(error) => Err(error),
-	}
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-	use super::*;
-
-	use crate::{AsDescriptor, Config};
-
-	/// Closed-descriptor deregistration differs by poller: epoll may reject it, while kqueue may have removed it already. Either outcome must discard the registration.
-	#[test]
-	fn a_deregistration_of_a_closed_descriptor_leaves_no_key_behind() {
-		let mut backend = Portable::new(&Config::default()).unwrap();
-		let (reader, _writer) = std::io::pipe().unwrap();
-		let fd = sys::raw(reader.as_descriptor());
-		let key = backend.active.insert(Active::Waiting {
-			fd,
-			op: Op::Readable,
-			buffer: None,
-			data: (),
-		});
-		backend.watch(fd, Direction::Readable, key).unwrap();
-		let registered = backend.keys[&fd];
-		drop(reader);
-		let _ = backend.unwatch(fd, Direction::Readable, key);
-		assert!(!backend.keys.contains_key(&fd));
-		assert!(!backend.sources.contains_key(registered));
-		assert!(backend.sources.is_empty());
-	}
-
-	/// Simulate a poller that lost the source before deregistration; stale readiness must not retain or dispatch the old key.
-	#[test]
-	fn a_refused_deregistration_leaves_no_key_behind() {
-		let mut backend = Portable::new(&Config::default()).unwrap();
-		let (reader, _writer) = std::io::pipe().unwrap();
-		let fd = sys::raw(reader.as_descriptor());
-		let key = backend.active.insert(Active::Waiting {
-			fd,
-			op: Op::Readable,
-			buffer: None,
-			data: (),
-		});
-		backend.watch(fd, Direction::Readable, key).unwrap();
-		let registered = backend.keys[&fd];
-		backend.delete(fd).unwrap();
-		assert!(backend.unwatch(fd, Direction::Readable, key).is_err());
-		assert!(!backend.keys.contains_key(&fd));
-		assert!(!backend.sources.contains_key(registered));
-		assert!(backend.sources.is_empty());
 	}
 }

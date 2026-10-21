@@ -1,21 +1,32 @@
-//! The executor: which wakes reach a thread parked in `block_on`, and which
-//! tasks a pass over the loop runs.
+//! The executor and the scopes it runs under: which wakes reach a thread parked
+//! in `block_on`, which tasks a pass over the loop runs, and how cancellation
+//! reaches the operations and tasks of a scope.
 //!
 //! A wake on the driver thread itself is seen by the poll that follows it
 //! whatever the reactor does, so the off-thread tests drive their executor on a
 //! thread of its own: only a wake raised from another thread can show whether
 //! it reached the wait the driver is parked in.
+//!
+//! The free functions — `block_on`, `spawn`, `scope` — run on the thread's
+//! default executor, which each test thread gets fresh.
+//!
+//! What a drop does — cancel the operation and detach it, without waiting for
+//! the backend to let go of the caller's memory — is a reactor concern the
+//! async layer cannot reach: its tests live in the low crate.
 
 mod common;
 
 use std::future::Future;
+use std::io::Read;
+use std::net::{TcpListener, TcpStream};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use completion_async::{Buffer, Config, ErrorKind, Executor, File, timeout};
+use completion_async::{Buffer, Config, Executor, File, Stream, block_on, spawn, timeout};
 
 fn executor() -> Executor {
 	common::init_logging();
@@ -105,78 +116,6 @@ fn a_task_woken_from_another_thread_ends_block_on() {
 /// second notification here, so a lost wake parks forever and the run is watched
 /// by a deadline.
 #[test]
-fn a_task_spawned_while_the_root_future_is_pending_runs_without_a_notify() {
-	let (done, finished) = std::sync::mpsc::channel();
-	std::thread::spawn(move || {
-		let mut executor = executor();
-		let ran = Arc::new(AtomicBool::new(false));
-		let flag = Arc::clone(&ran);
-		// The scope, not the executor: `block_on` holds the executor mutably for
-		// the whole run, and the scope is what a spawn goes through.
-		let scope = executor.scope();
-		let mut spawned = false;
-		let outcome = executor.block_on(std::future::poll_fn(move |_| {
-			if ran.load(Ordering::Acquire) {
-				return Poll::Ready(());
-			}
-			if !spawned {
-				// The spawn's own wake is the only notification: the root future
-				// raises no other, and nothing touches the reactor.
-				spawned = true;
-				let flag = Arc::clone(&flag);
-				drop(scope.spawn(async move { flag.store(true, Ordering::Release) }));
-			}
-			Poll::Pending
-		}));
-		let _ = done.send(outcome.is_ok());
-	});
-	let completed = finished.recv_timeout(Duration::from_secs(10));
-	assert!(
-		completed.is_ok(),
-		"the spawned task never ran: the executor parked with the wake the spawn raised"
-	);
-	assert!(completed.unwrap(), "block_on failed before the task ran");
-}
-
-/// The executor owns the reactor, so dropping it drops the reactor too: an
-/// operation already in flight on that reactor resolves to `ErrorKind::Cancelled`
-/// when polled after the executor is dropped.
-#[test]
-fn an_operation_after_the_executor_drops_is_refused() {
-	let mut executor = executor();
-	let (_peer, socket) = socket_pair();
-	let buffer: Buffer = Buffer::zeroed(5);
-	let mut recv = Box::pin(socket.recv(&buffer));
-	executor
-		.block_on(std::future::poll_fn(|cx| {
-			assert!(recv.as_mut().poll(cx).is_pending());
-			Poll::Ready(())
-		}))
-		.unwrap();
-	drop(executor);
-
-	let mut cx = Context::from_waker(Waker::noop());
-	let Poll::Ready(outcome) = std::future::Future::poll(recv.as_mut(), &mut cx) else {
-		panic!("the operation parked forever after the executor dropped");
-	};
-	match outcome {
-		Err(error) => assert_eq!(error.kind(), ErrorKind::Cancelled, "{error}"),
-		Ok(count) => panic!("a gone reactor took the operation and moved {count} bytes"),
-	}
-}
-
-#[test]
-fn awaiting_a_task_after_its_executor_drops_panics() {
-	let executor = executor();
-	let mut task = Box::pin(executor.spawn(std::future::pending::<()>()));
-	drop(executor);
-	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-		task.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-	}));
-	assert!(caught.is_err(), "a task with no executor parked forever");
-}
-
-#[test]
 fn a_busy_task_does_not_starve_file_io_or_timers() {
 	let stop = Arc::new(AtomicBool::new(false));
 	let flag = Arc::clone(&stop);
@@ -221,22 +160,6 @@ fn socket_pair() -> (std::net::TcpStream, completion_async::Stream) {
 	(peer, completion_async::Stream::new(stream))
 }
 
-fn stalled_task(
-	executor: &mut Executor,
-	buffer: &Buffer,
-) -> (std::net::TcpStream, impl Future<Output = ()> + use<>) {
-	let (peer, socket) = socket_pair();
-	let payload = buffer.whole();
-	let task = executor.spawn(async move {
-		socket.recv(payload).await.unwrap();
-	});
-	executor
-		.block_on(timeout(Duration::from_millis(1)))
-		.unwrap()
-		.unwrap();
-	(peer, task)
-}
-
 /// The deadline is fixed when the timer is constructed, not when it is first
 /// polled: a timer held past its duration has already come due, so the
 /// first poll finds it fired rather than starting the wait then.
@@ -251,27 +174,6 @@ fn a_timeout_held_past_its_duration_fires_on_its_first_poll() {
 		started.elapsed() < Duration::from_millis(5),
 		"the wait restarted at the first poll instead of holding the deadline"
 	);
-}
-
-/// A timer armed on an executor before that executor drops resolves to
-/// `ErrorKind::Cancelled` when polled after teardown.
-#[test]
-fn a_timer_armed_before_a_stop_reports_stopped_from_the_poll() {
-	let mut executor = executor();
-	let mut timeout = Box::pin(timeout(Duration::from_secs(3600)));
-	executor
-		.block_on(std::future::poll_fn(|cx| {
-			assert!(timeout.as_mut().poll(cx).is_pending());
-			Poll::Ready(())
-		}))
-		.unwrap();
-	drop(executor);
-	let mut cx = Context::from_waker(Waker::noop());
-	let Poll::Ready(error) = std::future::Future::poll(timeout.as_mut(), &mut cx) else {
-		panic!("a timer armed before the stop stayed pending");
-	};
-	let error = error.unwrap_err();
-	assert_eq!(error.kind(), ErrorKind::Cancelled, "{error}");
 }
 
 #[test]
@@ -388,90 +290,11 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	assert_eq!(*executor.block_on(next).unwrap(), 42);
 }
 
-#[test]
-fn task_destructors_observe_other_joins_as_gone_during_executor_teardown() {
-	use std::cell::{Cell, RefCell};
-	use std::rc::Rc;
-
-	struct Observe {
-		tasks: Rc<RefCell<Vec<completion_async::JoinHandle<()>>>>,
-		all_gone: Rc<Cell<bool>>,
-	}
-
-	impl Drop for Observe {
-		fn drop(&mut self) {
-			for task in self.tasks.borrow_mut().iter_mut() {
-				let gone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-					std::pin::Pin::new(task).poll(&mut Context::from_waker(Waker::noop()))
-				}))
-				.is_err();
-				self.all_gone.set(self.all_gone.get() && gone);
-			}
-		}
-	}
-
-	let mut executor = executor();
-	let tasks = Rc::new(RefCell::new(Vec::new()));
-	let all_gone = Rc::new(Cell::new(true));
-	for _ in 0..2 {
-		let observe = Observe {
-			tasks: Rc::clone(&tasks),
-			all_gone: Rc::clone(&all_gone),
-		};
-		tasks.borrow_mut().push(executor.spawn(async move {
-			std::future::pending::<()>().await;
-			drop(observe);
-		}));
-	}
-	executor.block_on(async {}).unwrap();
-	drop(executor);
-	assert!(
-		all_gone.get(),
-		"a task destructor found a join still waiting on a dead executor"
-	);
-}
-
-#[test]
-fn dropping_the_executor_returns_a_tasks_in_flight_io_buffer() {
-	let mut executor = executor();
-	let (buffer, live) = common::tracked(8);
-	let (_peer, task) = stalled_task(&mut executor, &buffer);
-	drop(executor);
-	drop(buffer);
-	assert!(!live.alive(), "executor teardown kept the buffer");
-	drop(task);
-}
-
 /// A root future that is ready on its first poll returns there and then. A task
 /// it detached before returning is queued only as a consequence of that poll,
 /// so the task has not been polled once by the time the loop would return.
 /// `block_on` has to make one closing pass before it hands the result back, or
 /// the detached task waits for the next call to run at all.
-#[test]
-fn block_on_runs_a_detached_task_before_returning_when_the_root_future_is_ready_at_once() {
-	let mut executor = executor();
-	let ran = Arc::new(AtomicBool::new(false));
-	let flag = Arc::clone(&ran);
-	let scope = executor.scope();
-	let mut to_spawn = Some(flag);
-	executor
-		.block_on(std::future::poll_fn(move |_| {
-			if let Some(flag) = to_spawn.take() {
-				drop(scope.spawn(async move { flag.store(true, Ordering::Release) }));
-			}
-			Poll::Ready(())
-		}))
-		.unwrap();
-	assert!(
-		ran.load(Ordering::Acquire),
-		"a task detached by a root future ready at once never ran"
-	);
-}
-
-/// The root future is polled before the ready-task queue is drained, so work
-/// already queued when `block_on` starts cannot delay the future the caller
-/// handed in. This is the ordering compio's `block_on_at` uses
-/// (`ignore/compio/compio-runtime/src/lib.rs:190-201`).
 #[test]
 fn block_on_polls_the_root_future_before_a_task_queued_before_it() {
 	use std::cell::Cell;
@@ -500,4 +323,100 @@ fn block_on_polls_the_root_future_before_a_task_queued_before_it() {
 		"a task queued before block_on ran before the root future was first polled"
 	);
 	assert!(ran.load(Ordering::Acquire), "the queued task never ran");
+}
+
+/// A timeout fires once its deadline has passed, not before.
+#[test]
+fn a_timeout_fires_at_its_deadline() {
+	let mut executor = executor();
+	let started = Instant::now();
+	executor
+		.block_on(timeout(Duration::from_millis(50)))
+		.unwrap()
+		.unwrap();
+	let elapsed = started.elapsed();
+	assert!(
+		elapsed >= Duration::from_millis(50),
+		"fired early: {elapsed:?}"
+	);
+	assert!(elapsed < Duration::from_secs(1), "fired late: {elapsed:?}");
+}
+
+/// A timer armed on a task does not hold up a nearer one: the wait is for the
+/// nearer deadline, not the far one.
+#[test]
+fn a_task_can_spawn_a_child_and_await_it() {
+	let parent = spawn(async {
+		let child = spawn(async { 21 });
+		child.await * 2
+	});
+	let result = block_on(parent);
+	assert!(matches!(result, Ok(42)), "{result:?}");
+}
+
+#[test]
+fn calling_block_on_inside_a_running_block_on_panics_as_nested() {
+	let result = catch_unwind(AssertUnwindSafe(|| {
+		let _ = block_on(async {
+			let _ = block_on(async {});
+		});
+	}));
+	let payload = result.expect_err("a nested call must panic");
+	let message = payload
+		.downcast_ref::<&str>()
+		.map(|s| s.to_string())
+		.or_else(|| payload.downcast_ref::<String>().cloned())
+		.unwrap_or_default();
+	assert!(message.contains("nested"), "{message}");
+}
+
+#[test]
+fn a_handle_made_inside_block_on_submits_to_the_global_executor() {
+	common::init_logging();
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+	let (mut server, _) = listener.accept().unwrap();
+
+	let payload = Buffer::from(b"hello").whole();
+	let sent = block_on(async move {
+		let socket: Stream = Stream::new(client);
+		socket.send_all(payload).await
+	})
+	.unwrap();
+	assert_eq!(sent.into_result().unwrap(), 5);
+
+	let mut got = [0u8; 5];
+	server.read_exact(&mut got).unwrap();
+	assert_eq!(&got, b"hello");
+}
+
+/// `Stream::connect` reaches the thread's default executor on its own: the
+/// connection is made there, and the stream it hands back runs on the same one.
+#[test]
+fn a_connect_made_inside_block_on_uses_the_global_executor() {
+	common::init_logging();
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	let addr = listener.local_addr().unwrap();
+
+	let payload = Buffer::from(b"hello").whole();
+	let sent = block_on(async move {
+		let stream = Stream::connect(addr).await.expect("the connect failed");
+		stream.send_all(payload).await
+	})
+	.unwrap();
+	assert_eq!(sent.into_result().unwrap(), 5);
+
+	let (mut peer, _) = listener.accept().unwrap();
+	let mut got = [0u8; 5];
+	peer.read_exact(&mut got).unwrap();
+	assert_eq!(&got, b"hello");
+}
+
+#[test]
+fn a_timeout_made_inside_a_spawned_task_fires_under_block_on() {
+	common::init_logging();
+	let start = Instant::now();
+	let task = spawn(async { timeout(Duration::from_millis(20)).await });
+	block_on(task).unwrap().unwrap();
+	assert!(start.elapsed() >= Duration::from_millis(20));
 }

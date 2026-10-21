@@ -9,8 +9,14 @@
 //! with the operation.
 //!
 //! The caller must keep each operation's descriptor and [`Buffer`] alive until
-//! [`Backend::poll`] reports its completion. For the high-level async runtime,
-//! executor, and resource handles, use `completion-async`.
+//! [`Backend::poll`] reports its completion.
+//!
+//! [`Driver`] wraps a [`Backend`] with what a single-threaded runtime needs on
+//! top of it: the thread's wait, its timers, and the cancellation of what is in
+//! flight. [`enter`] runs a closure on the driver entered on this thread, and
+//! [`Slot`] tracks one submitted operation or timer through to its response.
+//! For the high-level async runtime, executor, and resource handles, use
+//! `completion-async`.
 
 mod backend;
 mod desc;

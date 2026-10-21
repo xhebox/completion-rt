@@ -47,22 +47,17 @@
 //! # }
 //! ```
 
-mod cancel;
 mod executor;
-mod global;
 mod io;
 mod net;
-mod reactor;
 mod readiness;
 mod timer;
 
-pub use cancel::Scope;
 pub use completion_backend::{
 	AsDescriptor, BackendKind, BorrowedDescriptor, Buffer, BufferPool, Config, Error, ErrorKind,
 	IoVec, Memory, OwnedDescriptor, OwnedSocket, Result, Span,
 };
-pub use executor::{Executor, JoinHandle};
-pub use global::{block_on, scope, spawn};
+pub use executor::{Executor, JoinHandle, block_on, spawn};
 pub use io::{File, OpenOptions, Outcome};
 pub use net::{Listener, Received, Socket, Stream, ToSockAddr};
 pub use readiness::Readiness;

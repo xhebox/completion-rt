@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use completion_async::{Buffer, Config, ErrorKind, Executor, File, Stream};
+use completion_async::{Buffer, Config, Executor, File, Stream};
 
 fn executor() -> Executor {
 	common::init_logging();
@@ -42,26 +42,6 @@ fn a_hangup_waits_out_the_half_close_for_the_peer_to_go() {
 		"the hangup resolved on the half-close"
 	);
 	peer.join().unwrap();
-}
-
-#[test]
-fn a_cancelled_hangup_reports_the_cancel() {
-	let (_peer, stream) = UnixStream::pair().unwrap();
-	let mut executor = executor();
-	let stream: Stream = Stream::new(stream);
-	let scope = executor.scope();
-	let raiser = scope.clone();
-	let thread = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(50));
-		drop(raiser.cancel());
-	});
-
-	let error = executor
-		.block_on(async { scope.spawn(stream.hangup()).await })
-		.unwrap()
-		.unwrap_err();
-	assert_eq!(error.kind(), ErrorKind::Cancelled);
-	thread.join().unwrap();
 }
 
 /// The kernel ends a hangup's multishot poll on its own when the completion

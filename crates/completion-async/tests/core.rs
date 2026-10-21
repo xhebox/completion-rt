@@ -10,9 +10,11 @@ mod common;
 #[cfg(target_os = "linux")]
 use std::io;
 
-use completion_async::{Buffer, Config, Executor, File, Span};
+#[cfg(target_os = "linux")]
+use completion_async::ErrorKind;
 #[cfg(unix)]
-use completion_async::{ErrorKind, Stream};
+use completion_async::Stream;
+use completion_async::{Buffer, Config, Executor, File, Span};
 
 /// The async driver the operations run on: it owns the reactor, and `block_on`
 /// drives both the future and the backend beneath it.
@@ -114,46 +116,6 @@ fn a_dropped_operation_releases_an_unsubmitted_request() {
 	assert!(!live.alive(), "the request goes with it");
 	executor.block_on(async {}).unwrap();
 	assert!(!live.alive(), "and nothing held it after");
-}
-
-/// A cancel ends the receive only after the kernel has let go of the buffer:
-/// the caller's handle is all that is left of it when it does, and a byte
-/// written to the peer afterwards lands nowhere.
-#[test]
-#[cfg(unix)]
-fn cancelling_waits_for_the_kernel() {
-	use std::io::Write;
-	use std::os::unix::net::UnixStream;
-	use std::time::Duration;
-
-	let (left, right) = UnixStream::pair().unwrap();
-	left.set_nonblocking(true).unwrap();
-	right.set_nonblocking(true).unwrap();
-	let mut executor = executor();
-	let right: Stream = Stream::new(right);
-	let buf = Buffer::zeroed(8);
-	let scope = executor.scope();
-	let raiser = scope.clone();
-	std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(20));
-		drop(raiser.cancel());
-	});
-	let result = executor
-		.block_on(async { scope.spawn(right.recv(span(&buf))).await })
-		.unwrap();
-	assert_eq!(
-		result.expect_err("the cancelled receive resolved").kind(),
-		ErrorKind::Cancelled
-	);
-	// A write after the cancel lands nowhere: the kernel is no longer reading
-	// into the buffer.
-	(&left).write_all(b"late data").unwrap();
-	std::thread::sleep(Duration::from_millis(20));
-	assert_eq!(
-		buf.whole().to_vec(),
-		&[0u8; 8],
-		"a byte arrived after the cancel"
-	);
 }
 
 /// The pool runs a fixed number of file operations at a time and the rest

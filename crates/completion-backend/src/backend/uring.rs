@@ -168,7 +168,7 @@ impl Control {
 	}
 }
 
-pub(super) struct Uring<T = ()> {
+pub struct Uring<T = ()> {
 	ring: IoUring,
 	/// Whether the ring reports completions only while polling; such a ring has
 	/// no futex wake to ring.

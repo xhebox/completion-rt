@@ -9,7 +9,7 @@ use completion_backend::{AsDescriptor, Error, Op, OwnedDescriptor, OwnedSocket, 
 use socket2::SockAddr;
 
 use crate::Result;
-use crate::global::submit;
+use crate::executor::submit;
 use crate::io::{Outcome, counted, drain, fill};
 
 /// Payload of a receive that collects ancillary descriptors alongside bytes.

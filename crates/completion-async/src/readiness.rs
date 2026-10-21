@@ -4,7 +4,7 @@ use std::sync::Arc;
 use completion_backend::{AsDescriptor, Op, OwnedDescriptor};
 
 use crate::Result;
-use crate::global::submit;
+use crate::executor::submit;
 
 /// Handle for descriptors that signal readiness without transferring bytes
 /// (such as `eventfd`, `pidfd`, or `signalfd`).

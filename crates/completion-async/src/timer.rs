@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use completion_backend::Result;
 
-use crate::global::submit_timer;
+use crate::executor::submit_timer;
 
 /// Waits until `duration` has elapsed.
 ///

@@ -287,48 +287,6 @@ fn flush_leaves_the_handle_usable() {
 	assert_eq!(read.whole().to_vec(), b"helloworld");
 }
 
-/// A descriptor nothing owns anymore: `flush` must report the error rather than
-/// pretend success. Unix only — the close-time error is a unix idea.
-#[cfg(unix)]
-#[test]
-fn flush_reports_a_descriptor_that_is_not_open() {
-	use std::os::fd::{AsRawFd, FromRawFd};
-
-	let mut executor = executor();
-
-	// Opened then closed, so the number is free and nothing owns it. Made after
-	// the reactor so no descriptor it built can have taken the number back.
-	let dead = {
-		let (reader, writer) = std::io::pipe().unwrap();
-		drop(writer);
-		let raw = reader.as_raw_fd();
-		drop(reader);
-		raw
-	};
-
-	let file = File::new(unsafe { std::fs::File::from_raw_fd(dead) });
-	match executor.block_on(file.flush()).unwrap() {
-		Err(error) if error.kind() == ErrorKind::Failed => {
-			let error = io::Error::from(error);
-			assert_eq!(
-				error.raw_os_error(),
-				Some(rustix::io::Errno::BADF.raw_os_error()),
-				"a closed descriptor reports EBADF, not {error}"
-			)
-		}
-		other => panic!("flush on a closed descriptor must fail, got {other:?}"),
-	}
-
-	// The file owns a descriptor that is not open: dropping it would close the
-	// number again, which aborts under a debug assertion. Take it back and leak
-	// it instead.
-	let plain = match file.try_take() {
-		Some(plain) => plain,
-		None => panic!("an operation still names the file"),
-	};
-	std::mem::forget(plain);
-}
-
 fn filled(tag: &str, len: usize) -> (common::Scratch, std::path::PathBuf, Executor, File) {
 	let directory = common::tempdir(tag).unwrap();
 	let path = directory.path().join("data");

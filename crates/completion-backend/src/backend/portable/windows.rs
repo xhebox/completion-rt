@@ -17,10 +17,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
 
-use super::{Kind, MAX_TRANSFER, Progress, SyncFlush, Transfer, counted};
+use super::{IoVec, Kind, MAX_TRANSFER, Progress, SyncFlush, Transfer, counted};
 use crate::backend::Response;
 use crate::desc::BorrowedDescriptor;
-use crate::memory::IoVec;
 
 /// A descriptor as the platform names one: the poller watches only sockets, so
 /// a handle and a socket are told apart before anything else.

@@ -36,12 +36,9 @@ use windows_sys::Win32::System::IO::{
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
 use windows_sys::core::GUID;
 
-use super::Op;
+use super::{Config, Driver, IoVec, Op, Response};
 use crate::desc::{BorrowedDescriptor, OwnedSocket};
 use crate::error::{Error, Result};
-use crate::memory::Span;
-
-use super::{Config, Driver, Response};
 
 /// How long a teardown waits for one round of completions before going on.
 const WAIT_MILLIS: u32 = 1000;
@@ -423,12 +420,8 @@ impl<T> Iocp<T> {
 		Ok(())
 	}
 
-	fn issue(&mut self, fd: HANDLE, read: bool, span: &Span, fdoff: u64, data: T) -> Result<u64> {
+	fn issue(&mut self, fd: HANDLE, read: bool, buf: IoVec, fdoff: u64, data: T) -> Result<u64> {
 		self.associate(fd)?;
-		// `ReadFile` and `WriteFile` transfer through the span's one range.
-		// Resolving it first refuses an out-of-bounds span before anything is
-		// queued.
-		let buf = span.resolve()?;
 		let (key, ov_ptr) = self.enqueue(fd, fdoff, None, true, data);
 		// SAFETY: standard Win32 calls; `ov_ptr` names the box in `active`,
 		// alive until the completion is collected.
@@ -460,12 +453,10 @@ impl<T> Iocp<T> {
 		Ok(key.data().as_ffi())
 	}
 
-	fn transfer(&mut self, socket: SOCKET, span: &Span, send: bool, data: T) -> Result<u64> {
+	fn transfer(&mut self, socket: SOCKET, buf: IoVec, send: bool, data: T) -> Result<u64> {
 		self.associate(socket as HANDLE)?;
 		// The `WSABUF` only has to outlive the call: an overlapped `WSASend` or
-		// `WSARecv` copies it, and keeps only the buffer it names. Resolving
-		// first refuses an out-of-bounds span before anything is queued.
-		let buf = span.resolve()?;
+		// `WSARecv` copies it, and keeps only the buffer it names.
 		let wsabuf = WSABUF {
 			len: capped(buf.len),
 			buf: buf.ptr,
@@ -505,15 +496,15 @@ impl<T> Iocp<T> {
 		&mut self,
 		fd: BorrowedDescriptor<'_>,
 		read: bool,
-		span: &Span,
+		buf: IoVec,
 		offset: Option<u64>,
 		data: T,
 	) -> Result<u64> {
 		match (offset, fd) {
 			(None, BorrowedDescriptor::Socket(socket)) => {
-				self.transfer(socket.as_raw_socket() as SOCKET, span, !read, data)
+				self.transfer(socket.as_raw_socket() as SOCKET, buf, !read, data)
 			}
-			(offset, fd) => self.issue(as_handle(fd)?, read, span, offset.unwrap_or(0), data),
+			(offset, fd) => self.issue(as_handle(fd)?, read, buf, offset.unwrap_or(0), data),
 		}
 	}
 }
@@ -715,8 +706,8 @@ fn no_readiness() -> Error {
 impl<T> Driver<T> for Iocp<T> {
 	fn submit(&mut self, fd: BorrowedDescriptor<'_>, op: Op, data: T) -> Result<u64> {
 		match op {
-			Op::Read { offset, span } => self.read_or_write(fd, true, &span, offset, data),
-			Op::Write { offset, span } => self.read_or_write(fd, false, &span, offset, data),
+			Op::Read { offset, buf } => self.read_or_write(fd, true, buf, offset, data),
+			Op::Write { offset, buf } => self.read_or_write(fd, false, buf, offset, data),
 			Op::Fsync => Ok(self.in_thread(
 				as_handle(fd)?,
 				|handle| {
@@ -738,12 +729,12 @@ impl<T> Driver<T> for Iocp<T> {
 			Op::Punch { offset, len } => self
 				.punch(as_handle(fd)?, offset, len, data)
 				.map_err(Error::from),
-			Op::Recv { span } => self.transfer(as_socket(fd)?, &span, false, data),
-			Op::Send { span, fds } => {
+			Op::Recv { buf } => self.transfer(as_socket(fd)?, buf, false, data),
+			Op::Send { buf, fds } => {
 				if !fds.is_empty() {
 					return Err(Self::unsupported().into());
 				}
-				self.transfer(as_socket(fd)?, &span, true, data)
+				self.transfer(as_socket(fd)?, buf, true, data)
 			}
 			Op::RecvWithFds { .. } => Err(Self::unsupported().into()),
 			Op::Accept => self.accept(as_socket(fd)?, data).map_err(Error::from),

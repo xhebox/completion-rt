@@ -12,18 +12,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use completion_async::{Buffer, Config, Executor, File, Stream};
-
-fn executor() -> Executor {
-	common::init_logging();
-	Executor::new(Config::default()).unwrap()
-}
+use completion_async::{Buffer, Config, File, StreamSocket, block_on, init};
 
 #[test]
 fn a_hangup_waits_out_the_half_close_for_the_peer_to_go() {
 	let (peer, stream) = UnixStream::pair().unwrap();
-	let mut executor = executor();
-	let stream: Stream = Stream::new(stream);
+	common::init_logging();
+	let stream: StreamSocket = StreamSocket::new(stream);
 	let gone = Arc::new(AtomicBool::new(false));
 	let flag = Arc::clone(&gone);
 	let peer = std::thread::spawn(move || {
@@ -34,9 +29,7 @@ fn a_hangup_waits_out_the_half_close_for_the_peer_to_go() {
 		drop(peer);
 	});
 
-	// No scope of its own: `block_on` already runs the wait in the executor's
-	// root scope, and nothing here gives it up.
-	executor.block_on(stream.hangup()).unwrap().unwrap();
+	block_on(stream.hangup()).unwrap().unwrap();
 	assert!(
 		gone.load(Ordering::Acquire),
 		"the hangup resolved on the half-close"
@@ -50,13 +43,13 @@ fn a_hangup_waits_out_the_half_close_for_the_peer_to_go() {
 #[test]
 fn a_hangup_survives_a_poll_the_kernel_ends_early() {
 	// A ring whose completion queue holds four, so the burst below overflows it.
-	let mut executor = Executor::new(Config {
+	init(Config {
 		entries: 2,
 		..Config::default()
 	})
 	.unwrap();
 	let (peer, stream) = UnixStream::pair().unwrap();
-	let stream: Stream = Stream::new(stream);
+	let stream: StreamSocket = StreamSocket::new(stream);
 	// The wait, and then a burst of reads: nothing drives the reactor here, so
 	// the completions pile up unreaped while the poll is armed.
 	let mut hangup = Box::pin(stream.hangup());
@@ -67,17 +60,16 @@ fn a_hangup_survives_a_poll_the_kernel_ends_early() {
 		let path = scratch.path().join(format!("data{index}"));
 		std::fs::write(&path, b"hello").unwrap();
 		let file = File::new(common::open(&path).unwrap());
-		reads.push(Box::pin(file.read_at(buf.span(index, 1), 0)));
+		reads.push(Box::pin(file.read_at(buf.slice(index, 1), 0)));
 	}
-	executor
-		.block_on(std::future::poll_fn(|cx| {
-			assert!(hangup.as_mut().poll(cx).is_pending());
-			for read in &mut reads {
-				assert!(read.as_mut().poll(cx).is_pending());
-			}
-			std::task::Poll::Ready(())
-		}))
-		.unwrap();
+	block_on(std::future::poll_fn(|cx| {
+		assert!(hangup.as_mut().poll(cx).is_pending());
+		for read in &mut reads {
+			assert!(read.as_mut().poll(cx).is_pending());
+		}
+		std::task::Poll::Ready(())
+	}))
+	.unwrap();
 	std::thread::sleep(Duration::from_millis(50));
 	// The half-close reaches the armed poll with the queue full: the kernel ends
 	// the multishot rather than queue a report it has no room for.
@@ -90,7 +82,7 @@ fn a_hangup_survives_a_poll_the_kernel_ends_early() {
 		flag.store(true, Ordering::Release);
 		drop(peer);
 	});
-	executor.block_on(hangup).unwrap().unwrap();
+	block_on(hangup).unwrap().unwrap();
 	assert!(
 		gone.load(Ordering::Acquire),
 		"the hangup resolved before the peer went"

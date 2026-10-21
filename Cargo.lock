@@ -148,6 +148,7 @@ dependencies = [
  "fastrace",
  "log",
  "rustix",
+ "scopeguard",
  "slotmap",
  "smallvec",
  "socket2",

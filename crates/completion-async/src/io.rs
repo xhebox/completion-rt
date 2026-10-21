@@ -4,10 +4,11 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use completion_backend::{AsDescriptor, Error, Op, Response, Span};
+use completion_backend::{AsDescriptor, Error, IoVec, Op, Response};
 
 use crate::Result;
-use crate::executor::submit;
+use crate::executor::with_rt_or_default;
+use crate::memory::Buffer;
 
 /// Result of a multi-step transfer, preserving partial progress (`value`)
 /// alongside the completion status (`result`).
@@ -32,23 +33,29 @@ impl<T> Outcome<T> {
 	}
 }
 
-pub(crate) fn counted(landed: Result<Response>) -> Result<usize> {
-	match landed? {
+/// Submits the single transfer `op` builds over `buffer`'s range.
+pub(crate) async fn transfer(
+	fd: Arc<dyn AsDescriptor>,
+	buffer: Buffer,
+	op: impl FnOnce(IoVec) -> Op,
+) -> Result<usize> {
+	let op = op(buffer.resolve()?);
+	match with_rt_or_default(|rt| rt.submit(fd, op, Some(buffer.into_memory())))?.await? {
 		Response::Count(bytes) => Ok(bytes),
-		other => unreachable!("a transfer's round reports a count, not {other:?}"),
+		other => unreachable!("a transfer reports a count, not {other:?}"),
 	}
 }
 
 async fn repeat(
 	fd: Arc<dyn AsDescriptor>,
-	span: Span,
+	buffer: Buffer,
 	short: fn() -> io::Error,
-	mut op: impl FnMut(usize, Span) -> Op,
+	mut make_op: impl FnMut(usize, IoVec) -> Op,
 ) -> Outcome<usize> {
 	let mut done = 0;
-	while done < span.len() {
-		let round = op(done, span.clone().skip(done));
-		match counted(submit(Arc::clone(&fd), round).await) {
+	while done < buffer.len() {
+		let remaining = buffer.clone().skip(done);
+		match transfer(Arc::clone(&fd), remaining, |iovec| make_op(done, iovec)).await {
 			Ok(0) => return Outcome::new(done, Err(Error::from(short()))),
 			Ok(bytes) => done += bytes,
 			Err(error) => return Outcome::new(done, Err(error)),
@@ -59,12 +66,12 @@ async fn repeat(
 
 pub(crate) async fn fill(
 	fd: Arc<dyn AsDescriptor>,
-	span: Span,
-	op: impl FnMut(usize, Span) -> Op,
+	buffer: Buffer,
+	op: impl FnMut(usize, IoVec) -> Op,
 ) -> Outcome<usize> {
 	repeat(
 		fd,
-		span,
+		buffer,
 		|| {
 			io::Error::new(
 				io::ErrorKind::UnexpectedEof,
@@ -78,12 +85,12 @@ pub(crate) async fn fill(
 
 pub(crate) async fn drain(
 	fd: Arc<dyn AsDescriptor>,
-	span: Span,
-	op: impl FnMut(usize, Span) -> Op,
+	buffer: Buffer,
+	op: impl FnMut(usize, IoVec) -> Op,
 ) -> Outcome<usize> {
 	repeat(
 		fd,
-		span,
+		buffer,
 		|| io::Error::new(io::ErrorKind::WriteZero, "a call moved nothing"),
 		op,
 	)
@@ -229,94 +236,68 @@ impl File {
 		Arc::into_inner(self.0)
 	}
 
-	/// Performs a single read into `span` at byte offset `offset`.
-	///
-	/// May transfer fewer bytes than `span.len()`; use
-	/// [`read_exact_at`](Self::read_exact_at) to read until `span` is full.
+	/// Performs a single read into `buf` at byte offset `offset`.
 	pub fn read_at(
 		&self,
-		span: impl Into<Span>,
+		buf: impl Into<Buffer>,
 		offset: u64,
 	) -> impl Future<Output = Result<usize>> + 'static {
-		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
-		let span = span.into();
-		async move {
-			counted(
-				submit(
-					fd,
-					Op::Read {
-						offset: Some(offset),
-						span,
-					},
-				)
-				.await,
-			)
-		}
-	}
-
-	/// Reads into `span` starting at `offset` until `span` is completely filled.
-	///
-	/// Fails with [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) if EOF is
-	/// reached before `span` is full, and reports the bytes it did read as the
-	/// outcome's progress.
-	pub fn read_exact_at(
-		&self,
-		span: impl Into<Span>,
-		offset: u64,
-	) -> impl Future<Output = Outcome<usize>> + 'static {
-		let span = span.into();
-		fill(
+		transfer(
 			Arc::clone(&self.0) as Arc<dyn AsDescriptor>,
-			span,
-			move |done, span| Op::Read {
-				offset: Some(offset + done as u64),
-				span,
+			buf.into(),
+			move |iovec| Op::Read {
+				offset: Some(offset),
+				buf: iovec,
 			},
 		)
 	}
 
-	/// Performs a single write from `span` at byte offset `offset`.
-	///
-	/// May transfer fewer bytes than `span.len()`; use
-	/// [`write_all_at`](Self::write_all_at) to write the entire span.
-	pub fn write_at(
+	/// Reads into `buf` starting at `offset` until the buffer is completely filled.
+	pub fn read_exact_at(
 		&self,
-		span: impl Into<Span>,
-		offset: u64,
-	) -> impl Future<Output = Result<usize>> + 'static {
-		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
-		let span = span.into();
-		async move {
-			counted(
-				submit(
-					fd,
-					Op::Write {
-						offset: Some(offset),
-						span,
-					},
-				)
-				.await,
-			)
-		}
-	}
-
-	/// Writes all bytes in `span` starting at `offset`.
-	///
-	/// Fails with [`WriteZero`](io::ErrorKind::WriteZero) if a single write call
-	/// transfers zero bytes, and reports the bytes it did write as the outcome's
-	/// progress.
-	pub fn write_all_at(
-		&self,
-		span: impl Into<Span>,
+		buf: impl Into<Buffer>,
 		offset: u64,
 	) -> impl Future<Output = Outcome<usize>> + 'static {
-		let span = span.into();
+		let buffer = buf.into();
+		fill(
+			Arc::clone(&self.0) as Arc<dyn AsDescriptor>,
+			buffer,
+			move |done, iovec| Op::Read {
+				offset: Some(offset + done as u64),
+				buf: iovec,
+			},
+		)
+	}
+
+	/// Performs a single write from `buf` at byte offset `offset`.
+	pub fn write_at(
+		&self,
+		buf: impl Into<Buffer>,
+		offset: u64,
+	) -> impl Future<Output = Result<usize>> + 'static {
+		transfer(
+			Arc::clone(&self.0) as Arc<dyn AsDescriptor>,
+			buf.into(),
+			move |iovec| Op::Write {
+				offset: Some(offset),
+				buf: iovec,
+			},
+		)
+	}
+
+	/// Writes all bytes in `buf` starting at `offset`.
+	pub fn write_all_at(
+		&self,
+		buf: impl Into<Buffer>,
+		offset: u64,
+	) -> impl Future<Output = Outcome<usize>> + 'static {
+		let buffer = buf.into();
 		drain(
 			Arc::clone(&self.0) as Arc<dyn AsDescriptor>,
-			span,
-			move |done, span| Op::Write {
+			buffer,
+			move |done, iovec| Op::Write {
 				offset: Some(offset + done as u64),
-				span,
+				buf: iovec,
 			},
 		)
 	}
@@ -325,28 +306,29 @@ impl File {
 	/// `FlushFileBuffers`).
 	pub fn sync(&self) -> impl Future<Output = Result<()>> + use<> {
 		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
-		async move { submit(fd, Op::Fsync).await.map(|_response| ()) }
+		async move {
+			with_rt_or_default(|rt| rt.submit(fd, Op::Fsync, None))?
+				.await
+				.map(|_response| ())
+		}
 	}
 
 	/// Checks for deferred write-back errors (such as `ENOSPC` or `EIO`) without
 	/// forcing data to disk.
-	///
-	/// Unlike [`sync`](Self::sync), this does not guarantee durability; it
-	/// surfaces filesystem write-back errors that would otherwise be reported at
-	/// close.
 	pub fn flush(&self) -> impl Future<Output = Result<()>> + use<> {
 		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
-		async move { submit(fd, Op::Flush).await.map(|_response| ()) }
+		async move {
+			with_rt_or_default(|rt| rt.submit(fd, Op::Flush, None))?
+				.await
+				.map(|_response| ())
+		}
 	}
 
 	/// Preallocates disk space for `len` bytes starting at `offset`.
-	///
-	/// Extends the file with zeros if `offset + len` exceeds the current file
-	/// length; never shrinks the file.
 	pub fn allocate(&self, offset: u64, len: u64) -> impl Future<Output = Result<()>> + use<> {
 		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
 		async move {
-			submit(fd, Op::Allocate { offset, len })
+			with_rt_or_default(|rt| rt.submit(fd, Op::Allocate { offset, len }, None))?
 				.await
 				.map(|_response| ())
 		}
@@ -354,12 +336,10 @@ impl File {
 
 	/// Deallocates storage for `len` bytes at `offset` and zeroes the range while
 	/// keeping the file's length unchanged (hole punching).
-	///
-	/// On Windows, storage is only reclaimed if the file is marked sparse.
 	pub fn punch(&self, offset: u64, len: u64) -> impl Future<Output = Result<()>> + use<> {
 		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
 		async move {
-			submit(fd, Op::Punch { offset, len })
+			with_rt_or_default(|rt| rt.submit(fd, Op::Punch { offset, len }, None))?
 				.await
 				.map(|_response| ())
 		}

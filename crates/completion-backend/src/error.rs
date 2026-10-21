@@ -10,7 +10,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum ErrorKind {
 	/// The operation was cancelled.
 	Cancelled,
-	/// An OS or I/O failure occurred; see [`Error::source`](StdError::source) for the underlying [`io::Error`].
+	/// An OS or I/O failure occurred; recover the [`io::Error`] with [`io::Error::try_from`].
 	Failed,
 	/// The reactor has been shut down and no longer accepts work.
 	Stopped,
@@ -74,12 +74,13 @@ impl From<io::Error> for Error {
 	}
 }
 
-impl From<Error> for io::Error {
-	fn from(error: Error) -> io::Error {
+impl TryFrom<Error> for io::Error {
+	type Error = Error;
+
+	fn try_from(error: Error) -> Result<io::Error> {
 		match error.source {
-			Some(source) => source,
-			// Cancellation is not Interrupted: retrying needs the caller's decision.
-			None => io::Error::other(error),
+			Some(source) => Ok(source),
+			None => Err(error),
 		}
 	}
 }

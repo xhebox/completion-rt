@@ -7,10 +7,11 @@ use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 
-use super::{Kind, MAX_TRANSFER, Progress, SyncFlush, Transfer, blockable, counted, one_buffer};
+use super::{
+	IoVec, Kind, MAX_TRANSFER, Progress, SyncFlush, Transfer, blockable, counted, one_buffer,
+};
 use crate::backend::Response;
 use crate::desc::{BorrowedDescriptor, OwnedDescriptor};
-use crate::memory::IoVec;
 
 /// The most descriptors one control message carries.
 const MAX_FDS: usize = 8;

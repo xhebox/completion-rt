@@ -9,20 +9,16 @@ use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+#[cfg(unix)]
+use completion_async::spawn;
 use completion_async::{
-	Buffer, Config, Executor, Listener, OwnedDescriptor, Socket, Span, Stream, timeout,
+	Buffer, DatagramSocket, Listener, OwnedSocket, StreamSocket, block_on, timeout,
 };
 
-/// The async driver the socket operations run on.
-fn executor() -> Executor {
-	common::init_logging();
-	Executor::new(Config::default()).unwrap()
-}
-
-/// The whole of `buf` in a span: the span holds its own handle on the buffer,
-/// so it outlives the operation even when the caller's handle goes.
-fn span(buf: &Buffer) -> Span {
-	buf.whole()
+/// A copy of `buf` names the whole of it: the copy holds its own handle on the
+/// memory, so it outlives the operation even when the caller's handle goes.
+fn whole(buf: &Buffer) -> Buffer {
+	buf.clone()
 }
 
 /// A connected pair over loopback: the portable way to two real sockets.
@@ -86,8 +82,8 @@ fn listener(directory: &std::path::Path) -> (std::os::unix::net::UnixListener, s
 #[test]
 fn send_all_moves_a_payload_larger_than_one_call() {
 	let (client, mut server) = pair();
-	let mut executor = executor();
-	let socket: Stream = Stream::new(client);
+	common::init_logging();
+	let socket: StreamSocket = StreamSocket::new(client);
 
 	// The peer drains, so the send buffer never holds the whole payload. The
 	// timeout is not part of the contract: it is here so a send that stops
@@ -102,9 +98,8 @@ fn send_all_moves_a_payload_larger_than_one_call() {
 	});
 
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Buffer = Buffer::from(bytes.as_slice());
-	executor
-		.block_on(socket.send_all(span(&payload)))
+	let payload: Buffer = Buffer::copy_from(&bytes);
+	block_on(socket.send_all(whole(&payload)))
 		.unwrap()
 		.into_result()
 		.unwrap();
@@ -123,8 +118,8 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 	use std::io::Write;
 
 	let (mut client, server) = pair();
-	let mut executor = executor();
-	let socket: Stream = Stream::new(server);
+	common::init_logging();
+	let socket: StreamSocket = StreamSocket::new(server);
 
 	// The write timeout bounds the sender, so a receive that stops short fails
 	// this test instead of parking the sender thread.
@@ -138,9 +133,8 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 		client.write_all(&sender)
 	});
 
-	let buffer: Buffer = Buffer::zeroed(len);
-	executor
-		.block_on(socket.recv_exact(span(&buffer)))
+	let mut buffer: Buffer = Buffer::zeroed(len);
+	block_on(socket.recv_exact(whole(&buffer)))
 		.unwrap()
 		.into_result()
 		.unwrap();
@@ -150,7 +144,7 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 		.expect("the sender never got the whole payload out");
 
 	assert_eq!(
-		buffer.whole().to_vec(),
+		buffer.get_mut().unwrap().to_vec(),
 		bytes,
 		"the payload did not arrive whole"
 	);
@@ -161,8 +155,8 @@ fn recv_exact_fills_a_buffer_larger_than_one_call() {
 /// names, so no trait has to name it.
 struct MyStream(TcpStream);
 
-impl From<MyStream> for OwnedDescriptor {
-	fn from(stream: MyStream) -> OwnedDescriptor {
+impl From<MyStream> for OwnedSocket {
+	fn from(stream: MyStream) -> OwnedSocket {
 		stream.0.into()
 	}
 }
@@ -173,13 +167,12 @@ fn a_caller_socket_type_gets_the_socket_operations() {
 	use std::io::Write;
 
 	let (stream, mut peer) = pair();
-	let mut executor = executor();
-	let socket = Stream::new(MyStream(stream));
+	common::init_logging();
+	let socket = StreamSocket::new(MyStream(stream));
 
-	let payload: Buffer = Buffer::from(b"hello");
+	let payload: Buffer = Buffer::copy_from(b"hello");
 	assert_eq!(
-		executor
-			.block_on(socket.send_all(span(&payload)))
+		block_on(socket.send_all(whole(&payload)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
@@ -191,16 +184,15 @@ fn a_caller_socket_type_gets_the_socket_operations() {
 	assert_eq!(&got, b"hello");
 
 	peer.write_all(b"world").unwrap();
-	let buffer: Buffer = Buffer::zeroed(5);
+	let mut buffer: Buffer = Buffer::zeroed(5);
 	assert_eq!(
-		executor
-			.block_on(socket.recv_exact(span(&buffer)))
+		block_on(socket.recv_exact(whole(&buffer)))
 			.unwrap()
 			.into_result()
 			.unwrap(),
 		5
 	);
-	assert_eq!(buffer.whole().to_vec(), b"world");
+	assert_eq!(buffer.get_mut().unwrap().to_vec(), b"world");
 }
 
 /// A datagram socket is not a byte stream: each call is one message, and the
@@ -212,28 +204,16 @@ fn a_datagram_socket_takes_a_message_a_call() {
 	let left = UdpSocket::bind("127.0.0.1:0").unwrap();
 	let right = UdpSocket::bind("127.0.0.1:0").unwrap();
 	right.connect(left.local_addr().unwrap()).unwrap();
-	let mut executor = executor();
-	let receiver: Socket = Socket::new(left);
-	let sender: Socket = Socket::new(right);
+	common::init_logging();
+	let receiver: DatagramSocket = DatagramSocket::new(left);
+	let sender: DatagramSocket = DatagramSocket::new(right);
 
-	let payload: Buffer = Buffer::from(b"hello");
-	assert_eq!(
-		executor
-			.block_on(sender.send(span(&payload)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
+	let payload: Buffer = Buffer::copy_from(b"hello");
+	assert_eq!(block_on(sender.send(whole(&payload))).unwrap().unwrap(), 5);
 
-	let buffer: Buffer = Buffer::zeroed(8);
-	assert_eq!(
-		executor
-			.block_on(receiver.recv(span(&buffer)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
-	assert_eq!(&buffer.whole().to_vec()[..5], b"hello");
+	let mut buffer: Buffer = Buffer::zeroed(8);
+	assert_eq!(block_on(receiver.recv(whole(&buffer))).unwrap().unwrap(), 5);
+	assert_eq!(&buffer.get_mut().unwrap().to_vec()[..5], b"hello");
 }
 
 /// An accept hands back the connection as a stream of its own. The connection
@@ -247,22 +227,15 @@ fn an_accept_gives_a_stream_of_its_own() {
 
 	let directory = common::tempdir("completion-accept-stream").unwrap();
 	let (listener, path) = listener(directory.path());
-	let mut executor = executor();
+	common::init_logging();
 	let listener: Listener = Listener::new(listener);
 
 	let mut client = UnixStream::connect(&path).unwrap();
-	let stream: Stream = executor
-		.block_on(listener.accept())
+	let stream: StreamSocket = block_on(listener.accept())
 		.unwrap()
 		.expect("the accept landed");
-	let payload: Buffer = Buffer::from(b"hello");
-	assert_eq!(
-		executor
-			.block_on(stream.send(span(&payload)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
+	let payload: Buffer = Buffer::copy_from(b"hello");
+	assert_eq!(block_on(stream.send(whole(&payload))).unwrap().unwrap(), 5);
 
 	client
 		.set_read_timeout(Some(Duration::from_secs(5)))
@@ -274,15 +247,9 @@ fn an_accept_gives_a_stream_of_its_own() {
 	// The connection reaches the other way too: the client's bytes come out of
 	// the accepted stream.
 	client.write_all(b"world").unwrap();
-	let received: Buffer = Buffer::zeroed(5);
-	assert_eq!(
-		executor
-			.block_on(stream.recv(span(&received)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
-	assert_eq!(received.whole().to_vec(), b"world");
+	let mut received: Buffer = Buffer::zeroed(5);
+	assert_eq!(block_on(stream.recv(whole(&received))).unwrap().unwrap(), 5);
+	assert_eq!(received.get_mut().unwrap().to_vec(), b"world");
 }
 
 /// The same accept over TCP, on every platform, and the connection is live both
@@ -294,21 +261,14 @@ fn a_tcp_accept_gives_a_stream_of_its_own() {
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 	listener.set_nonblocking(true).unwrap();
 	let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-	let mut executor = executor();
+	common::init_logging();
 	let listener: Listener = Listener::new(listener);
 
-	let stream: Stream = executor
-		.block_on(listener.accept())
+	let stream: StreamSocket = block_on(listener.accept())
 		.unwrap()
 		.expect("the accept landed");
-	let payload: Buffer = Buffer::from(b"hello");
-	assert_eq!(
-		executor
-			.block_on(stream.send(span(&payload)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
+	let payload: Buffer = Buffer::copy_from(b"hello");
+	assert_eq!(block_on(stream.send(whole(&payload))).unwrap().unwrap(), 5);
 	client
 		.set_read_timeout(Some(Duration::from_secs(5)))
 		.unwrap();
@@ -319,15 +279,9 @@ fn a_tcp_accept_gives_a_stream_of_its_own() {
 	// The connection reaches the other way too: the client's bytes come out of
 	// the accepted stream.
 	client.write_all(b"world").unwrap();
-	let received: Buffer = Buffer::zeroed(5);
-	assert_eq!(
-		executor
-			.block_on(stream.recv(span(&received)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
-	assert_eq!(received.whole().to_vec(), b"world");
+	let mut received: Buffer = Buffer::zeroed(5);
+	assert_eq!(block_on(stream.recv(whole(&received))).unwrap().unwrap(), 5);
+	assert_eq!(received.get_mut().unwrap().to_vec(), b"world");
 }
 
 /// A connect reaches a listener over TCP, and the stream it hands back is live
@@ -337,37 +291,22 @@ fn a_tcp_connect_gives_a_live_stream() {
 	use std::io::Write;
 
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-	let mut executor = executor();
-	let connecting = Stream::connect(listener.local_addr().unwrap());
-	let stream = executor
-		.block_on(connecting)
-		.unwrap()
-		.expect("the connect failed");
+	common::init_logging();
+	let connecting = StreamSocket::connect(listener.local_addr().unwrap());
+	let stream = block_on(connecting).unwrap().expect("the connect failed");
 	let (mut peer, _) = listener.accept().unwrap();
 
-	let payload: Buffer = Buffer::from(b"hello");
-	assert_eq!(
-		executor
-			.block_on(stream.send(span(&payload)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
+	let payload: Buffer = Buffer::copy_from(b"hello");
+	assert_eq!(block_on(stream.send(whole(&payload))).unwrap().unwrap(), 5);
 	peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 	let mut got = [0u8; 5];
 	peer.read_exact(&mut got).unwrap();
 	assert_eq!(&got, b"hello");
 
 	peer.write_all(b"world").unwrap();
-	let received: Buffer = Buffer::zeroed(5);
-	assert_eq!(
-		executor
-			.block_on(stream.recv(span(&received)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
-	assert_eq!(received.whole().to_vec(), b"world");
+	let mut received: Buffer = Buffer::zeroed(5);
+	assert_eq!(block_on(stream.recv(whole(&received))).unwrap().unwrap(), 5);
+	assert_eq!(received.get_mut().unwrap().to_vec(), b"world");
 }
 
 /// A unix socket's path is an address the connect takes as it is, and the
@@ -379,37 +318,22 @@ fn a_unix_connect_gives_a_live_stream() {
 
 	let directory = common::tempdir("completion-connect-unix").unwrap();
 	let (listener, path) = listener(directory.path());
-	let mut executor = executor();
-	let connecting = Stream::connect(path.as_path());
-	let stream = executor
-		.block_on(connecting)
-		.unwrap()
-		.expect("the connect failed");
+	common::init_logging();
+	let connecting = StreamSocket::connect(path.as_path());
+	let stream = block_on(connecting).unwrap().expect("the connect failed");
 	let (mut peer, _) = listener.accept().unwrap();
 
-	let payload: Buffer = Buffer::from(b"hello");
-	assert_eq!(
-		executor
-			.block_on(stream.send(span(&payload)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
+	let payload: Buffer = Buffer::copy_from(b"hello");
+	assert_eq!(block_on(stream.send(whole(&payload))).unwrap().unwrap(), 5);
 	peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 	let mut got = [0u8; 5];
 	peer.read_exact(&mut got).unwrap();
 	assert_eq!(&got, b"hello");
 
 	peer.write_all(b"world").unwrap();
-	let received: Buffer = Buffer::zeroed(5);
-	assert_eq!(
-		executor
-			.block_on(stream.recv(span(&received)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
-	assert_eq!(received.whole().to_vec(), b"world");
+	let mut received: Buffer = Buffer::zeroed(5);
+	assert_eq!(block_on(stream.recv(whole(&received))).unwrap().unwrap(), 5);
+	assert_eq!(received.get_mut().unwrap().to_vec(), b"world");
 }
 
 /// The portable backend connects by readiness: the handshake it left in flight
@@ -425,27 +349,25 @@ fn recv_with_fds_hands_the_descriptors_back() {
 	std::fs::write(&path, b"hello").unwrap();
 
 	let (left, right) = UnixStream::pair().unwrap();
-	let mut executor = executor();
-	let sender: Stream = Stream::new(left);
-	let receiver: Stream = Stream::new(right);
+	common::init_logging();
+	let sender: StreamSocket = StreamSocket::new(left);
+	let receiver: StreamSocket = StreamSocket::new(right);
 
 	let file = std::fs::File::open(&path).unwrap();
-	let payload: Buffer = Buffer::from(b"hello");
-	let sent = executor
-		.block_on(sender.send_all_with_fds(span(&payload), vec![file.into()]))
+	let payload: Buffer = Buffer::copy_from(b"hello");
+	let sent = block_on(sender.send_all_with_fds(whole(&payload), vec![file.into()]))
 		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(sent, 5, "the send moved a different count");
 
-	let buffer: Buffer = Buffer::zeroed(5);
-	let received = executor
-		.block_on(receiver.recv_exact_with_fds(span(&buffer)))
+	let mut buffer: Buffer = Buffer::zeroed(5);
+	let received = block_on(receiver.recv_exact_with_fds(whole(&buffer)))
 		.unwrap()
 		.into_result()
 		.expect("the receive failed");
 	assert_eq!(received.bytes, 5);
-	assert_eq!(buffer.whole().to_vec(), b"hello");
+	assert_eq!(buffer.get_mut().unwrap().to_vec(), b"hello");
 	assert_eq!(received.fds.len(), 1, "the descriptor did not come across");
 	let sent = std::fs::File::from(received.fds.into_iter().next().unwrap());
 	assert_eq!(sent.metadata().unwrap().len(), 5);
@@ -474,7 +396,7 @@ fn take_error_takes_a_pending_error_off_the_socket() {
 	// comes back to the connected socket that sent it.
 	sender.send(b"x").unwrap();
 
-	let socket: Socket = Socket::new(sender);
+	let socket: DatagramSocket = DatagramSocket::new(sender);
 
 	let deadline = Instant::now() + Duration::from_secs(5);
 	let pending = loop {
@@ -507,8 +429,8 @@ fn a_shutdown_write_half_closes_the_connection() {
 	use std::net::Shutdown;
 
 	let (client, mut server) = pair();
-	let mut executor = executor();
-	let socket: Stream = Stream::new(client);
+	common::init_logging();
+	let socket: StreamSocket = StreamSocket::new(client);
 
 	socket.shutdown(Shutdown::Write).unwrap();
 
@@ -525,20 +447,13 @@ fn a_shutdown_write_half_closes_the_connection() {
 
 	// The receive side is open still: the peer's bytes arrive.
 	server.write_all(b"world").unwrap();
-	let buffer: Buffer = Buffer::zeroed(5);
-	assert_eq!(
-		executor
-			.block_on(socket.recv(span(&buffer)))
-			.unwrap()
-			.unwrap(),
-		5
-	);
-	assert_eq!(buffer.whole().to_vec(), b"world");
+	let mut buffer: Buffer = Buffer::zeroed(5);
+	assert_eq!(block_on(socket.recv(whole(&buffer))).unwrap().unwrap(), 5);
+	assert_eq!(buffer.get_mut().unwrap().to_vec(), b"world");
 }
 
-/// A cancel covers the whole `recv_exact` loop: a cancel that lands after the
-/// first call has moved bytes, but before the memory is full, ends the loop
-/// there — the bytes it took are its progress, and the cancel is why it stopped.
+/// A `send_all` loop interrupted by an I/O error reports the bytes it already
+/// transferred before the error occurred.
 #[test]
 #[cfg(unix)]
 fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
@@ -546,12 +461,12 @@ fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 	// payload are filled, the rest is left waiting, and the connection goes
 	// down with the peer.
 	let (client, server) = held_pair(64 << 10);
-	let mut executor = executor();
-	let socket: Stream = Stream::new(client);
+	common::init_logging();
+	let socket: StreamSocket = StreamSocket::new(client);
 
 	let len = 8 << 20;
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Buffer = Buffer::from(bytes.as_slice());
+	let payload: Buffer = Buffer::copy_from(&bytes);
 	let gone = std::thread::spawn(move || {
 		std::thread::sleep(Duration::from_millis(100));
 		drop(server);
@@ -559,7 +474,7 @@ fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 
 	// The peer goes away, and the reset reaches the send: what it had taken off
 	// the memory is still the progress it reports.
-	let outcome = executor.block_on(socket.send_all(span(&payload))).unwrap();
+	let outcome = block_on(socket.send_all(whole(&payload))).unwrap();
 	gone.join().unwrap();
 	assert!(outcome.value > 0, "the failed send dropped its progress");
 	assert!(
@@ -581,21 +496,21 @@ fn a_shutdown_read_ends_a_receive_in_flight() {
 	use std::net::Shutdown;
 
 	let (client, _server) = pair();
-	let mut executor = executor();
-	let socket: Stream = Stream::new(client);
+	common::init_logging();
+	let socket: StreamSocket = StreamSocket::new(client);
 
 	let buffer: Buffer = Buffer::zeroed(16);
 	// The peer sends nothing, so the receive sits with the kernel and only a
 	// shutdown can end it.
 	let shutdown = socket.clone();
 	let timeout = timeout(Duration::from_millis(50));
-	let task = executor.spawn(async move {
+	let task = spawn(async move {
 		timeout.await.unwrap();
 		shutdown.shutdown(Shutdown::Read).unwrap();
 	});
 
-	let received = executor.block_on(socket.recv(span(&buffer))).unwrap();
-	executor.block_on(task).unwrap();
+	let received = block_on(socket.recv(whole(&buffer))).unwrap();
+	block_on(task).unwrap();
 	assert_eq!(
 		received.expect("the receive ended with an error"),
 		0,
@@ -617,23 +532,23 @@ fn a_shutdown_write_ends_a_send_in_flight() {
 	use std::net::Shutdown;
 
 	let (client, _server) = held_pair(64 << 10);
-	let mut executor = executor();
-	let socket: Stream = Stream::new(client);
+	common::init_logging();
+	let socket: StreamSocket = StreamSocket::new(client);
 
 	let len = 8 << 20;
 	let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
-	let payload: Buffer = Buffer::from(bytes.as_slice());
+	let payload: Buffer = Buffer::copy_from(&bytes);
 	// Buffers held to a slice of the payload with the peer not reading: the
 	// send is still pending when the write side goes.
 	let shutdown = socket.clone();
 	let timeout = timeout(Duration::from_millis(50));
-	let task = executor.spawn(async move {
+	let task = spawn(async move {
 		timeout.await.unwrap();
 		shutdown.shutdown(Shutdown::Write).unwrap();
 	});
 
-	let outcome = executor.block_on(socket.send_all(span(&payload))).unwrap();
-	executor.block_on(task).unwrap();
+	let outcome = block_on(socket.send_all(whole(&payload))).unwrap();
+	block_on(task).unwrap();
 	assert!(
 		outcome.value > 0,
 		"the shut-down send threw away the bytes it had put out"
@@ -651,17 +566,16 @@ fn a_take_without_waiting_reports_a_receive_in_flight() {
 	use std::io::Write;
 
 	let (client, mut server) = pair();
-	let mut executor = executor();
-	let socket: Stream = Stream::new(client);
+	common::init_logging();
+	let socket: StreamSocket = StreamSocket::new(client);
 
-	let buffer: Buffer = Buffer::zeroed(5);
-	let mut receive = Box::pin(socket.clone().recv(span(&buffer)));
-	executor
-		.block_on(std::future::poll_fn(|cx| {
-			assert!(receive.as_mut().poll(cx).is_pending());
-			std::task::Poll::Ready(())
-		}))
-		.unwrap();
+	let mut buffer: Buffer = Buffer::zeroed(5);
+	let mut receive = Box::pin(socket.clone().recv(whole(&buffer)));
+	block_on(std::future::poll_fn(|cx| {
+		assert!(receive.as_mut().poll(cx).is_pending());
+		std::task::Poll::Ready(())
+	}))
+	.unwrap();
 
 	// `try_take` consumes the handle, so probe with a clone: the receive holds
 	// its own clone of the descriptor and the probe cannot take it out.
@@ -678,13 +592,12 @@ fn a_take_without_waiting_reports_a_receive_in_flight() {
 	});
 	{
 		let receive = &mut receive;
-		executor
-			.block_on(std::future::poll_fn(|cx| receive.as_mut().poll(cx)))
+		block_on(std::future::poll_fn(|cx| receive.as_mut().poll(cx)))
 			.unwrap()
 			.unwrap();
 	}
 	writer.join().unwrap();
-	assert_eq!(buffer.whole().to_vec(), b"hello");
+	assert_eq!(buffer.get_mut().unwrap().to_vec(), b"hello");
 
 	// The settled receive, once dropped, names the socket no longer.
 	drop(receive);
@@ -703,13 +616,12 @@ fn a_dropped_accept_result_closes_the_connection() {
 
 	let directory = common::tempdir("completion-accept-dropped").unwrap();
 	let (listener, path) = listener(directory.path());
-	let mut executor = executor();
+	common::init_logging();
 	let listener: Listener = Listener::new(listener);
 
-	let accepted = executor.spawn(listener.accept());
+	let accepted = spawn(listener.accept());
 	let mut client = UnixStream::connect(&path).unwrap();
-	executor
-		.block_on(timeout(Duration::from_millis(100)))
+	block_on(timeout(Duration::from_millis(100)))
 		.unwrap()
 		.unwrap();
 	drop(accepted);
@@ -733,33 +645,31 @@ fn a_dropped_in_flight_recv_is_cancelled_and_never_written() {
 	use std::io::Write;
 
 	let (mut client, server) = pair();
-	let mut executor = executor();
-	let stream: Stream = Stream::new(server);
-	let buf = Buffer::zeroed(8);
-	let recv_span = span(&buf);
+	common::init_logging();
+	let stream: StreamSocket = StreamSocket::new(server);
+	let mut buf = Buffer::zeroed(8);
+	let recv_view = whole(&buf);
 
 	// One poll submits the receive; dropping it then leaves it in flight.
-	executor
-		.block_on(async {
-			let mut recv = std::pin::pin!(stream.recv(recv_span));
-			std::future::poll_fn(|cx| {
-				let _ = recv.as_mut().poll(cx);
-				std::task::Poll::Ready(())
-			})
-			.await;
+	block_on(async {
+		let mut recv = std::pin::pin!(stream.recv(recv_view));
+		std::future::poll_fn(|cx| {
+			let _ = recv.as_mut().poll(cx);
+			std::task::Poll::Ready(())
 		})
-		.unwrap();
-	executor
-		.block_on(timeout(Duration::from_millis(50)))
+		.await;
+	})
+	.unwrap();
+	block_on(timeout(Duration::from_millis(50)))
 		.unwrap()
 		.unwrap();
-	let _held =
-		Stream::new(Stream::try_take(stream).expect("the dropped receive still holds the stream"));
+	let _held = StreamSocket::new(
+		StreamSocket::try_take(stream).expect("the dropped receive still holds the stream"),
+	);
 
 	client.write_all(b"later").unwrap();
-	executor
-		.block_on(timeout(Duration::from_millis(50)))
+	block_on(timeout(Duration::from_millis(50)))
 		.unwrap()
 		.unwrap();
-	assert_eq!(buf.whole().to_vec(), [0u8; 8]);
+	assert_eq!(buf.get_mut().unwrap().to_vec(), [0u8; 8]);
 }

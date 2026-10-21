@@ -1,14 +1,13 @@
-//! The executor and the scopes it runs under: which wakes reach a thread parked
-//! in `block_on`, which tasks a pass over the loop runs, and how cancellation
-//! reaches the operations and tasks of a scope.
+//! The executor: which wakes reach a thread parked in `block_on`, and which
+//! tasks a pass over the loop runs.
 //!
 //! A wake on the driver thread itself is seen by the poll that follows it
 //! whatever the reactor does, so the off-thread tests drive their executor on a
 //! thread of its own: only a wake raised from another thread can show whether
 //! it reached the wait the driver is parked in.
 //!
-//! The free functions — `block_on`, `spawn`, `scope` — run on the thread's
-//! default executor, which each test thread gets fresh.
+//! The free functions — `block_on`, `spawn` — run on the thread's default
+//! executor, which each test thread gets fresh.
 //!
 //! What a drop does — cancel the operation and detach it, without waiting for
 //! the backend to let go of the caller's memory — is a reactor concern the
@@ -26,12 +25,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use completion_async::{Buffer, Config, Executor, File, Stream, block_on, spawn, timeout};
-
-fn executor() -> Executor {
-	common::init_logging();
-	Executor::new(Config::default()).unwrap()
-}
+use completion_async::{Buffer, File, StreamSocket, block_on, spawn, timeout};
 
 /// A future that hands its waker to another thread on the first poll and
 /// stays pending until that thread raises `woken` and wakes it.
@@ -55,8 +49,8 @@ fn driver_on_another_thread(woken: Arc<AtomicBool>) -> (Receiver<Waker>, Receive
 	let (handoff, handed) = std::sync::mpsc::channel();
 	let (done, finished) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
-		let mut executor = executor();
-		executor.block_on(handed_over(woken, handoff)).unwrap();
+		common::init_logging();
+		block_on(handed_over(woken, handoff)).unwrap();
 		let _ = done.send(());
 	});
 	(handed, finished)
@@ -87,11 +81,11 @@ fn a_task_woken_from_another_thread_ends_block_on() {
 	let (done, finished) = std::sync::mpsc::channel();
 	let flag = Arc::clone(&woken);
 	std::thread::spawn(move || {
-		let mut executor = executor();
+		common::init_logging();
 		// What is awaited this time is a task, whose waker is the executor's
 		// own: the task is made ready, and the reactor nothing.
-		let task = executor.spawn(handed_over(flag, handoff));
-		executor.block_on(task).unwrap();
+		let task = spawn(handed_over(flag, handoff));
+		block_on(task).unwrap();
 		let _ = done.send(());
 	});
 	let deadline = Duration::from_secs(10);
@@ -124,8 +118,8 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 		let directory = common::tempdir("completion-busy").unwrap();
 		let path = directory.path().join("data");
 		std::fs::write(&path, b"hello").unwrap();
-		let mut executor = executor();
-		let _busy = executor.spawn(std::future::poll_fn(move |cx| {
+		common::init_logging();
+		let _busy = spawn(std::future::poll_fn(move |cx| {
 			if flag.load(Ordering::Acquire) {
 				Poll::Ready(())
 			} else {
@@ -134,16 +128,15 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 			}
 		}));
 		let file = File::new(common::open(&path).unwrap());
-		let buffer = Buffer::zeroed(5);
-		let payload = buffer.whole();
+		let mut buffer = Buffer::zeroed(5);
+		let payload = buffer.clone();
 		let timeout = timeout(Duration::from_millis(1));
-		executor
-			.block_on(async {
-				assert_eq!(file.read_at(payload, 0).await.unwrap(), 5);
-				timeout.await.unwrap();
-			})
-			.unwrap();
-		assert_eq!(buffer.whole().to_vec(), b"hello");
+		block_on(async {
+			assert_eq!(file.read_at(payload, 0).await.unwrap(), 5);
+			timeout.await.unwrap();
+		})
+		.unwrap();
+		assert_eq!(buffer.get_mut().unwrap().to_vec(), b"hello");
 		let _ = done.send(());
 	});
 	let completed = finished.recv_timeout(Duration::from_secs(3));
@@ -152,12 +145,12 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 	completed.expect("a self-waking task starved real I/O or the timer");
 }
 
-fn socket_pair() -> (std::net::TcpStream, completion_async::Stream) {
+fn socket_pair() -> (std::net::TcpStream, completion_async::StreamSocket) {
 	let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
 	let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let (stream, _) = listener.accept().unwrap();
 	stream.set_nonblocking(true).unwrap();
-	(peer, completion_async::Stream::new(stream))
+	(peer, completion_async::StreamSocket::new(stream))
 }
 
 /// The deadline is fixed when the timer is constructed, not when it is first
@@ -165,11 +158,11 @@ fn socket_pair() -> (std::net::TcpStream, completion_async::Stream) {
 /// first poll finds it fired rather than starting the wait then.
 #[test]
 fn a_timeout_held_past_its_duration_fires_on_its_first_poll() {
-	let mut executor = executor();
+	common::init_logging();
 	let timeout = timeout(Duration::from_millis(5));
 	std::thread::sleep(Duration::from_millis(30));
 	let started = std::time::Instant::now();
-	executor.block_on(timeout).unwrap().unwrap();
+	block_on(timeout).unwrap().unwrap();
 	assert!(
 		started.elapsed() < Duration::from_millis(5),
 		"the wait restarted at the first poll instead of holding the deadline"
@@ -178,18 +171,17 @@ fn a_timeout_held_past_its_duration_fires_on_its_first_poll() {
 
 #[test]
 fn dropping_a_join_handle_detaches_the_task() {
-	let mut executor = executor();
+	common::init_logging();
 	let ran = Arc::new(AtomicBool::new(false));
 	let flag = Arc::clone(&ran);
-	let handle = executor.spawn(async move {
+	let handle = spawn(async move {
 		timeout(Duration::from_millis(5)).await.unwrap();
 		flag.store(true, Ordering::Release);
 	});
 	drop(handle);
 	// Longer than the task's own timer, so a task left running has the time to
 	// reach the end of its body.
-	executor
-		.block_on(timeout(Duration::from_millis(30)))
+	block_on(timeout(Duration::from_millis(30)))
 		.unwrap()
 		.unwrap();
 	assert!(
@@ -203,10 +195,10 @@ fn a_task_can_drop_its_own_join_handle_while_finishing() {
 	use std::cell::{Cell, RefCell};
 	use std::rc::Rc;
 
-	let mut executor = executor();
+	common::init_logging();
 	let (_peer, socket) = socket_pair();
 	let (buffer, live) = common::tracked(8);
-	let payload = buffer.whole();
+	let payload = buffer.clone();
 	drop(buffer);
 	let mut receive = Box::pin(socket.recv(payload));
 	let handle = Rc::new(RefCell::new(None::<completion_async::JoinHandle<()>>));
@@ -215,7 +207,7 @@ fn a_task_can_drop_its_own_join_handle_while_finishing() {
 	let own_handle = Rc::clone(&handle);
 	let flag = Rc::clone(&finish);
 	let task_wake = Rc::clone(&wake);
-	*handle.borrow_mut() = Some(executor.spawn(std::future::poll_fn(move |cx| {
+	*handle.borrow_mut() = Some(spawn(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			drop(own_handle.borrow_mut().take());
 			return Poll::Ready(());
@@ -224,17 +216,15 @@ fn a_task_can_drop_its_own_join_handle_while_finishing() {
 		assert!(receive.as_mut().poll(cx).is_pending());
 		Poll::Pending
 	})));
-	executor
-		.block_on(timeout(Duration::from_millis(1)))
+	block_on(timeout(Duration::from_millis(1)))
 		.unwrap()
 		.unwrap();
 	finish.set(true);
 	wake.borrow().as_ref().unwrap().wake_by_ref();
 	// The task's own end drops its in-flight receive, which the reactor reaps on
 	// a later pass.
-	executor.block_on(async {}).unwrap();
-	executor
-		.block_on(timeout(Duration::from_millis(10)))
+	block_on(async {}).unwrap();
+	block_on(timeout(Duration::from_millis(10)))
 		.unwrap()
 		.unwrap();
 	assert!(!live.alive(), "the finished task kept its I/O buffer");
@@ -245,16 +235,16 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	use std::cell::Cell;
 	use std::rc::Rc;
 
-	let mut executor = executor();
+	common::init_logging();
 	let (_peer, socket) = socket_pair();
 	let (buffer, live) = common::tracked(8);
-	let payload = buffer.whole();
+	let payload = buffer.clone();
 	drop(buffer);
 	let mut receive = Box::pin(socket.recv(payload));
 	let panic_next = Rc::new(Cell::new(false));
 	let flag = Rc::clone(&panic_next);
 	let (handoff, handed) = std::sync::mpsc::channel();
-	let mut task = executor.spawn(std::future::poll_fn(move |cx| {
+	let mut task = spawn(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			panic!("task failed while waiting for I/O");
 		}
@@ -262,14 +252,12 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		assert!(receive.as_mut().poll(cx).is_pending());
 		Poll::Pending::<()>
 	}));
-	executor
-		.block_on(timeout(Duration::from_millis(1)))
+	block_on(timeout(Duration::from_millis(1)))
 		.unwrap()
 		.unwrap();
 	panic_next.set(true);
 	handed.try_recv().unwrap().wake();
-	let caught =
-		std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.block_on(async {})));
+	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block_on(async {})));
 	let panic = caught.expect_err("a task panic must leave block_on");
 	assert_eq!(
 		panic.downcast_ref::<&str>(),
@@ -277,8 +265,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	);
 	// Unwinding dropped the job and released its I/O as a detached cancel; a
 	// pass over the reactor reaps that cancel.
-	executor
-		.block_on(timeout(Duration::from_millis(10)))
+	block_on(timeout(Duration::from_millis(10)))
 		.unwrap()
 		.unwrap();
 	assert!(!live.alive(), "unwinding kept the I/O buffer");
@@ -286,8 +273,8 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		std::pin::Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()))
 	}));
 	assert!(gone.is_err(), "joining a failed task parked forever");
-	let next = executor.spawn(async { Rc::new(42) });
-	assert_eq!(*executor.block_on(next).unwrap(), 42);
+	let next = spawn(async { Rc::new(42) });
+	assert_eq!(*block_on(next).unwrap(), 42);
 }
 
 /// A root future that is ready on its first poll returns there and then. A task
@@ -300,24 +287,23 @@ fn block_on_polls_the_root_future_before_a_task_queued_before_it() {
 	use std::cell::Cell;
 	use std::rc::Rc;
 
-	let mut executor = executor();
+	common::init_logging();
 	let ran = Arc::new(AtomicBool::new(false));
 	let flag = Arc::clone(&ran);
 	let polled = Arc::clone(&ran);
-	let task = executor.spawn(async move { flag.store(true, Ordering::Release) });
+	let task = spawn(async move { flag.store(true, Ordering::Release) });
 	let seen_unpolled = Rc::new(Cell::new(false));
 	let observed = Rc::clone(&seen_unpolled);
 	let mut first = true;
 	let mut task = std::pin::pin!(task);
-	executor
-		.block_on(std::future::poll_fn(move |cx| {
-			if first {
-				first = false;
-				observed.set(!polled.load(Ordering::Acquire));
-			}
-			task.as_mut().poll(cx)
-		}))
-		.unwrap();
+	block_on(std::future::poll_fn(move |cx| {
+		if first {
+			first = false;
+			observed.set(!polled.load(Ordering::Acquire));
+		}
+		task.as_mut().poll(cx)
+	}))
+	.unwrap();
 	assert!(
 		seen_unpolled.get(),
 		"a task queued before block_on ran before the root future was first polled"
@@ -328,10 +314,9 @@ fn block_on_polls_the_root_future_before_a_task_queued_before_it() {
 /// A timeout fires once its deadline has passed, not before.
 #[test]
 fn a_timeout_fires_at_its_deadline() {
-	let mut executor = executor();
+	common::init_logging();
 	let started = Instant::now();
-	executor
-		.block_on(timeout(Duration::from_millis(50)))
+	block_on(timeout(Duration::from_millis(50)))
 		.unwrap()
 		.unwrap();
 	let elapsed = started.elapsed();
@@ -377,9 +362,9 @@ fn a_handle_made_inside_block_on_submits_to_the_global_executor() {
 	let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let (mut server, _) = listener.accept().unwrap();
 
-	let payload = Buffer::from(b"hello").whole();
+	let payload = Buffer::copy_from(b"hello");
 	let sent = block_on(async move {
-		let socket: Stream = Stream::new(client);
+		let socket: StreamSocket = StreamSocket::new(client);
 		socket.send_all(payload).await
 	})
 	.unwrap();
@@ -390,7 +375,7 @@ fn a_handle_made_inside_block_on_submits_to_the_global_executor() {
 	assert_eq!(&got, b"hello");
 }
 
-/// `Stream::connect` reaches the thread's default executor on its own: the
+/// `StreamSocket::connect` reaches the thread's default executor on its own: the
 /// connection is made there, and the stream it hands back runs on the same one.
 #[test]
 fn a_connect_made_inside_block_on_uses_the_global_executor() {
@@ -398,9 +383,11 @@ fn a_connect_made_inside_block_on_uses_the_global_executor() {
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 	let addr = listener.local_addr().unwrap();
 
-	let payload = Buffer::from(b"hello").whole();
+	let payload = Buffer::copy_from(b"hello");
 	let sent = block_on(async move {
-		let stream = Stream::connect(addr).await.expect("the connect failed");
+		let stream = StreamSocket::connect(addr)
+			.await
+			.expect("the connect failed");
 		stream.send_all(payload).await
 	})
 	.unwrap();

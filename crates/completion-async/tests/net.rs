@@ -336,43 +336,6 @@ fn a_unix_connect_gives_a_live_stream() {
 	assert_eq!(received.get_mut().unwrap().to_vec(), b"world");
 }
 
-/// The portable backend connects by readiness: the handshake it left in flight
-/// is answered by the socket turning writable, and the stream it hands back is
-/// live both ways.
-#[test]
-#[cfg(unix)]
-fn recv_with_fds_hands_the_descriptors_back() {
-	use std::os::unix::net::UnixStream;
-
-	let directory = common::tempdir("completion-fds").unwrap();
-	let path = directory.path().join("payload");
-	std::fs::write(&path, b"hello").unwrap();
-
-	let (left, right) = UnixStream::pair().unwrap();
-	common::init_logging();
-	let sender: StreamSocket = StreamSocket::new(left);
-	let receiver: StreamSocket = StreamSocket::new(right);
-
-	let file = std::fs::File::open(&path).unwrap();
-	let payload: Buffer = Buffer::copy_from(b"hello");
-	let sent = block_on(sender.send_all_with_fds(whole(&payload), vec![file.into()]))
-		.unwrap()
-		.into_result()
-		.unwrap();
-	assert_eq!(sent, 5, "the send moved a different count");
-
-	let mut buffer: Buffer = Buffer::zeroed(5);
-	let received = block_on(receiver.recv_exact_with_fds(whole(&buffer)))
-		.unwrap()
-		.into_result()
-		.expect("the receive failed");
-	assert_eq!(received.bytes, 5);
-	assert_eq!(buffer.get_mut().unwrap().to_vec(), b"hello");
-	assert_eq!(received.fds.len(), 1, "the descriptor did not come across");
-	let sent = std::fs::File::from(received.fds.into_iter().next().unwrap());
-	assert_eq!(sent.metadata().unwrap().len(), 5);
-}
-
 /// `take_error` hands over the socket's pending error and clears it: a refused
 /// datagram shows up once, and the second call reports a clean socket.
 ///
@@ -654,7 +617,7 @@ fn a_dropped_in_flight_recv_is_cancelled_and_never_written() {
 	block_on(async {
 		let mut recv = std::pin::pin!(stream.recv(recv_view));
 		std::future::poll_fn(|cx| {
-			let _ = recv.as_mut().poll(cx);
+			drop(recv.as_mut().poll(cx));
 			std::task::Poll::Ready(())
 		})
 		.await;

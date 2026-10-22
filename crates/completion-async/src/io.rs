@@ -7,7 +7,7 @@ use std::sync::Arc;
 use completion_backend::{AsDescriptor, Error, IoVec, Op, Response};
 
 use crate::Result;
-use crate::executor::{Handle, submit};
+use crate::executor::submit;
 use crate::memory::AsIoVec;
 
 /// Result of a multi-step transfer, preserving partial progress (`value`)
@@ -15,7 +15,7 @@ use crate::memory::AsIoVec;
 #[derive(Debug)]
 pub struct Outcome<T> {
 	/// Progress accumulated before the operation finished, failed, or was cancelled
-	/// (e.g. number of bytes transferred or [`Received`](crate::Received)).
+	/// (e.g. number of bytes transferred).
 	pub value: T,
 	/// `Ok(())` if the operation completed in full, or `Err` if it stopped early.
 	pub result: Result<()>,
@@ -35,7 +35,7 @@ impl<T> Outcome<T> {
 
 /// Submits the single transfer `op` builds over `buffer`'s range.
 pub(crate) async fn transfer<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
+	fd: Arc<D>,
 	buffer: M,
 	op: impl FnOnce(IoVec) -> Op + Send,
 ) -> Result<usize> {
@@ -47,7 +47,7 @@ pub(crate) async fn transfer<D: AsDescriptor + 'static, M: AsIoVec>(
 /// Like [`transfer`], but hands the buffer back so a loop can file its memory
 /// with the next round.
 async fn transfer_in<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
+	fd: Arc<D>,
 	buffer: M,
 	op: impl FnOnce(IoVec) -> Op + Send,
 ) -> Result<(usize, M)> {
@@ -60,7 +60,7 @@ async fn transfer_in<D: AsDescriptor + 'static, M: AsIoVec>(
 }
 
 async fn repeat<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
+	fd: Arc<D>,
 	buffer: M,
 	short: fn() -> io::Error,
 	mut make_op: impl FnMut(usize, IoVec) -> Op + Send,
@@ -93,7 +93,7 @@ async fn repeat<D: AsDescriptor + 'static, M: AsIoVec>(
 }
 
 pub(crate) async fn fill<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
+	fd: Arc<D>,
 	buffer: M,
 	op: impl FnMut(usize, IoVec) -> Op + Send,
 ) -> Outcome<usize> {
@@ -112,7 +112,7 @@ pub(crate) async fn fill<D: AsDescriptor + 'static, M: AsIoVec>(
 }
 
 pub(crate) async fn drain<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
+	fd: Arc<D>,
 	buffer: M,
 	op: impl FnMut(usize, IoVec) -> Op + Send,
 ) -> Outcome<usize> {
@@ -132,7 +132,7 @@ pub(crate) async fn drain<D: AsDescriptor + 'static, M: AsIoVec>(
 /// IOCP requires before a [`std::fs::File`] can be handed to [`File`]; the
 /// portable backend takes either mode.
 pub struct OpenOptions {
-	inner: std::fs::OpenOptions,
+	inner: fs::OpenOptions,
 	direct: bool,
 }
 
@@ -146,7 +146,7 @@ impl OpenOptions {
 	/// Creates a blank set of options.
 	pub fn new() -> OpenOptions {
 		OpenOptions {
-			inner: std::fs::OpenOptions::new(),
+			inner: fs::OpenOptions::new(),
 			direct: false,
 		}
 	}
@@ -246,7 +246,7 @@ impl OpenOptions {
 /// Every transfer takes an explicit byte offset and leaves the OS file cursor
 /// unchanged, so cloned handles can run concurrent transfers on the same file.
 #[derive(Clone)]
-pub struct File(Arc<Handle<fs::File>>);
+pub struct File(Arc<fs::File>);
 
 impl File {
 	/// Wraps `file`.
@@ -255,13 +255,13 @@ impl File {
 	/// `FILE_FLAG_OVERLAPPED` (see [`OpenOptions`]).
 	#[fastrace::trace]
 	pub fn new(file: impl Into<fs::File>) -> File {
-		File(Arc::new(Handle::new(file.into())))
+		File(Arc::new(file.into()))
 	}
 
 	/// Unwraps the underlying [`std::fs::File`] if no clones of this handle and
 	/// no in-flight operations remain.
 	pub fn try_take(self) -> Option<fs::File> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Performs a single read into `buf` at byte offset `offset`.

@@ -1,9 +1,8 @@
 //! Async I/O runtime built on OS completion backends (`io_uring`, IOCP, and
 //! `polling`).
 //!
-//! Run futures on the current thread's runtime with [`block_on`]. [`spawn`]
-//! runs a `Send` task on the work-stealing pool, and [`spawn_local`] pins a
-//! task to the current thread. The runtime is created with [`Config::default`] on first use, or
+//! Run futures on the current thread's runtime with [`block_on`] and
+//! [`spawn`]. The runtime is created with [`Config::default`] on first use, or
 //! from a custom [`Config`] by calling [`init`] first.
 //!
 //! A resource is wrapped in the handle whose operations it takes:
@@ -11,11 +10,11 @@
 //! | Resource | Operations |
 //! |---|---|
 //! | [`File`] | `read_at`, `read_exact_at`, `write_at`, `write_all_at`, `sync`, `flush`, `allocate`, `punch` |
-//! | [`Stream`] (pipes, PTYs, TAPs) | `read`, `read_exact`, `write`, `write_all` |
-//! | [`StreamSocket`] (stream sockets) | `recv`, `recv_exact`, `send`, `send_all`, the `_with_fds` forms, `shutdown`, `take_error`, `hangup` |
-//! | [`DatagramSocket`] (datagram sockets) | `recv`, `recv_with_fds`, `send`, `send_with_fds`, `take_error` |
+//! | [`Stream`] (pipes and byte streams) | `pipe`, `read`, `read_exact`, `write`, `write_all` |
+//! | [`StreamSocket`] (stream sockets) | `recv`, `recv_exact`, `send`, `send_all`, `shutdown`, `take_error`, `hangup` |
+//! | [`DatagramSocket`] (datagram sockets) | `recv`, `send`, `take_error` |
 //! | [`Listener`] (listening sockets) | `accept` |
-//! | [`Readiness`] (eventfd, pidfd, signalfd) | `readable`, `writable` |
+//! | [`Readiness`] (readiness descriptors and waitable handles) | `readable`, `writable` |
 //!
 //! A single call may transfer fewer bytes than requested and returns the byte
 //! count; `_exact` and `_all` repeat until the [`AsIoVec`] is full and return an
@@ -49,8 +48,8 @@ pub use completion_backend::{
 	AsDescriptor, BackendKind, BorrowedDescriptor, Config, Error, ErrorKind, IoVec,
 	OwnedDescriptor, OwnedSocket, Result,
 };
-pub use executor::{JoinHandle, block_on, init, spawn, spawn_local, timeout};
+pub use executor::{JoinHandle, block_on, init, spawn, timeout};
 pub use io::{File, OpenOptions, Outcome};
 pub use memory::{AsIoVec, Buffer};
-pub use net::{DatagramSocket, Listener, Received, Stream, StreamSocket, ToSockAddr};
+pub use net::{DatagramSocket, Listener, Stream, StreamSocket, ToSockAddr};
 pub use readiness::Readiness;

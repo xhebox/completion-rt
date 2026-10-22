@@ -55,7 +55,7 @@ macro_rules! from_handle {
 	};
 }
 
-from_handle!(std::fs::File, std::io::PipeReader, std::io::PipeWriter);
+from_handle!(std::fs::File, io::PipeReader, io::PipeWriter);
 
 macro_rules! from_socket {
 	($($socket:ty),* $(,)?) => {
@@ -98,11 +98,11 @@ as_descriptor!(
 	OwnedHandle,
 	BorrowedHandle<'_>,
 	std::fs::File,
-	std::io::Stdin,
-	std::io::Stdout,
-	std::io::Stderr,
-	std::io::PipeReader,
-	std::io::PipeWriter,
+	io::Stdin,
+	io::Stdout,
+	io::Stderr,
+	io::PipeReader,
+	io::PipeWriter,
 );
 
 macro_rules! as_descriptor_socket {
@@ -122,7 +122,7 @@ as_descriptor_socket!(
 	std::net::TcpListener,
 	std::net::UdpSocket,
 	std::os::windows::io::OwnedSocket,
-	std::os::windows::io::BorrowedSocket<'_>,
+	BorrowedSocket<'_>,
 );
 
 impl AsDescriptor for OwnedDescriptor {

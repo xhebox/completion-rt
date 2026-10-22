@@ -21,7 +21,7 @@ strum = { version = "0.28", features = ["derive"] }
 io-uring = "0.7"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Threading"] }
 
 # The portable backend: readiness from `polling` (epoll, kqueue, event ports,
 # IOCP) and file I/O on `blocking`'s thread pool, on every target. Its socket

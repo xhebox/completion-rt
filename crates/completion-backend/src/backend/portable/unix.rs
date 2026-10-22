@@ -4,17 +4,14 @@
 //! calls and the space reservations only a unix makes.
 
 use std::io;
-use std::mem::{MaybeUninit, size_of};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
-use super::{
-	IoVec, Kind, MAX_TRANSFER, Progress, SyncFlush, Transfer, blockable, counted, one_buffer,
-};
+use polling::{Event as Ready, PollMode, Poller};
+use socket2::SockRef;
+
+use super::{IoVec, Kind, MAX_TRANSFER, Progress, SyncFlush, Transfer, counted};
 use crate::backend::Response;
-use crate::desc::{BorrowedDescriptor, OwnedDescriptor};
-
-/// The most descriptors one control message carries.
-const MAX_FDS: usize = 8;
+use crate::desc::BorrowedDescriptor;
 
 /// A descriptor as the platform names one: a file descriptor.
 pub(super) type Raw = RawFd;
@@ -74,10 +71,52 @@ pub(super) fn pollable(_raw: Raw) -> io::Result<()> {
 	Ok(())
 }
 
-/// A send carrying descriptors is a control message, and `sendmsg` takes one on
-/// any descriptor.
-pub(super) fn control_message(_raw: Raw) -> io::Result<()> {
+/// A wait for readiness runs on the poller, and a descriptor here is a source
+/// it watches whether or not the wait is a transfer.
+pub(super) fn waitable(_raw: Raw) -> io::Result<()> {
 	Ok(())
+}
+
+/// Where a wait for a hangup can run.
+///
+/// `polling`'s interrupt interest is a no-op on kqueue, and its events carry no
+/// `EV_EOF`, so a peer gone cannot be told from one that half-closed there.
+pub(super) fn hangup(_raw: Raw) -> io::Result<()> {
+	#[cfg(target_vendor = "apple")]
+	{
+		Err(io::Error::new(
+			io::ErrorKind::Unsupported,
+			"this backend cannot wait for a hangup",
+		))
+	}
+	#[cfg(not(target_vendor = "apple"))]
+	{
+		Ok(())
+	}
+}
+
+/// Switches a descriptor the poller is about to watch to non-blocking: the call
+/// the report permits runs on the reactor thread, and one that blocked there
+/// would stall every other operation behind it.
+pub(super) fn prepare_watch(raw: Raw) -> io::Result<()> {
+	SockRef::from(&borrow(raw)?).set_nonblocking(true)
+}
+
+/// Registers a source the poller has not seen, level-triggered.
+pub(super) fn add(poller: &Poller, raw: Raw, interest: Ready) -> io::Result<()> {
+	// SAFETY: the reactor keeps the descriptor open and `delete`s the source
+	// from the poller before it goes.
+	unsafe { poller.add_with_mode(&borrow(raw)?, interest, PollMode::Level) }
+}
+
+/// Rearms a source the poller already holds.
+pub(super) fn modify(poller: &Poller, raw: Raw, interest: Ready) -> io::Result<()> {
+	poller.modify_with_mode(borrow(raw)?, interest, PollMode::Level)
+}
+
+/// Deregisters a source, which the reactor still holds open.
+pub(super) fn delete(poller: &Poller, raw: Raw) -> io::Result<()> {
+	poller.delete(borrow(raw)?)
 }
 
 fn regular(raw: Raw) -> bool {
@@ -281,37 +320,6 @@ fn count(result: libc::ssize_t) -> io::Result<usize> {
 	}
 }
 
-/// Receives into the one buffer `buffer` names on a socket, also collecting the
-/// descriptors the call carried in a control message.
-pub(super) fn recv_with_fds(fd: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
-	// SAFETY: the descriptor stays open for the operation's flight.
-	let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-	let (ptr, len) = one_buffer(buffer)?;
-	// The received descriptors are this call's own: nothing waits on them
-	// after the response carries them out.
-	let mut fds: Vec<OwnedDescriptor> = Vec::new();
-	let mut iov = libc::iovec {
-		iov_base: ptr.cast(),
-		iov_len: len,
-	};
-	let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
-	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-	msg.msg_iov = &mut iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = space.as_mut_ptr().cast();
-	msg.msg_controllen = space.len() as _;
-	// MSG_DONTWAIT: the caller's socket may be in blocking mode, and a call
-	// that blocked would stall the reactor thread behind it.
-	let result = count(unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) });
-	match blockable(result)? {
-		Some(moved) => {
-			take_fds(&msg, &mut fds);
-			Ok(Progress::Done(Response::CountWithFds(moved, fds)))
-		}
-		None => Ok(Progress::Blocked),
-	}
-}
-
 /// Reads into the one buffer `buffer` names, on a watched descriptor.
 ///
 /// A watched descriptor here may be a pipe, which only `read`/`write` take; a
@@ -338,77 +346,4 @@ pub(super) fn write(fd: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 	// operation lands, and the call only reads it.
 	let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
 	counted(rustix::io::write(borrow(fd)?, bytes).map_err(io::Error::from))
-}
-
-/// Sends the one buffer `buffer` names on `fd`, carrying `fds` in a control
-/// message: the descriptors are this operation's own, and the peer holds its own
-/// copies once the call takes the bytes, so they go with the call.
-pub(super) fn send_with_fds(
-	fd: Raw,
-	buffer: Option<IoVec>,
-	fds: &mut Vec<OwnedDescriptor>,
-) -> io::Result<Progress> {
-	// SAFETY: the descriptor stays open for the operation's flight.
-	let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-	if fds.len() > MAX_FDS {
-		return Err(io::Error::new(
-			io::ErrorKind::InvalidInput,
-			"too many descriptors",
-		));
-	}
-	let (ptr, len) = one_buffer(buffer)?;
-	let carried: Vec<libc::c_int> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
-	let mut iov = libc::iovec {
-		iov_base: ptr.cast(),
-		iov_len: len,
-	};
-	let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
-	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-	msg.msg_iov = &mut iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = space.as_mut_ptr().cast();
-	msg.msg_controllen =
-		unsafe { libc::CMSG_LEN((carried.len() * size_of::<libc::c_int>()) as u32) } as _;
-	unsafe {
-		let header = space.as_mut_ptr().cast::<libc::cmsghdr>();
-		(*header).cmsg_level = libc::SOL_SOCKET;
-		(*header).cmsg_type = libc::SCM_RIGHTS;
-		(*header).cmsg_len = libc::CMSG_LEN((carried.len() * size_of::<libc::c_int>()) as u32) as _;
-		let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
-		for (index, raw) in carried.iter().enumerate() {
-			*data.add(index) = *raw;
-		}
-	}
-	// MSG_DONTWAIT: the caller's socket may be in blocking mode, and a call that
-	// blocked would stall the reactor thread behind it.
-	let result = count(unsafe { libc::sendmsg(fd.as_raw_fd(), &msg, libc::MSG_DONTWAIT) });
-	match blockable(result)? {
-		Some(moved) => {
-			fds.clear();
-			Ok(Progress::Done(Response::Count(moved)))
-		}
-		None => Ok(Progress::Blocked),
-	}
-}
-
-fn take_fds(msg: &libc::msghdr, out: &mut Vec<OwnedDescriptor>) {
-	let mut header = unsafe { libc::CMSG_FIRSTHDR(msg) };
-	while !header.is_null() {
-		let (level, kind) = unsafe { ((*header).cmsg_level, (*header).cmsg_type) };
-		if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-			let count = ((unsafe { (*header).cmsg_len } as usize)
-				- (unsafe { libc::CMSG_LEN(0) }) as usize)
-				/ size_of::<libc::c_int>();
-			let data = unsafe { libc::CMSG_DATA(header) }.cast::<libc::c_int>();
-			for index in 0..count {
-				let raw = unsafe { *data.add(index) };
-				// SAFETY: the kernel put this descriptor in the process, and
-				// nothing else in it owns the number.
-				let descriptor = unsafe { OwnedDescriptor::from_raw_fd(raw) };
-				let _ = rustix::io::fcntl_setfd(&descriptor, rustix::io::FdFlags::CLOEXEC);
-				out.push(descriptor);
-			}
-		}
-		header = unsafe { libc::CMSG_NXTHDR(msg, header) };
-	}
 }

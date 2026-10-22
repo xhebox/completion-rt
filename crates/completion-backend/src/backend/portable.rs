@@ -23,7 +23,7 @@ use std::task::{Context, Poll as TaskPoll, Wake, Waker};
 use std::time::Duration;
 
 use blocking::{Task, unblock};
-use polling::{Event as Ready, Events, PollMode, Poller};
+use polling::{Event as Ready, Events, Poller};
 use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 use smallvec::SmallVec;
 use socket2::{SockAddr, SockRef};
@@ -46,6 +46,7 @@ use self::windows as sys;
 enum Direction {
 	Readable,
 	Writable,
+	Hangup,
 }
 
 const EVENTS: usize = 64;
@@ -150,6 +151,7 @@ struct Source {
 	fd: sys::Raw,
 	readers: SmallVec<[DefaultKey; 2]>,
 	writers: SmallVec<[DefaultKey; 2]>,
+	hangups: SmallVec<[DefaultKey; 2]>,
 }
 
 impl Source {
@@ -168,7 +170,7 @@ impl Source {
 
 	/// Whether no operation waits on the source any more.
 	fn idle(&self) -> bool {
-		self.readers.is_empty() && self.writers.is_empty()
+		self.readers.is_empty() && self.writers.is_empty() && self.hangups.is_empty()
 	}
 
 	/// The operations waiting in `direction`.
@@ -176,17 +178,25 @@ impl Source {
 		match direction {
 			Direction::Readable => &mut self.readers,
 			Direction::Writable => &mut self.writers,
+			Direction::Hangup => &mut self.hangups,
 		}
 	}
 
 	/// The poller interest for the source, which the poller names by `key`.
+	///
+	/// A hangup is the interrupt the poller reports for a descriptor whose peer
+	/// has gone; it rides on whatever interest the readers and writers ask for.
 	fn interest(&self, key: DefaultKey) -> Ready {
-		match (self.readers.is_empty(), self.writers.is_empty()) {
+		let mut interest = match (self.readers.is_empty(), self.writers.is_empty()) {
 			(false, false) => Ready::all(event_key(key)),
 			(false, true) => Ready::readable(event_key(key)),
 			(true, false) => Ready::writable(event_key(key)),
 			(true, true) => Ready::none(event_key(key)),
+		};
+		if !self.hangups.is_empty() {
+			interest = interest.with_interrupt();
 		}
+		interest
 	}
 }
 
@@ -247,26 +257,20 @@ impl<T> Portable<T> {
 
 	/// Registers a source the poller has not seen, level-triggered.
 	fn add(&self, fd: sys::Raw, interest: Ready) -> io::Result<()> {
-		let source = sys::borrow(fd)?;
-		// SAFETY: the reactor keeps the descriptor open and `delete`s the source
-		// from the poller before it goes.
-		unsafe {
-			self.poller
-				.add_with_mode(&source, interest, PollMode::Level)
-		}
+		let poller: &Poller = &self.poller;
+		sys::add(poller, fd, interest)
 	}
 
 	/// Rearms a source the poller already holds.
 	fn modify(&self, fd: sys::Raw, interest: Ready) -> io::Result<()> {
-		let source = sys::borrow(fd)?;
-		self.poller
-			.modify_with_mode(source, interest, PollMode::Level)
+		let poller: &Poller = &self.poller;
+		sys::modify(poller, fd, interest)
 	}
 
 	/// Deregisters a source, which the reactor still holds open.
 	fn delete(&self, fd: sys::Raw) -> io::Result<()> {
-		let source = sys::borrow(fd)?;
-		self.poller.delete(source)
+		let poller: &Poller = &self.poller;
+		sys::delete(poller, fd)
 	}
 
 	/// Rearms the poller for a source it already holds, whose key is `key`:
@@ -284,7 +288,7 @@ impl<T> Portable<T> {
 				Err(error) => {
 					// Nothing is registered for this operation, and the poller must not
 					// report the descriptor as waiting for it: the key goes back out.
-					let _ = self.unwatch(fd, direction, key);
+					drop(self.unwatch(fd, direction, key));
 					Err(error)
 				}
 			}
@@ -292,16 +296,15 @@ impl<T> Portable<T> {
 			// A readiness backend calls the operation when the poller says it
 			// is ready, and a descriptor the caller left in blocking mode would
 			// stall the reactor in that call. A socket's MSG_DONTWAIT does not
-			// cover it: XNU's sosendcheck only honours SS_NBIO. `socket2` sets
-			// the flag with `fcntl(F_SETFL, O_NONBLOCK)` on unix — which a pipe
-			// takes as well as a socket — and with `ioctlsocket(FIONBIO)` on a
-			// socket on Windows.
-			let source = sys::borrow(fd)?;
-			SockRef::from(&source).set_nonblocking(true)?;
+			// cover it: XNU's sosendcheck only honours SS_NBIO. Where the
+			// platform runs the call on the poller, the descriptor is switched
+			// to non-blocking; a waitable handle has no such mode.
+			sys::prepare_watch(fd)?;
 			let mut entry = Source {
 				fd,
 				readers: SmallVec::new(),
 				writers: SmallVec::new(),
+				hangups: SmallVec::new(),
 			};
 			entry.add(direction, key);
 			let source_key = self.sources.insert(entry);
@@ -349,6 +352,11 @@ impl<T> Portable<T> {
 		}
 		if event.writable {
 			keys.extend(registered.writers.iter().copied());
+		}
+		// A peer that closed, or a connection that broke, is the hangup the
+		// poller reports as an interrupt or an error. A half-close is neither.
+		if event.is_interrupt() || event.is_err() == Some(true) {
+			keys.extend(registered.hangups.iter().copied());
 		}
 		for key in keys {
 			self.run_ready(key)?;
@@ -459,7 +467,7 @@ impl<T> Drop for Portable<T> {
 	fn drop(&mut self) {
 		// The poller requires deregistration before descriptors are closed.
 		for (_, source) in std::mem::take(&mut self.sources) {
-			let _ = self.delete(source.fd);
+			drop(self.delete(source.fd));
 		}
 		// Workers cannot be interrupted; wait until no job can access the
 		// caller's resources.
@@ -491,7 +499,7 @@ impl<T> Driver<T> for Portable<T> {
 		let Some(Active::Waiting { fd, op, data, .. }) = self.active.remove(key) else {
 			unreachable!("the operation waiting on the poller has no job");
 		};
-		let _ = self.unwatch(fd, direction(&op), key);
+		drop(self.unwatch(fd, direction(&op), key));
 		self.done.push((id, data, Err(Error::cancelled())));
 	}
 
@@ -594,21 +602,9 @@ impl<T> Portable<T> {
 				sys::pollable(raw)?;
 				self.wait(raw, Op::Recv { buf }, Some(buf), data)
 			}
-			#[cfg(unix)]
-			Op::RecvWithFds { buf } => self.wait(raw, Op::RecvWithFds { buf }, Some(buf), data),
-			// A receive that carries descriptors has no form on a platform whose
-			// socket call has none.
-			#[cfg(windows)]
-			Op::RecvWithFds { .. } => Err(unsupported("this backend cannot receive descriptors")),
-			Op::Send { buf, fds } => {
-				// A send that carries no descriptor is a socket call, and one
-				// that does needs a control message.
-				if fds.is_empty() {
-					sys::pollable(raw)?;
-				} else {
-					sys::control_message(raw)?;
-				}
-				self.wait(raw, Op::Send { buf, fds }, Some(buf), data)
+			Op::Send { buf } => {
+				sys::pollable(raw)?;
+				self.wait(raw, Op::Send { buf }, Some(buf), data)
 			}
 			Op::Accept => {
 				sys::pollable(raw)?;
@@ -627,18 +623,16 @@ impl<T> Portable<T> {
 				}
 			}
 			Op::Readable => {
-				sys::pollable(raw)?;
+				sys::waitable(raw)?;
 				self.wait(raw, Op::Readable, None, data)
 			}
 			Op::Writable => {
-				sys::pollable(raw)?;
+				sys::waitable(raw)?;
 				self.wait(raw, Op::Writable, None, data)
 			}
 			Op::Hangup => {
-				// `polling`'s interrupt interest is a no-op on kqueue, and its
-				// events carry no `EV_EOF`, so a peer gone cannot be told from
-				// one that half-closed.
-				Err(unsupported("this backend cannot wait for a hangup"))
+				sys::hangup(raw)?;
+				self.wait(raw, Op::Hangup, None, data)
 			}
 		}
 	}
@@ -647,39 +641,29 @@ impl<T> Portable<T> {
 /// The direction the poller has to report ready for a waiting operation.
 fn direction(op: &Op) -> Direction {
 	match op {
-		Op::Read { .. } | Op::Recv { .. } | Op::RecvWithFds { .. } | Op::Accept | Op::Readable => {
-			Direction::Readable
-		}
+		Op::Read { .. } | Op::Recv { .. } | Op::Accept | Op::Readable => Direction::Readable,
 		Op::Write { .. } | Op::Send { .. } | Op::Writable | Op::Connect { .. } => {
 			Direction::Writable
 		}
+		Op::Hangup => Direction::Hangup,
 		_ => unreachable!("only a socket call and a readiness wait reach the poller"),
 	}
 }
 
 /// Makes the call the poller's report permits, through `buffer` — the one buffer
 /// the operation transfers through, resolved when it was submitted.
-fn run_watched(op: &mut Op, fd: sys::Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
+fn run_watched(op: &Op, fd: sys::Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 	match op {
 		Op::Read { .. } => sys::read(fd, buffer),
 		Op::Write { .. } => sys::write(fd, buffer),
 		Op::Recv { .. } => recv(fd, buffer),
-		Op::Send { fds, .. } if fds.is_empty() => send(fd, buffer),
-		#[cfg(unix)]
-		Op::Send { fds, .. } => sys::send_with_fds(fd, buffer, fds),
-		#[cfg(unix)]
-		Op::RecvWithFds { .. } => sys::recv_with_fds(fd, buffer),
+		Op::Send { .. } => send(fd, buffer),
 		Op::Accept => accept(fd),
 		Op::Connect { .. } => connect(fd),
 		// A wait for readiness is answered by the poller itself.
-		Op::Readable | Op::Writable => Ok(Progress::Done(Response::Done)),
+		Op::Readable | Op::Writable | Op::Hangup => Ok(Progress::Done(Response::Done)),
 		_ => unreachable!("only a socket call and a readiness wait reach the poller"),
 	}
-}
-
-/// The error an operation this platform cannot run reports.
-fn unsupported(reason: &'static str) -> Error {
-	Error::from(io::Error::new(io::ErrorKind::Unsupported, reason))
 }
 
 /// The one buffer a socket call transfers through, or the error for a call that

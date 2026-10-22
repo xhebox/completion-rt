@@ -5,9 +5,11 @@
 
 use std::io;
 use std::mem::{MaybeUninit, size_of};
-use std::os::windows::io::{AsRawHandle, AsRawSocket, BorrowedSocket, RawSocket};
+use std::os::windows::io::{AsRawHandle, AsRawSocket, BorrowedHandle, BorrowedSocket, RawSocket};
 use std::slice;
 
+use polling::os::iocp::PollerIocpExt;
+use polling::{Event as Ready, PollMode, Poller};
 use socket2::SockRef;
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -114,9 +116,62 @@ pub(super) fn pollable(raw: Raw) -> io::Result<()> {
 	}
 }
 
-/// A send carrying descriptors has no form here, whichever descriptor names it.
-pub(super) fn control_message(_raw: Raw) -> io::Result<()> {
-	Err(unsupported("this backend cannot send descriptors"))
+/// A wait for readiness runs on the poller: a socket through the AFD it sits
+/// on, and a waitable handle through the port's own wait.
+pub(super) fn waitable(_raw: Raw) -> io::Result<()> {
+	Ok(())
+}
+
+/// A wait for a hangup is a socket wait here: a handle has no peer to lose.
+pub(super) fn hangup(raw: Raw) -> io::Result<()> {
+	pollable(raw)
+}
+
+/// Switches a descriptor the poller is about to watch to non-blocking. Only a
+/// socket takes a mode; a waitable handle is signalled by the kernel.
+pub(super) fn prepare_watch(raw: Raw) -> io::Result<()> {
+	match raw {
+		Raw::Socket(_) => SockRef::from(&borrow(raw)?).set_nonblocking(true),
+		Raw::Handle(_) => Ok(()),
+	}
+}
+
+/// Registers a source the poller has not seen.
+pub(super) fn add(poller: &Poller, raw: Raw, interest: Ready) -> io::Result<()> {
+	match raw {
+		// SAFETY: the reactor keeps the socket open and `delete`s the source
+		// from the poller before it goes.
+		Raw::Socket(_) => unsafe { poller.add_with_mode(&borrow(raw)?, interest, PollMode::Level) },
+		// SAFETY: the reactor keeps the handle open and `delete`s the source
+		// from the poller before it goes.
+		Raw::Handle(handle) => unsafe {
+			poller.add_waitable(handle as HANDLE, interest, PollMode::Oneshot)
+		},
+	}
+}
+
+/// Rearms a source the poller already holds.
+pub(super) fn modify(poller: &Poller, raw: Raw, interest: Ready) -> io::Result<()> {
+	match raw {
+		Raw::Socket(_) => poller.modify_with_mode(borrow(raw)?, interest, PollMode::Level),
+		// SAFETY: the handle stays open while the reactor holds it.
+		Raw::Handle(handle) => poller.modify_waitable(
+			unsafe { BorrowedHandle::borrow_raw(handle as HANDLE) },
+			interest,
+			PollMode::Oneshot,
+		),
+	}
+}
+
+/// Deregisters a source, which the reactor still holds open.
+pub(super) fn delete(poller: &Poller, raw: Raw) -> io::Result<()> {
+	match raw {
+		Raw::Socket(_) => poller.delete(borrow(raw)?),
+		// SAFETY: the handle stays open while the reactor holds it.
+		Raw::Handle(handle) => {
+			poller.remove_waitable(unsafe { BorrowedHandle::borrow_raw(handle as HANDLE) })
+		}
+	}
 }
 
 /// Runs a file call on the pool.

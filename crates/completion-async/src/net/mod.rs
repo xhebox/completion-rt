@@ -5,125 +5,48 @@ use std::net::{Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use completion_backend::{AsDescriptor, Error, IoVec, Op, OwnedDescriptor, OwnedSocket, Response};
+use completion_backend::{AsDescriptor, Op, OwnedDescriptor, OwnedSocket, Response};
 use socket2::SockAddr;
 
 use crate::Result;
-use crate::executor::{Handle, submit};
+use crate::executor::submit;
 use crate::io::{Outcome, drain, fill, transfer};
 use crate::memory::AsIoVec;
 
-/// Payload of a receive that collects ancillary descriptors alongside bytes.
-#[derive(Debug)]
-pub struct Received {
-	/// Number of payload bytes received.
-	pub bytes: usize,
-	/// Descriptors received via ancillary control messages (`SCM_RIGHTS`).
-	pub fds: Vec<OwnedDescriptor>,
-}
-
-async fn recv_with_fds<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
-	buffer: M,
-	offset: usize,
-) -> Result<Received> {
-	recv_with_fds_in(fd, buffer, offset)
-		.await
-		.map(|(received, _memory)| received)
-}
-
-/// Like [`recv_with_fds`], but hands the buffer back so the loop can file its
-/// memory with the next round.
-async fn recv_with_fds_in<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
-	buffer: M,
-	offset: usize,
-) -> Result<(Received, M)> {
-	let whole = buffer.as_iovec();
-	// SAFETY: every caller keeps `offset` at or below the buffer's length, so
-	// the rest of the range is inside it.
-	let range = IoVec {
-		ptr: unsafe { whole.ptr.add(offset) },
-		len: whole.len - offset,
-	};
-	let op = Op::RecvWithFds { buf: range };
-	let (response, buffer) = submit(fd, op, buffer)?.await;
-	match response? {
-		Response::CountWithFds(bytes, fds) => Ok((Received { bytes, fds }, buffer)),
-		other => unreachable!("a receive reports a count, not {other:?}"),
-	}
-}
-
-async fn recv_all_with_fds<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
-	buffer: M,
-) -> Outcome<Received> {
-	// The loop owns the one buffer handle: each round moves it into the round's
-	// entry, and the completion hands it back for the next. A round dropped in
-	// flight keeps it in its entry until the kernel finishes.
-	let mut buffer = buffer;
-	let len = buffer.as_iovec().len;
-	let mut done = 0;
-	let mut fds = Vec::new();
-	while done < len {
-		match recv_with_fds_in(Arc::clone(&fd), buffer, done).await {
-			Ok((round, returned)) => {
-				buffer = returned;
-				fds.extend(round.fds);
-				if round.bytes == 0 {
-					return Outcome::new(
-						Received { bytes: done, fds },
-						Err(Error::from(io::Error::new(
-							io::ErrorKind::UnexpectedEof,
-							"the source ended before the memory was full",
-						))),
-					);
-				}
-				done += round.bytes;
-			}
-			Err(error) => return Outcome::new(Received { bytes: done, fds }, Err(error)),
-		}
-	}
-	Outcome::new(Received { bytes: done, fds }, Ok(()))
-}
-
-async fn send_all_impl<D: AsDescriptor + 'static, M: AsIoVec>(
-	fd: Arc<Handle<D>>,
-	buffer: M,
-	mut fds: Vec<OwnedDescriptor>,
-) -> Outcome<usize> {
-	drain(fd, buffer, move |done, iovec| {
-		let fds = if done == 0 {
-			std::mem::take(&mut fds)
-		} else {
-			Vec::new()
-		};
-		Op::Send { buf: iovec, fds }
-	})
-	.await
-}
-
 // ---------------------------------------------------------------------------
-// Stream (pipe / PTY / TAP)
+// Stream (pipe)
 // ---------------------------------------------------------------------------
 
-/// Handle for a connected byte stream that is not a socket (pipe, PTY, TAP).
+/// Handle for a non-seekable byte stream that is not a socket (such as an
+/// anonymous or named pipe).
 ///
-/// Transfers advance the descriptor's own position.
+/// Transfers advance the descriptor's own position. On Windows with the IOCP
+/// backend, handles passed to [`Stream::new`] must be opened with
+/// `FILE_FLAG_OVERLAPPED` (use [`Stream::pipe`], which sets it automatically).
 #[derive(Clone)]
-pub struct Stream(Arc<Handle<OwnedDescriptor>>);
+pub struct Stream(Arc<OwnedDescriptor>);
 
 impl Stream {
 	/// Wraps `stream`.
 	#[fastrace::trace]
 	pub fn new(stream: impl Into<OwnedDescriptor>) -> Stream {
-		Stream(Arc::new(Handle::new(stream.into())))
+		Stream(Arc::new(stream.into()))
+	}
+
+	/// Creates a connected pair of anonymous pipe streams `(reader, writer)`.
+	///
+	/// On Windows, both ends are opened with `FILE_FLAG_OVERLAPPED` so they can
+	/// be driven by the IOCP backend as well as the portable backend.
+	#[fastrace::trace]
+	pub fn pipe() -> io::Result<(Stream, Stream)> {
+		let (reader, writer) = imp::pipe()?;
+		Ok((Stream::new(reader), Stream::new(writer)))
 	}
 
 	/// Unwraps the underlying [`OwnedDescriptor`] if no clones of this handle
 	/// and no in-flight operations remain.
 	pub fn try_take(self) -> Option<OwnedDescriptor> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Performs a single read into `buf`.
@@ -165,16 +88,15 @@ impl Stream {
 
 /// Handle for a connected stream socket.
 ///
-/// Transfers use socket `recv`/`send` semantics; ancillary descriptor passing
-/// is available through the `_with_fds` forms.
+/// Transfers use socket `recv`/`send` semantics.
 #[derive(Clone)]
-pub struct StreamSocket(Arc<Handle<OwnedSocket>>);
+pub struct StreamSocket(Arc<OwnedSocket>);
 
 impl StreamSocket {
 	/// Wraps `socket`.
 	#[fastrace::trace]
 	pub fn new(socket: impl Into<OwnedSocket>) -> StreamSocket {
-		StreamSocket(Arc::new(Handle::new(socket.into())))
+		StreamSocket(Arc::new(socket.into()))
 	}
 
 	/// Connects a new stream socket to `addr`.
@@ -186,7 +108,7 @@ impl StreamSocket {
 	/// Unwraps the underlying [`OwnedSocket`] if no clones of this handle
 	/// and no in-flight operations remain.
 	pub fn try_take(self) -> Option<OwnedSocket> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Performs a single receive into `buf`.
@@ -203,57 +125,18 @@ impl StreamSocket {
 		})
 	}
 
-	/// Performs a single receive into `buf`, also capturing any file
-	/// descriptors passed via ancillary control messages (`SCM_RIGHTS`).
-	pub fn recv_with_fds<M: AsIoVec>(
-		&self,
-		buf: M,
-	) -> impl Future<Output = Result<Received>> + 'static {
-		recv_with_fds(Arc::clone(&self.0), buf, 0)
-	}
-
-	/// Receives into `buf` until it is completely filled, collecting all file
-	/// descriptors received across calls.
-	pub fn recv_exact_with_fds<M: AsIoVec>(
-		&self,
-		buf: M,
-	) -> impl Future<Output = Outcome<Received>> + 'static {
-		recv_all_with_fds(Arc::clone(&self.0), buf)
-	}
-
 	/// Performs a single send from `buf`.
 	pub fn send<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
 		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Send {
 			buf: iovec,
-			fds: Vec::new(),
 		})
 	}
 
 	/// Sends all bytes in `buf` across one or more calls.
 	pub fn send_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Outcome<usize>> + 'static {
-		send_all_impl(Arc::clone(&self.0), buf, Vec::new())
-	}
-
-	/// Performs a single send from `buf`, attaching `fds` as ancillary control
-	/// messages (`SCM_RIGHTS`).
-	pub fn send_with_fds<M: AsIoVec>(
-		&self,
-		buf: M,
-		fds: Vec<OwnedDescriptor>,
-	) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Send {
+		drain(Arc::clone(&self.0), buf, |_done, iovec| Op::Send {
 			buf: iovec,
-			fds,
 		})
-	}
-
-	/// Sends all bytes in `buf`, attaching `fds` to the first send call.
-	pub fn send_all_with_fds<M: AsIoVec>(
-		&self,
-		buf: M,
-		fds: Vec<OwnedDescriptor>,
-	) -> impl Future<Output = Outcome<usize>> + 'static {
-		send_all_impl(Arc::clone(&self.0), buf, fds)
 	}
 
 	/// Shuts down the read, write, or both halves of the stream.
@@ -293,19 +176,19 @@ impl StreamSocket {
 
 /// Handle for a connected datagram socket.
 #[derive(Clone)]
-pub struct DatagramSocket(Arc<Handle<OwnedSocket>>);
+pub struct DatagramSocket(Arc<OwnedSocket>);
 
 impl DatagramSocket {
 	/// Wraps `socket`.
 	#[fastrace::trace]
 	pub fn new(socket: impl Into<OwnedSocket>) -> DatagramSocket {
-		DatagramSocket(Arc::new(Handle::new(socket.into())))
+		DatagramSocket(Arc::new(socket.into()))
 	}
 
 	/// Unwraps the underlying [`OwnedSocket`] if no clones of this handle and
 	/// no in-flight operations remain.
 	pub fn try_take(self) -> Option<OwnedSocket> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Performs a single receive into `buf`.
@@ -315,33 +198,10 @@ impl DatagramSocket {
 		})
 	}
 
-	/// Performs a single receive into `buf`, also capturing any file
-	/// descriptors passed via ancillary control messages (`SCM_RIGHTS`).
-	pub fn recv_with_fds<M: AsIoVec>(
-		&self,
-		buf: M,
-	) -> impl Future<Output = Result<Received>> + 'static {
-		recv_with_fds(Arc::clone(&self.0), buf, 0)
-	}
-
 	/// Performs a single send from `buf`.
 	pub fn send<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
 		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Send {
 			buf: iovec,
-			fds: Vec::new(),
-		})
-	}
-
-	/// Performs a single send from `buf`, attaching `fds` as ancillary control
-	/// messages (`SCM_RIGHTS`).
-	pub fn send_with_fds<M: AsIoVec>(
-		&self,
-		buf: M,
-		fds: Vec<OwnedDescriptor>,
-	) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Send {
-			buf: iovec,
-			fds,
 		})
 	}
 
@@ -357,19 +217,19 @@ impl DatagramSocket {
 
 /// Handle for a listening socket.
 #[derive(Clone)]
-pub struct Listener(Arc<Handle<OwnedSocket>>);
+pub struct Listener(Arc<OwnedSocket>);
 
 impl Listener {
 	/// Wraps `listener`.
 	#[fastrace::trace]
 	pub fn new(listener: impl Into<OwnedSocket>) -> Listener {
-		Listener(Arc::new(Handle::new(listener.into())))
+		Listener(Arc::new(listener.into()))
 	}
 
 	/// Unwraps the underlying [`OwnedSocket`] if no clones of this handle and
 	/// no in-flight accept operations remain.
 	pub fn try_take(self) -> Option<OwnedSocket> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Accepts the next incoming connection on this listener.
@@ -436,9 +296,7 @@ impl<T: ToSockAddr + ?Sized> ToSockAddr for &T {
 	}
 }
 
-async fn connected(
-	connection: io::Result<(SockAddr, Arc<Handle<OwnedSocket>>)>,
-) -> Result<StreamSocket> {
+async fn connected(connection: io::Result<(SockAddr, Arc<OwnedSocket>)>) -> Result<StreamSocket> {
 	let (addr, socket) = connection?;
 	submit(Arc::clone(&socket), Op::Connect { addr }, ())?
 		.await
@@ -446,10 +304,10 @@ async fn connected(
 	Ok(StreamSocket(socket))
 }
 
-fn connect_socket(addr: SockAddr) -> io::Result<(SockAddr, Arc<Handle<OwnedSocket>>)> {
+fn connect_socket(addr: SockAddr) -> io::Result<(SockAddr, Arc<OwnedSocket>)> {
 	let socket = socket2::Socket::new(addr.domain(), socket2::Type::STREAM, None)?;
 	socket.set_nonblocking(true)?;
-	Ok((addr, Arc::new(Handle::new(OwnedSocket::from(socket)))))
+	Ok((addr, Arc::new(OwnedSocket::from(socket))))
 }
 
 #[cfg(unix)]

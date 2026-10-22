@@ -1,5 +1,10 @@
 # completion-rt
 
+[![Test](https://github.com/xhebox/completion-rt/actions/workflows/test.yml/badge.svg)](https://github.com/xhebox/completion-rt/actions/workflows/test.yml)
+[![crates.io](https://img.shields.io/crates/v/completion-async.svg)](https://crates.io/crates/completion-async)
+[![docs.rs](https://img.shields.io/docsrs/completion-async)](https://docs.rs/completion-async)
+[![License: MIT](https://img.shields.io/crates/l/completion-async.svg)](https://github.com/xhebox/completion-rt/blob/main/LICENSE)
+
 Completion-based async I/O for Rust: `io_uring` on Linux, IOCP on Windows, and a portable fallback based on [`polling`](https://github.com/smol-rs/polling) and [`blocking`](https://github.com/smol-rs/blocking).
 
 - `completion-async` provides a single-threaded executor and async handles (`File`, `Stream`, `StreamSocket`, `DatagramSocket`, `Listener`, `Readiness`).
@@ -41,7 +46,7 @@ Every I/O method takes its buffer by value as `impl AsIoVec`.
 
 A `Buffer` implements `AsIoVec`, and cloning one is cheap and shares the same bytes. Create a `Buffer` with `Buffer::zeroed`, `Buffer::copy_from` (copies a slice), or `Buffer::from` (takes a `Vec<u8>` or `Box<[u8]>` without copying). Pass `buffer.clone()` to an operation and keep the original: once the operation has landed, `buffer.get_mut()` returns the bytes, and it returns `None` while another clone or an in-flight operation still names them.
 
-Implement `unsafe trait AsIoVec` yourself if `Buffer` does not suite, such as a slice of a larger allocation, or a shared memory region.
+Implement `unsafe trait AsIoVec` yourself if `Buffer` does not suit, such as a slice of a larger allocation, or a shared memory region.
 
 ### Cancellation
 

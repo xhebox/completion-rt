@@ -2,22 +2,193 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak as SyncWeak};
-use std::task::{Context, Poll, Wake, Waker};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak as SyncWeak};
+use std::task::{Context, Poll, Waker};
+use std::thread;
 use std::time::{Duration, Instant};
 
+use async_task::{Runnable, Task};
+use crossbeam_deque::{Injector, Stealer, Worker};
 use slotmap::{DefaultKey, SlotMap};
 use smallvec::SmallVec;
 
-use completion_backend::{AsDescriptor, Backend, Config, Error, Op, Response, Result};
-
-use crate::memory::Memory;
+use completion_backend::{
+	AsDescriptor, Backend, BorrowedDescriptor, Config, Error, Op, Response, Result,
+};
 
 const TICK_BUDGET: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Global work-stealing pool
+// ---------------------------------------------------------------------------
+
+static POOL: LazyLock<Pool> = LazyLock::new(Pool::new);
+
+struct Pool {
+	injector: Injector<Runnable>,
+	state: Mutex<PoolState>,
+}
+
+struct PoolState {
+	workers: usize,
+	max_workers: usize,
+	next_id: usize,
+	stealers: Vec<(usize, Stealer<Runnable>)>,
+	sleepers: Vec<Arc<Shared>>,
+}
+
+impl Pool {
+	fn new() -> Pool {
+		let max_workers = thread::available_parallelism()
+			.map(NonZeroUsize::get)
+			.unwrap_or(2)
+			.clamp(2, 4);
+		Pool {
+			injector: Injector::new(),
+			state: Mutex::new(PoolState {
+				workers: 0,
+				max_workers,
+				next_id: 0,
+				stealers: Vec::new(),
+				sleepers: Vec::new(),
+			}),
+		}
+	}
+
+	fn lock(&self) -> MutexGuard<'_, PoolState> {
+		self.state.lock().unwrap_or_else(|p| p.into_inner())
+	}
+
+	fn register_stealer(&self, stealer: Stealer<Runnable>) -> usize {
+		let mut state = self.lock();
+		let id = state.next_id;
+		state.next_id += 1;
+		state.stealers.push((id, stealer));
+		id
+	}
+
+	fn unregister_stealer(&self, id: usize) {
+		self.lock().stealers.retain(|(entry_id, _)| *entry_id != id);
+	}
+
+	fn register_sleeper(&self, shared: &Arc<Shared>) {
+		let mut state = self.lock();
+		if !state.sleepers.iter().any(|s| Arc::ptr_eq(s, shared)) {
+			state.sleepers.push(Arc::clone(shared));
+		}
+	}
+
+	fn unregister_sleeper(&self, shared: &Arc<Shared>) {
+		self.lock().sleepers.retain(|s| !Arc::ptr_eq(s, shared));
+	}
+
+	fn schedule(&'static self, runnable: Runnable) {
+		self.injector.push(runnable);
+		self.notify();
+	}
+
+	fn notify(&'static self) {
+		let mut state = self.lock();
+		while let Some(shared) = state.sleepers.pop() {
+			if shared.unpark() {
+				return;
+			}
+		}
+		if state.workers < state.max_workers {
+			state.workers += 1;
+			drop(state);
+			self.spawn_worker();
+		}
+	}
+
+	fn spawn_worker(&'static self) {
+		if thread::Builder::new()
+			.name("completion-worker".into())
+			.spawn(move || {
+				scopeguard::defer! {
+					self.lock().workers -= 1;
+				}
+				let _ = worker_loop();
+			})
+			.is_err()
+		{
+			self.lock().workers -= 1;
+		}
+	}
+
+	fn steal(&self, dest: &Worker<Runnable>, self_id: usize) -> Option<Runnable> {
+		if let Some(runnable) = std::iter::repeat_with(|| self.injector.steal_batch_and_pop(dest))
+			.find(|s| !s.is_retry())
+			.and_then(|s| s.success())
+		{
+			return Some(runnable);
+		}
+		let stealers: SmallVec<[Stealer<Runnable>; 8]> = self
+			.lock()
+			.stealers
+			.iter()
+			.filter(|(id, _)| *id != self_id)
+			.map(|(_, s)| s.clone())
+			.collect();
+		for stealer in stealers {
+			if let Some(runnable) = std::iter::repeat_with(|| stealer.steal_batch_and_pop(dest))
+				.find(|s| !s.is_retry())
+				.and_then(|s| s.success())
+			{
+				return Some(runnable);
+			}
+		}
+		None
+	}
+
+	fn has_work(&self) -> bool {
+		if !self.injector.is_empty() {
+			return true;
+		}
+		self.lock()
+			.stealers
+			.iter()
+			.any(|(_, stealer)| !stealer.is_empty())
+	}
+}
+
+fn worker_loop() -> Result<()> {
+	let shared = with_rt_or_default(|rt| {
+		rt.running = true;
+		Arc::clone(&rt.shared)
+	});
+	scopeguard::defer! {
+		POOL.unregister_sleeper(&shared);
+		with_rt(|rt| rt.running = false);
+	}
+	loop {
+		for _ in 0..TICK_BUDGET {
+			let Some(runnable) = next_runnable() else {
+				break;
+			};
+			let _ = catch_unwind(AssertUnwindSafe(|| runnable.run()));
+		}
+		shared.parked.store(true, Ordering::SeqCst);
+		POOL.register_sleeper(&shared);
+		let has_work =
+			with_rt(|rt| rt.shared.has_work() || !rt.local_worker.is_empty() || POOL.has_work());
+		let timeout = if has_work {
+			POOL.unregister_sleeper(&shared);
+			Some(Duration::ZERO)
+		} else {
+			None
+		};
+		let result = with_rt(|rt| rt.drive(timeout));
+		shared.parked.store(false, Ordering::SeqCst);
+		POOL.unregister_sleeper(&shared);
+		result?;
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Thread-local state
@@ -29,88 +200,125 @@ thread_local! {
 
 /// The combined I/O driver and task scheduler for one thread.
 pub(crate) struct Runtime {
-	backend: Backend<Arc<Entry>>,
+	backend: Backend<Arc<dyn EntryOps>>,
 	shared: Arc<Shared>,
-	tasks: SlotMap<DefaultKey, Option<Box<dyn Runnable>>>,
-	ready: Arc<Ready>,
+	/// Tasks spawned on this thread by [`spawn`], stealable by the pool.
+	local_worker: Worker<Runnable>,
+	/// This runtime's entry in [`Pool::stealers`].
+	worker_id: usize,
+	/// Set while a `block_on` or worker loop drives this runtime; only touched on this thread.
+	running: bool,
 }
 
 impl Runtime {
 	fn new(config: Config) -> Result<Runtime> {
 		let backend = Backend::new(&config)?;
-		let driver_waker = backend.waker();
+		let local_worker = Worker::new_fifo();
+		let worker_id = POOL.register_stealer(local_worker.stealer());
 		let shared = Arc::new(Shared {
 			inner: Mutex::new(SharedInner {
 				stopped: false,
+				root_runnable: None,
+				local_runnable: VecDeque::new(),
+				active_local: SlotMap::new(),
 				cancellations: Vec::new(),
+				submissions: Vec::new(),
 				timers: BTreeMap::new(),
 				next_timer: 0,
-				waker: driver_waker.clone(),
 			}),
-		});
-		let ready = Arc::new(Ready {
-			runnable: Mutex::new(VecDeque::new()),
-			driver_waker,
+			driver_waker: backend.waker(),
 			parked: AtomicBool::new(false),
-			root_woken: AtomicBool::new(true),
-			running: AtomicBool::new(false),
 		});
 		Ok(Runtime {
 			backend,
 			shared,
-			tasks: SlotMap::new(),
-			ready,
+			local_worker,
+			worker_id,
+			running: false,
 		})
 	}
 
 	fn drive(&mut self, timeout: Option<Duration>) -> Result<()> {
+		for entry in self.shared.take_submissions() {
+			entry.submit(&mut self.backend);
+		}
 		for id in self.shared.take_cancellations() {
 			self.backend.cancel(id);
 		}
-		let within = self.shared.within(timeout);
+		let within = self.shared.reap_timers(timeout);
 		let polled = self.backend.poll(within, |_id, entry, response| {
 			entry.complete(response);
 		});
-		self.shared.expire_timers();
+		// Timers that came due during the wait wake their callers now.
+		self.shared.reap_timers(None);
 		polled
 	}
 
-	pub(crate) fn submit(
+	fn submit<D: AsDescriptor + 'static, M: Send + 'static>(
 		&mut self,
-		fd: Arc<dyn AsDescriptor>,
+		fd: Arc<Handle<D>>,
 		op: Op,
-		memory: Option<Arc<dyn Memory>>,
-	) -> Result<Slot> {
+		memory: M,
+	) -> Result<Slot<D, M>> {
 		if self.shared.is_stopped() {
 			return Err(Error::stopped());
 		}
-		let entry = Arc::new(Entry::pending(Arc::clone(&fd), memory));
-		let id = self
-			.backend
-			.submit(fd.as_descriptor(), op, Arc::clone(&entry))?;
-		Ok(Slot {
-			shared: Arc::clone(&self.shared),
-			entry,
-			id: Some(id),
-		})
+		let owner = fd.bind(&self.shared);
+		if Arc::ptr_eq(&owner, &self.shared) {
+			let entry = Arc::new(Entry::pending(Arc::clone(&fd), None, memory));
+			let id = self.backend.submit(
+				fd.as_descriptor(),
+				op,
+				Arc::clone(&entry) as Arc<dyn EntryOps>,
+			)?;
+			entry.set_id(id);
+			Ok(Slot {
+				shared: owner,
+				entry,
+				armed: true,
+			})
+		} else {
+			let entry = Arc::new(Entry::pending(fd, Some(op), memory));
+			if !owner.queue_submit(Arc::clone(&entry) as Arc<dyn EntryOps>) {
+				return Err(Error::stopped());
+			}
+			Ok(Slot {
+				shared: owner,
+				entry,
+				armed: true,
+			})
+		}
 	}
 }
 
 impl Drop for Runtime {
 	fn drop(&mut self) {
-		for job in self.tasks.values_mut().filter_map(Option::as_mut) {
-			job.abandon();
+		POOL.unregister_stealer(self.worker_id);
+		POOL.unregister_sleeper(&self.shared);
+		while let Some(runnable) = self.local_worker.pop() {
+			drop(runnable);
 		}
-		if let Some(timers) = self.shared.stop() {
-			for waker in timers.into_values() {
-				waker.wake();
+		let (local_wakers, timers, submissions) = self.shared.stop();
+		for (_, waker) in local_wakers {
+			waker.wake();
+		}
+		for waker in timers.into_values() {
+			waker.wake();
+		}
+		for entry in submissions {
+			entry.abort();
+		}
+		while let Some(runnable) = self.shared.dequeue_local() {
+			drop(runnable);
+		}
+		self.backend.cancel_all();
+		while !self.backend.is_idle() {
+			if self.drive(None).is_err() {
+				break;
 			}
-			self.backend.cancel_all();
-			while !self.backend.is_idle() {
-				if self.drive(None).is_err() {
-					break;
-				}
-			}
+		}
+		while let Some(runnable) = self.shared.dequeue_local() {
+			drop(runnable);
 		}
 	}
 }
@@ -131,318 +339,218 @@ fn with_rt<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
 }
 
 /// Ensures a runtime exists on this thread (lazy default), then borrows it.
-pub(crate) fn with_rt_or_default<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
+fn with_rt_or_default<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
 	RT.with(|cell| {
-		if cell.borrow().is_none() {
-			let rt = Runtime::new(Config::default())
-				.expect("the thread's default runtime could not be created");
-			*cell.borrow_mut() = Some(rt);
-		}
-		f(cell.borrow_mut().as_mut().unwrap())
+		let mut borrow = cell.borrow_mut();
+		let rt = borrow.get_or_insert_with(|| {
+			Runtime::new(Config::default())
+				.expect("the thread's default runtime could not be created")
+		});
+		f(rt)
 	})
 }
 
+/// Submits `op` on `fd` to the current thread's runtime.
+pub(crate) fn submit<D: AsDescriptor + 'static, M: Send + 'static>(
+	fd: Arc<Handle<D>>,
+	op: Op,
+	memory: M,
+) -> Result<Slot<D, M>> {
+	with_rt_or_default(|rt| rt.submit(fd, op, memory))
+}
+
 // ---------------------------------------------------------------------------
-// JoinHandle / Join
+// JoinHandle
 // ---------------------------------------------------------------------------
 
-/// Handle to a spawned thread-local task.
+/// Handle to a spawned task.
 pub struct JoinHandle<T> {
-	join: Rc<RefCell<Join<T>>>,
+	task: Option<Task<T>>,
 }
 
 impl<T> Future for JoinHandle<T> {
 	type Output = T;
 
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-		let mut join = self.join.borrow_mut();
-		match &mut *join {
-			Join::Waiting(waker) => {
-				if waker
-					.as_ref()
-					.is_none_or(|waker| !waker.will_wake(cx.waker()))
-				{
-					*waker = Some(cx.waker().clone());
-				}
-				Poll::Pending
-			}
-			Join::Done(_) => {
-				let Join::Done(output) = std::mem::replace(&mut *join, Join::Taken) else {
-					unreachable!("the arm just matched Done")
-				};
-				Poll::Ready(output)
-			}
-			Join::Gone => panic!("the runtime was dropped before the task finished"),
-			Join::Taken | Join::Detached => {
-				panic!("the task result is no longer available")
-			}
-		}
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+		Pin::new(
+			self.task
+				.as_mut()
+				.expect("the task result is no longer available"),
+		)
+		.poll(cx)
 	}
 }
 
 impl<T> Drop for JoinHandle<T> {
 	fn drop(&mut self) {
-		drop(self.join.replace(Join::Detached));
+		if let Some(task) = self.task.take() {
+			task.detach();
+		}
 	}
 }
 
-enum Join<T> {
-	Detached,
-	Waiting(Option<Waker>),
-	Done(T),
-	Taken,
-	Gone,
-}
-
 // ---------------------------------------------------------------------------
-// Task (Job) internals
+// Spawning tasks
 // ---------------------------------------------------------------------------
 
-trait Runnable {
-	fn poll(&mut self) -> Poll<()>;
-	fn abandon(&mut self);
+/// Spawns a task onto the work-stealing executor.
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+	F: Future + Send + 'static,
+	F::Output: Send + 'static,
+{
+	let (runnable, task) = async_task::spawn(future, |runnable: Runnable| {
+		POOL.schedule(runnable);
+	});
+	let notify = with_rt_or_default(|rt| {
+		rt.local_worker.push(runnable);
+		rt.shared.notify();
+		rt.running
+	});
+	if notify {
+		POOL.notify();
+	}
+	JoinHandle { task: Some(task) }
 }
 
-struct Job<F: Future> {
-	future: Pin<Box<F>>,
-	join: Rc<RefCell<Join<F::Output>>>,
-	scheduled: Arc<AtomicBool>,
-	waker: Waker,
-}
-
-impl<F: Future> Runnable for Job<F> {
-	fn poll(&mut self) -> Poll<()> {
-		self.scheduled.swap(false, Ordering::AcqRel);
-		let mut cx = Context::from_waker(&self.waker);
-		let output = match self.future.as_mut().poll(&mut cx) {
-			Poll::Pending => return Poll::Pending,
-			Poll::Ready(output) => output,
-		};
-		let previous = self.join.replace(Join::Taken);
-		match previous {
-			Join::Waiting(waker) => {
-				*self.join.borrow_mut() = Join::Done(output);
-				if let Some(waker) = waker {
-					waker.wake();
+/// Spawns a thread-local (`!Send`) task pinned to the current thread.
+pub fn spawn_local<F>(future: F) -> JoinHandle<F::Output>
+where
+	F: Future + 'static,
+	F::Output: 'static,
+{
+	with_rt_or_default(|rt| {
+		let key = rt.shared.lock().active_local.insert(Waker::noop().clone());
+		let cleanup: SyncWeak<Shared> = Arc::downgrade(&rt.shared);
+		let wrapped = async move {
+			scopeguard::defer! {
+				if let Some(shared) = cleanup.upgrade() {
+					shared.lock().active_local.remove(key);
 				}
 			}
-			Join::Detached => drop(output),
-			_ => unreachable!("the future finished while the slot held its result"),
-		}
-		Poll::Ready(())
-	}
-
-	fn abandon(&mut self) {
-		let previous = self.join.replace(Join::Gone);
-		if let Join::Waiting(Some(waker)) = previous {
-			waker.wake();
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Ready queue + wakers
-// ---------------------------------------------------------------------------
-
-struct Ready {
-	runnable: Mutex<VecDeque<DefaultKey>>,
-	driver_waker: Waker,
-	parked: AtomicBool,
-	root_woken: AtomicBool,
-	/// Set while a `block_on` drives this runtime.
-	running: AtomicBool,
-}
-
-impl Ready {
-	fn enqueue(&self, key: DefaultKey) {
-		self.runnable
-			.lock()
-			.expect("the ready queue was poisoned")
-			.push_back(key);
-		self.notify();
-	}
-
-	/// Flags the root as woken and unparks the driver if it is waiting.
-	fn notify(&self) {
-		self.root_woken.store(true, Ordering::SeqCst);
-		if self.parked.swap(false, Ordering::SeqCst) {
-			self.driver_waker.wake_by_ref();
-		}
-	}
-
-	fn dequeue(&self) -> Option<DefaultKey> {
-		self.runnable
-			.lock()
-			.expect("the ready queue was poisoned")
-			.pop_front()
-	}
-
-	fn has_ready(&self) -> bool {
-		!self
-			.runnable
-			.lock()
-			.expect("the ready queue was poisoned")
-			.is_empty()
-	}
-}
-
-impl Wake for Ready {
-	fn wake(self: Arc<Self>) {
-		self.wake_by_ref();
-	}
-
-	fn wake_by_ref(self: &Arc<Self>) {
-		self.notify();
-	}
-}
-
-struct TaskWake {
-	key: DefaultKey,
-	scheduled: Arc<AtomicBool>,
-	ready: SyncWeak<Ready>,
-}
-
-impl Wake for TaskWake {
-	fn wake(self: Arc<Self>) {
-		self.wake_by_ref();
-	}
-
-	fn wake_by_ref(self: &Arc<Self>) {
-		if self.scheduled.swap(true, Ordering::AcqRel) {
-			return;
-		}
-		if let Some(ready) = self.ready.upgrade() {
-			ready.enqueue(self.key);
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Spawning and polling tasks
-// ---------------------------------------------------------------------------
-
-/// Spawns a thread-local task.
-pub fn spawn<T: 'static>(future: impl Future<Output = T> + 'static) -> JoinHandle<T> {
-	let join = with_rt_or_default(|rt| {
-		let join = Rc::new(RefCell::new(Join::Waiting(None)));
-		// Queued right below, so it starts out scheduled.
-		let scheduled = Arc::new(AtomicBool::new(true));
-		let ready = Arc::downgrade(&rt.ready);
-		let key = rt.tasks.insert_with_key(|key| {
-			Some(Box::new(Job {
-				future: Box::pin(future),
-				join: Rc::clone(&join),
-				scheduled: Arc::clone(&scheduled),
-				waker: Waker::from(Arc::new(TaskWake {
-					key,
-					scheduled,
-					ready,
-				})),
-			}) as Box<dyn Runnable>)
+			future.await
+		};
+		let schedule_weak: SyncWeak<Shared> = Arc::downgrade(&rt.shared);
+		let (runnable, task) = async_task::spawn_local(wrapped, move |runnable: Runnable| {
+			if let Some(shared) = schedule_weak.upgrade() {
+				shared.enqueue_local(runnable);
+			}
 		});
-		rt.ready.enqueue(key);
-		join
-	});
-	JoinHandle { join }
-}
-
-/// Polls up to `budget` ready tasks. Each task is taken out of the runtime
-/// before polling so the `RT` borrow is not held across the poll — futures
-/// polled inside the task can call `submit`/`spawn` freely.
-fn tick(budget: usize) -> bool {
-	for _ in 0..budget {
-		let Some((key, job)) = with_rt(|rt| {
-			let key = rt.ready.dequeue()?;
-			Some((key, rt.tasks.get_mut(key).and_then(Option::take)))
-		}) else {
-			break;
-		};
-		let Some(mut job) = job else {
-			continue;
-		};
-		// No RT borrow held here — the future can submit/spawn freely.
-		let result = catch_unwind(AssertUnwindSafe(|| job.poll()));
-		match result {
-			Ok(Poll::Pending) => {
-				with_rt(|rt| {
-					let slot = rt
-						.tasks
-						.get_mut(key)
-						.expect("the task's slot went away while it ran");
-					*slot = Some(job);
-				});
-			}
-			Ok(Poll::Ready(())) => {
-				with_rt(|rt| rt.tasks.remove(key));
-			}
-			Err(panic) => {
-				job.abandon();
-				with_rt(|rt| rt.tasks.remove(key));
-				resume_unwind(panic);
-			}
+		if let Some(slot) = rt.shared.lock().active_local.get_mut(key) {
+			*slot = runnable.waker();
 		}
-	}
-	with_rt(|rt| rt.ready.has_ready())
-}
-
-/// Installs a runtime built from `config` on the current thread.
-///
-/// Without this, the first [`block_on`], [`spawn`], or I/O operation on a
-/// thread installs one with [`Config::default`]. Like `log::set_logger`, it
-/// can only succeed once per thread: it fails with
-/// [`io::ErrorKind::AlreadyExists`] if a runtime is already installed.
-#[fastrace::trace]
-pub fn init(config: Config) -> Result<()> {
-	if RT.with(|cell| cell.borrow().is_some()) {
-		return Err(io::Error::new(
-			io::ErrorKind::AlreadyExists,
-			"a runtime is already installed on this thread",
-		)
-		.into());
-	}
-	let rt = Runtime::new(config)?;
-	RT.with(|cell| *cell.borrow_mut() = Some(rt));
-	Ok(())
+		runnable.schedule();
+		JoinHandle { task: Some(task) }
+	})
 }
 
 // ---------------------------------------------------------------------------
 // The run loop (block_on)
 // ---------------------------------------------------------------------------
 
+/// Installs a runtime built from `config` on the current thread.
+///
+/// Without this, the first [`block_on`], [`spawn`], [`spawn_local`], or I/O
+/// operation on a thread installs one with [`Config::default`]. Like
+/// `log::set_logger`, it can only succeed once per thread: it fails with
+/// [`io::ErrorKind::AlreadyExists`] if a runtime is already installed.
+#[fastrace::trace]
+pub fn init(config: Config) -> Result<()> {
+	RT.with(|cell| {
+		let mut borrow = cell.borrow_mut();
+		if borrow.is_some() {
+			return Err(io::Error::new(
+				io::ErrorKind::AlreadyExists,
+				"a runtime is already installed on this thread",
+			)
+			.into());
+		}
+		*borrow = Some(Runtime::new(config)?);
+		Ok(())
+	})
+}
+
+/// Takes the next runnable for this thread: its own `block_on` root or
+/// `spawn_local` tasks first, then its spawned tasks, then tasks stolen from
+/// the pool.
+fn next_runnable() -> Option<Runnable> {
+	let (runnable, notify_pool) = with_rt(|rt| {
+		if let Some(runnable) = rt.shared.dequeue_local() {
+			return (Some(runnable), false);
+		}
+		if let Some(runnable) = rt.local_worker.pop() {
+			let has_more = !rt.local_worker.is_empty();
+			return (Some(runnable), has_more);
+		}
+		let runnable = POOL.steal(&rt.local_worker, rt.worker_id);
+		let has_more = !rt.local_worker.is_empty() || !POOL.injector.is_empty();
+		(runnable, has_more)
+	});
+	if notify_pool {
+		POOL.notify();
+	}
+	runnable
+}
+
 /// Runs `future` to completion on the current thread.
 pub fn block_on<F: Future>(future: F) -> Result<F::Output> {
-	let ready = with_rt_or_default(|rt| Arc::clone(&rt.ready));
-	assert!(
-		!ready.running.swap(true, Ordering::SeqCst),
-		"block_on cannot be nested on the same thread"
-	);
+	let shared = with_rt_or_default(|rt| {
+		assert!(!rt.running, "block_on cannot be nested on the same thread");
+		rt.running = true;
+		Arc::clone(&rt.shared)
+	});
+	let output = Rc::new(RefCell::new(None));
+	let slot = Rc::clone(&output);
+	let weak = Arc::downgrade(&shared);
+	// SAFETY: the root future runs only on this thread (via `root_runnable`),
+	// and the guard below cancels `root_task` and drops any queued root
+	// `Runnable` before `block_on` returns or unwinds.
+	let (runnable, root_task) = unsafe {
+		async_task::spawn_unchecked(
+			async move {
+				*slot.borrow_mut() = Some(future.await);
+			},
+			move |runnable: Runnable| {
+				if let Some(shared) = weak.upgrade() {
+					shared.enqueue_root(runnable);
+				}
+			},
+		)
+	};
+	shared.lock().root_runnable = Some(runnable);
 	scopeguard::defer! {
-		ready.running.store(false, Ordering::SeqCst);
+		drop(root_task);
+		let root = shared.lock().root_runnable.take();
+		drop(root);
+		POOL.unregister_sleeper(&shared);
+		with_rt(|rt| rt.running = false);
 	}
-	let root_waker = Waker::from(Arc::clone(&ready));
-	let mut fut = std::pin::pin!(future);
-	let mut cx = Context::from_waker(&root_waker);
 	loop {
-		ready.root_woken.store(false, Ordering::SeqCst);
-		if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
-			tick(TICK_BUDGET);
-			return Ok(out);
+		for _ in 0..TICK_BUDGET {
+			let Some(runnable) = next_runnable() else {
+				break;
+			};
+			runnable.run();
 		}
-		let timeout = if tick(TICK_BUDGET) {
-			// Tasks are left over: reap completions without waiting.
+		if let Some(output) = output.borrow_mut().take() {
+			return Ok(output);
+		}
+		// Park first, then look: a wake that lands after the look sees
+		// `parked` and interrupts the wait, so none is lost.
+		shared.parked.store(true, Ordering::SeqCst);
+		POOL.register_sleeper(&shared);
+		let has_work =
+			with_rt(|rt| rt.shared.has_work() || !rt.local_worker.is_empty() || POOL.has_work());
+		let timeout = if has_work {
+			// Work is left over: reap completions without waiting.
+			POOL.unregister_sleeper(&shared);
 			Some(Duration::ZERO)
 		} else {
-			// Park first, then look: a wake that lands after the look sees
-			// `parked` and interrupts the wait, so none is lost.
-			ready.parked.store(true, Ordering::SeqCst);
-			if ready.root_woken.load(Ordering::SeqCst) {
-				Some(Duration::ZERO)
-			} else {
-				None
-			}
+			None
 		};
 		let result = with_rt(|rt| rt.drive(timeout));
-		ready.parked.store(false, Ordering::SeqCst);
+		shared.parked.store(false, Ordering::SeqCst);
+		POOL.unregister_sleeper(&shared);
 		result?;
 	}
 }
@@ -453,81 +561,228 @@ pub fn block_on<F: Future>(future: F) -> Result<F::Output> {
 
 type TimerKey = (Instant, u64);
 
-struct Entry {
-	inner: Mutex<EntryInner>,
+/// What [`Shared::stop`] hands back: the thread-local tasks, the timers, and the
+/// submissions still registered.
+type Stopped = (
+	SlotMap<DefaultKey, Waker>,
+	BTreeMap<TimerKey, Waker>,
+	Vec<Arc<dyn EntryOps>>,
+);
+
+/// Associates a descriptor with the first live runtime that submits an
+/// operation on it, so every submission and cancellation for that descriptor
+/// lands on the same [`Backend`].
+pub(crate) struct Handle<D> {
+	inner: D,
+	owner: Mutex<Option<SyncWeak<Shared>>>,
 }
 
-struct EntryInner {
-	response: Option<Result<Response>>,
-	wakers: SmallVec<[Waker; 2]>,
-	cancelled: bool,
-	done: bool,
-	descriptor: Option<Arc<dyn AsDescriptor>>,
-	memory: Option<Arc<dyn Memory>>,
+impl<D> Handle<D> {
+	pub(crate) fn new(inner: D) -> Self {
+		Handle {
+			inner,
+			owner: Mutex::new(None),
+		}
+	}
+
+	pub(crate) fn into_inner(self) -> D {
+		self.inner
+	}
+
+	fn bind(&self, current: &Arc<Shared>) -> Arc<Shared> {
+		let mut guard = self.owner.lock().unwrap_or_else(|p| p.into_inner());
+		if let Some(weak) = &*guard
+			&& let Some(shared) = weak.upgrade()
+			&& !shared.is_stopped()
+		{
+			return shared;
+		}
+		*guard = Some(Arc::downgrade(current));
+		Arc::clone(current)
+	}
 }
 
-impl Entry {
-	fn pending(descriptor: Arc<dyn AsDescriptor>, memory: Option<Arc<dyn Memory>>) -> Entry {
+impl<D: AsDescriptor> AsDescriptor for Handle<D> {
+	fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
+		self.inner.as_descriptor()
+	}
+}
+
+/// What the backend drives on an entry once it no longer names its types.
+///
+/// The entry itself stays generic over its descriptor and memory types; both
+/// live in the same allocation, and the type-erased handle the backend keeps is
+/// an `Arc` over that allocation.
+trait EntryOps: Send + Sync {
+	/// Files the operation with `backend`, unless it was cancelled first.
+	fn submit(self: Arc<Self>, backend: &mut Backend<Arc<dyn EntryOps>>);
+	fn complete(&self, response: Result<Response>);
+	/// Fails the operation with a cancellation unless it has completed.
+	fn abort(&self);
+}
+
+struct Entry<D, M> {
+	state: Mutex<EntryState<D, M>>,
+}
+
+/// Where an operation stands.
+///
+/// The memory and descriptor stay in the entry until the operation settles, so
+/// a future dropped in flight leaves them to go with the entry when the kernel
+/// finishes. Completing replaces the pending variant, releasing the descriptor;
+/// the memory then waits in `Done` for the caller.
+enum EntryState<D, M> {
+	Pending {
+		waker: Option<Waker>,
+		descriptor: Arc<Handle<D>>,
+		/// The operation, until it is filed with the owning backend.
+		op: Option<Op>,
+		/// The id the owning backend filed the operation under.
+		id: Option<u64>,
+		memory: M,
+	},
+	Done(Result<Response>, M),
+	/// The completion and memory went back to the caller, or a queued submission
+	/// was cancelled before it reached the backend.
+	Taken,
+}
+
+impl<D, M> Entry<D, M> {
+	fn pending(descriptor: Arc<Handle<D>>, op: Option<Op>, memory: M) -> Entry<D, M> {
 		Entry {
-			inner: Mutex::new(EntryInner {
-				response: None,
-				wakers: SmallVec::new(),
-				cancelled: false,
-				done: false,
-				descriptor: Some(descriptor),
+			state: Mutex::new(EntryState::Pending {
+				waker: None,
+				descriptor,
+				op,
+				id: None,
 				memory,
 			}),
 		}
 	}
 
-	fn lock(&self) -> MutexGuard<'_, EntryInner> {
-		self.inner.lock().unwrap_or_else(|p| p.into_inner())
+	fn lock(&self) -> MutexGuard<'_, EntryState<D, M>> {
+		self.state.lock().unwrap_or_else(|p| p.into_inner())
+	}
+
+	fn set_id(&self, submitted_id: u64) {
+		if let EntryState::Pending { id, .. } = &mut *self.lock() {
+			*id = Some(submitted_id);
+		}
+	}
+
+	/// Cancels the operation: a filed one is cancelled in its backend, and one
+	/// still queued is dropped before it reaches the backend.
+	fn cancel(&self, shared: &Shared) {
+		let mut state = self.lock();
+		if let EntryState::Pending { id, .. } = &*state {
+			match *id {
+				Some(id) => {
+					drop(state);
+					shared.queue_cancel(id);
+				}
+				None => {
+					*state = EntryState::Taken;
+				}
+			}
+		}
+	}
+
+	fn take_or_register(&self, waker: &Waker) -> Option<(Result<Response>, M)> {
+		let mut state = self.lock();
+		if let EntryState::Pending {
+			waker: registered, ..
+		} = &mut *state
+		{
+			if registered.as_ref().is_none_or(|w| !w.will_wake(waker)) {
+				*registered = Some(waker.clone());
+			}
+			return None;
+		}
+		match std::mem::replace(&mut *state, EntryState::Taken) {
+			EntryState::Done(response, memory) => Some((response, memory)),
+			_ => None,
+		}
+	}
+}
+
+impl<D: AsDescriptor + 'static, M: Send + 'static> EntryOps for Entry<D, M> {
+	fn submit(self: Arc<Self>, backend: &mut Backend<Arc<dyn EntryOps>>) {
+		let mut state = self.lock();
+		let EntryState::Pending {
+			descriptor, op, id, ..
+		} = &mut *state
+		else {
+			return;
+		};
+		let Some(op) = op.take() else {
+			return;
+		};
+		match backend.submit(
+			descriptor.as_descriptor(),
+			op,
+			Arc::clone(&self) as Arc<dyn EntryOps>,
+		) {
+			Ok(submitted_id) => {
+				*id = Some(submitted_id);
+			}
+			Err(error) => {
+				drop(state);
+				self.complete(Err(error));
+			}
+		}
 	}
 
 	fn complete(&self, response: Result<Response>) {
-		let mut inner = self.lock();
-		inner.memory = None;
-		inner.descriptor = None;
-		inner.response = Some(response);
-		inner.done = true;
-		let wakers = std::mem::take(&mut inner.wakers);
-		drop(inner);
-		for waker in wakers {
+		let mut state = self.lock();
+		let waker = match std::mem::replace(&mut *state, EntryState::Taken) {
+			EntryState::Pending {
+				waker,
+				descriptor,
+				memory,
+				..
+			} => {
+				drop(descriptor);
+				*state = EntryState::Done(response, memory);
+				waker
+			}
+			// The backend reports each operation once.
+			EntryState::Done(..) | EntryState::Taken => {
+				unreachable!("the backend reports each operation once")
+			}
+		};
+		drop(state);
+		if let Some(waker) = waker {
 			waker.wake();
 		}
 	}
 
-	fn mark_cancelled(&self) -> bool {
-		let mut inner = self.lock();
-		!std::mem::replace(&mut inner.cancelled, true) && !inner.done
-	}
-
-	fn take_or_register(&self, waker: &Waker) -> Option<Result<Response>> {
-		let mut inner = self.lock();
-		if let Some(response) = inner.response.take() {
-			return Some(response);
+	fn abort(&self) {
+		if matches!(&*self.lock(), EntryState::Pending { .. }) {
+			self.complete(Err(Error::cancelled()));
 		}
-		if !inner.wakers.iter().any(|w| w.will_wake(waker)) {
-			inner.wakers.push(waker.clone());
-		}
-		None
-	}
-
-	fn take_response(&self) -> Option<Result<Response>> {
-		self.lock().response.take()
 	}
 }
 
 struct Shared {
 	inner: Mutex<SharedInner>,
+	driver_waker: Waker,
+	/// Set while the driver is waiting in `Backend::poll`.
+	parked: AtomicBool,
 }
 
 struct SharedInner {
 	stopped: bool,
+	/// The `block_on` root, queued by its waker; only the owning thread runs it.
+	root_runnable: Option<Runnable>,
+	/// Ready `spawn_local` tasks; only the owning thread runs them.
+	local_runnable: VecDeque<Runnable>,
+	/// Wakers of live `spawn_local` tasks, so dropping the runtime wakes them.
+	active_local: SlotMap<DefaultKey, Waker>,
 	cancellations: Vec<u64>,
+	/// Submissions from other threads, filed by this thread's backend on its next drive.
+	submissions: Vec<Arc<dyn EntryOps>>,
 	timers: BTreeMap<TimerKey, Waker>,
 	next_timer: u64,
-	waker: Waker,
 }
 
 impl Shared {
@@ -535,32 +790,87 @@ impl Shared {
 		self.inner.lock().unwrap_or_else(|p| p.into_inner())
 	}
 
-	fn queue_cancel(&self, id: u64) {
-		let mut inner = self.lock();
-		inner.cancellations.push(id);
-		inner.waker.wake_by_ref();
+	fn enqueue_root(&self, runnable: Runnable) {
+		self.lock().root_runnable = Some(runnable);
+		self.notify();
 	}
 
-	fn release(&self, id: u64, entry: &Entry) {
-		if entry.mark_cancelled() {
-			self.queue_cancel(id);
+	fn enqueue_local(&self, runnable: Runnable) {
+		self.lock().local_runnable.push_back(runnable);
+		self.notify();
+	}
+
+	/// Unparks the driver if it is waiting.
+	fn notify(&self) {
+		let _ = self.unpark();
+	}
+
+	/// Unparks the driver if it is waiting, and reports whether it was.
+	fn unpark(&self) -> bool {
+		if self.parked.swap(false, Ordering::SeqCst) {
+			self.driver_waker.wake_by_ref();
+			true
+		} else {
+			false
 		}
+	}
+
+	fn dequeue_local(&self) -> Option<Runnable> {
+		let mut inner = self.lock();
+		inner
+			.root_runnable
+			.take()
+			.or_else(|| inner.local_runnable.pop_front())
+	}
+
+	/// Whether the loop has something to do besides wait: a queued task or a
+	/// cancellation still to hand to the backend.
+	fn has_work(&self) -> bool {
+		let inner = self.lock();
+		inner.root_runnable.is_some()
+			|| !inner.local_runnable.is_empty()
+			|| !inner.cancellations.is_empty()
+			|| !inner.submissions.is_empty()
+	}
+
+	fn queue_cancel(&self, id: u64) {
+		self.lock().cancellations.push(id);
+		self.notify();
 	}
 
 	fn take_cancellations(&self) -> Vec<u64> {
 		std::mem::take(&mut self.lock().cancellations)
 	}
 
+	/// Queues a submission from another thread; `false` if the runtime has stopped.
+	fn queue_submit(&self, entry: Arc<dyn EntryOps>) -> bool {
+		let mut inner = self.lock();
+		if inner.stopped {
+			return false;
+		}
+		inner.submissions.push(entry);
+		drop(inner);
+		self.notify();
+		true
+	}
+
+	fn take_submissions(&self) -> Vec<Arc<dyn EntryOps>> {
+		std::mem::take(&mut self.lock().submissions)
+	}
+
 	fn is_stopped(&self) -> bool {
 		self.lock().stopped
 	}
 
-	fn stop(&self) -> Option<BTreeMap<TimerKey, Waker>> {
+	/// Marks the runtime stopped and hands back what is still registered with it.
+	fn stop(&self) -> Stopped {
 		let mut inner = self.lock();
-		if std::mem::replace(&mut inner.stopped, true) {
-			return None;
-		}
-		Some(std::mem::take(&mut inner.timers))
+		inner.stopped = true;
+		(
+			std::mem::take(&mut inner.active_local),
+			std::mem::take(&mut inner.timers),
+			std::mem::take(&mut inner.submissions),
+		)
 	}
 
 	fn add_timer(&self, deadline: Instant, waker: &Waker) -> Option<u64> {
@@ -590,7 +900,12 @@ impl Shared {
 		self.lock().timers.remove(&key);
 	}
 
-	fn expire_timers(&self) {
+	/// Reaps timers that have come due and returns how long the backend may
+	/// wait: `timeout` bounded by the nearest remaining deadline.
+	///
+	/// An expiry wakes its waiter and cuts the wait to zero, so work it makes
+	/// ready is not left behind a wait for a later deadline.
+	fn reap_timers(&self, timeout: Option<Duration>) -> Option<Duration> {
 		let now = Instant::now();
 		let mut expired = SmallVec::<[Waker; 4]>::new();
 		let mut inner = self.lock();
@@ -600,51 +915,51 @@ impl Shared {
 			}
 			expired.push(entry.remove());
 		}
+		let within = if expired.is_empty() {
+			let nearest = inner
+				.timers
+				.first_key_value()
+				.map(|(&(deadline, _), _)| deadline.saturating_duration_since(now));
+			match (timeout, nearest) {
+				(Some(timeout), Some(nearest)) => Some(timeout.min(nearest)),
+				(timeout, nearest) => timeout.or(nearest),
+			}
+		} else {
+			Some(Duration::ZERO)
+		};
 		drop(inner);
 		for waker in expired {
 			waker.wake();
 		}
-	}
-
-	fn within(&self, timeout: Option<Duration>) -> Option<Duration> {
-		let inner = self.lock();
-		let nearest = inner
-			.timers
-			.first_key_value()
-			.map(|(&(deadline, _), _)| deadline.saturating_duration_since(Instant::now()));
-		match (timeout, nearest) {
-			(Some(timeout), Some(nearest)) => Some(timeout.min(nearest)),
-			(timeout, nearest) => timeout.or(nearest),
-		}
+		within
 	}
 }
 
-pub(crate) struct Slot {
+pub(crate) struct Slot<D, M> {
 	shared: Arc<Shared>,
-	entry: Arc<Entry>,
+	entry: Arc<Entry<D, M>>,
 	/// Cleared once the response is taken, so dropping no longer cancels.
-	id: Option<u64>,
+	armed: bool,
 }
 
-impl Drop for Slot {
+impl<D, M> Drop for Slot<D, M> {
 	fn drop(&mut self) {
-		if let Some(id) = self.id.take() {
-			self.shared.release(id, &self.entry);
+		if std::mem::take(&mut self.armed) {
+			self.entry.cancel(&self.shared);
 		}
-		let response = self.entry.take_response();
-		drop(response);
 	}
 }
 
-impl Future for Slot {
-	type Output = Result<Response>;
+impl<D, M> Future for Slot<D, M> {
+	/// The completion and the memory the operation was filed with.
+	type Output = (Result<Response>, M);
 
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Response>> {
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = self.get_mut();
 		match this.entry.take_or_register(cx.waker()) {
-			Some(response) => {
-				this.id = None;
-				Poll::Ready(response)
+			Some((response, memory)) => {
+				this.armed = false;
+				Poll::Ready((response, memory))
 			}
 			None => Poll::Pending,
 		}

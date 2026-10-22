@@ -1,13 +1,11 @@
-//! Memory handed to an operation: a [`Buffer`] names the range each operation
-//! transfers through.
+//! Memory handed to an operation: a [`Buffer`] shares its bytes between clones,
+//! and a custom [`AsIoVec`] names a range inside memory the operation does not
+//! own.
 mod common;
 
-use std::io;
 use std::sync::Arc;
 
-use completion_async::{
-	Buffer, Error, ErrorKind, File, IoVec, Memory, OpenOptions, Result, block_on,
-};
+use completion_async::{AsIoVec, Buffer, File, IoVec, OpenOptions, block_on};
 
 /// An empty file in a scratch directory, open for reading and writing on
 /// `executor`.
@@ -25,151 +23,116 @@ fn scratch(tag: &str) -> (common::Scratch, std::path::PathBuf, File) {
 	(directory, path, file)
 }
 
-/// A buffer names a range; one past the end is refused when the operation is
-/// submitted, not by a panic, and the memory is left alone.
-#[test]
-fn a_buffer_past_its_range_fails_as_invalid_input() {
-	common::init_logging();
-	let (_directory, path, file) = scratch("completion-memory-range");
-	std::fs::write(&path, b"hello").unwrap();
-	let mut buffer = Buffer::zeroed(4);
+/// Memory the test owns: the operation reaches the range `offset..offset + len`
+/// inside `bytes`, which stays put for as long as any clone is alive.
+#[derive(Clone)]
+struct Middle {
+	bytes: Arc<Vec<u8>>,
+	offset: usize,
+	len: usize,
+}
 
-	let result = block_on(file.read_at(buffer.slice(2, 4), 0)).unwrap();
-	match result {
-		Err(error) if error.kind() == ErrorKind::Failed => {
-			assert_eq!(
-				io::Error::try_from(error).unwrap().kind(),
-				io::ErrorKind::InvalidInput
-			)
+impl Middle {
+	fn range(&self) -> &[u8] {
+		&self.bytes[self.offset..self.offset + self.len]
+	}
+}
+
+// SAFETY: the `Arc` keeps `bytes` alive, and `offset..offset + len` is inside
+// it.
+unsafe impl AsIoVec for Middle {
+	fn as_iovec(&self) -> IoVec {
+		IoVec {
+			ptr: unsafe { self.bytes.as_ptr().add(self.offset).cast_mut() },
+			len: self.len,
 		}
-		other => panic!("a buffer past its range was taken: {other:?}"),
 	}
-	assert_eq!(
-		buffer.get_mut().unwrap().to_vec(),
-		&[0u8; 4],
-		"the memory was written to"
-	);
 }
 
-/// A buffer at an offset moves only its own range: a write sends those bytes
-/// alone, and a read fills that range and leaves the rest of the buffer alone.
+/// A custom [`AsIoVec`] reads into and writes from its own range, not the whole
+/// allocation it points into.
 #[test]
-fn a_buffer_at_an_offset_moves_only_its_range() {
-	common::init_logging();
-	let (_directory, path, file) = scratch("completion-memory-offset");
-	let source = Buffer::copy_from(b"..head..");
-
-	let written = block_on(file.write_all_at(source.slice(2, 4), 0))
-		.unwrap()
-		.into_result()
-		.unwrap();
-	assert_eq!(written, 4);
-	assert_eq!(std::fs::read(&path).unwrap(), b"head");
-
-	let mut sink = Buffer::copy_from(&[b'.'; 8]);
-	let read = block_on(file.read_exact_at(sink.slice(3, 4), 0))
-		.unwrap()
-		.into_result()
-		.unwrap();
-	assert_eq!(read, 4);
-	assert_eq!(sink.get_mut().unwrap().to_vec(), b"...head.");
-}
-
-/// A skipped view starts past the bytes it skips, and a fill through it stops
-/// at its end.
-#[test]
-fn read_exact_at_fills_a_skipped_view() {
-	common::init_logging();
-	let (_directory, path, file) = scratch("completion-memory-skip");
-	std::fs::write(&path, b"world").unwrap();
-	let mut sink = Buffer::copy_from(b"hello, .....");
-
-	let read = block_on(file.read_exact_at(sink.clone().skip(7), 0))
-		.unwrap()
-		.into_result()
-		.unwrap();
-
-	assert_eq!(read, 5);
-	assert_eq!(sink.get_mut().unwrap().to_vec(), b"hello, world");
-}
-
-/// A [`Memory`] the test owns, to prove [`Buffer::new`] carries a custom
-/// implementation through a real transfer.
-struct Custom(Vec<u8>);
-
-// SAFETY: the bytes outlive the memory and only reach the kernel through
-// `resolve`, which refuses an extent that does not fit them.
-unsafe impl Memory for Custom {
-	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec> {
-		let fits = offset
-			.checked_add(len)
-			.is_some_and(|end| end <= self.0.len());
-		if !fits {
-			return Err(Error::from(io::Error::from(io::ErrorKind::InvalidInput)));
-		}
-		// SAFETY: `offset..offset + len` is inside the vector, which the buffer
-		// keeps alive.
-		Ok(IoVec {
-			ptr: unsafe { self.0.as_ptr().add(offset).cast_mut() },
-			len,
-		})
-	}
-
-	fn len(&self) -> usize {
-		self.0.len()
-	}
-
-	fn get_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
-		self.0.get_mut(offset..offset.checked_add(len)?)
-	}
-}
-
-#[test]
-fn a_custom_memory_reads_through_a_file() {
+fn a_custom_as_iovec_reads_and_writes_through_its_range() {
 	common::init_logging();
 	let (_directory, path, file) = scratch("completion-memory-custom");
-	std::fs::write(&path, b"custom").unwrap();
-	let mut buffer = Buffer::new(Arc::new(Custom(vec![0; 6])));
+	std::fs::write(&path, b"abcdefgh").unwrap();
 
-	block_on(file.read_exact_at(buffer.clone(), 0))
+	let sink = Middle {
+		bytes: Arc::new(vec![b'.'; 10]),
+		offset: 3,
+		len: 4,
+	};
+	block_on(file.read_exact_at(sink.clone(), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
-	assert_eq!(buffer.get_mut().unwrap().to_vec(), b"custom");
+	assert_eq!(sink.range(), b"abcd");
+	assert_eq!(sink.bytes.as_slice(), b"...abcd...");
+
+	let source = Middle {
+		bytes: Arc::new(b"..WXYZ..".to_vec()),
+		offset: 2,
+		len: 4,
+	};
+	block_on(file.write_all_at(source.clone(), 4))
+		.unwrap()
+		.into_result()
+		.unwrap();
+	assert_eq!(std::fs::read(&path).unwrap(), b"abcdWXYZ");
 }
 
-/// A buffer is what a transfer names, whole or sliced, and a clone keeps the
-/// bytes alive for it.
+/// A clone of a buffer is a handle on the same bytes: passing it to an
+/// operation and keeping the original reads the bytes back once it lands.
 #[test]
-fn a_transfer_takes_the_bytes_it_names() {
+fn a_shared_buffer_reads_and_writes() {
 	common::init_logging();
-	let (_directory, path, file) = scratch("completion-memory-into");
+	let (_directory, path, file) = scratch("completion-memory-shared");
+	std::fs::write(&path, b"shared").unwrap();
 
-	let written = block_on(file.write_all_at(Buffer::copy_from(b"payload"), 0))
+	let source = Buffer::copy_from(b"shared");
+	let written = block_on(file.write_all_at(source.clone(), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
-	assert_eq!(written, 7);
-	assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+	assert_eq!(written, 6);
 
-	let mut sink = Buffer::zeroed(7);
+	let mut sink = Buffer::zeroed(6);
 	let read = block_on(file.read_exact_at(sink.clone(), 0))
 		.unwrap()
 		.into_result()
 		.unwrap();
-	assert_eq!(read, 7);
-	assert_eq!(sink.get_mut().unwrap().to_vec(), b"payload");
-
-	let mut from_vec = Buffer::zeroed(7);
-	block_on(file.read_exact_at(from_vec.clone(), 0))
-		.unwrap()
-		.into_result()
-		.unwrap();
-	assert_eq!(from_vec.get_mut().unwrap().to_vec(), b"payload");
+	assert_eq!(read, 6);
+	assert_eq!(sink.get_mut().unwrap(), b"shared");
 }
 
-/// A transfer holds a handle on the bytes it was handed: the caller's buffer may
-/// go before the operation is awaited.
+/// The bytes are exclusive only while no other handle names them: another clone
+/// or an in-flight operation refuses `get_mut`, and completion gives it back.
+#[test]
+fn a_buffer_is_exclusive_only_once_nothing_else_names_it() {
+	common::init_logging();
+	let (_directory, path, file) = scratch("completion-memory-exclusive");
+	std::fs::write(&path, b"hello").unwrap();
+
+	let mut buffer = Buffer::zeroed(5);
+	let read = file.read_at(buffer.clone(), 0);
+	assert!(
+		buffer.get_mut().is_none(),
+		"the in-flight operation still names the bytes"
+	);
+	block_on(read).unwrap().unwrap();
+	assert_eq!(buffer.get_mut().unwrap(), b"hello");
+
+	let clone = buffer.clone();
+	assert!(
+		buffer.get_mut().is_none(),
+		"another handle still names the bytes"
+	);
+	drop(clone);
+	assert!(buffer.get_mut().is_some());
+}
+
+/// A transfer holds the bytes it was handed: the caller's handle may go before
+/// the operation is awaited.
 #[test]
 fn a_transfer_outlives_the_buffer_it_was_named_by() {
 	common::init_logging();

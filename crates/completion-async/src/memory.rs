@@ -1,37 +1,20 @@
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::io;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
-use completion_backend::{Error, IoVec, Result};
+use completion_backend::IoVec;
 
-fn check_extent(offset: usize, len: usize, bound: usize) -> Result<()> {
-	match offset.checked_add(len) {
-		Some(end) if end <= bound => Ok(()),
-		_ => Err(Error::from(io::Error::from(io::ErrorKind::InvalidInput))),
-	}
-}
-
-/// Backing memory for I/O operations.
+/// Memory an I/O operation can transfer through.
+///
+/// Implement it for memory the buffer types cannot own, such as a range inside
+/// a larger allocation.
 ///
 /// # Safety
-/// [`Memory::resolve`] must return a pointer and length that remain valid for
-/// as long as the `Memory` value is alive, or fail with
-/// [`InvalidInput`](io::ErrorKind::InvalidInput) if the range is out of bounds.
-pub unsafe trait Memory: Send + Sync {
-	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec>;
-
-	fn len(&self) -> usize;
-
-	/// Returns a mutable slice when `&mut self` guarantees exclusive access.
-	///
-	/// Shared-memory implementations (guest RAM, shared mmap) should keep the
-	/// default `None`.
-	fn get_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
-		let _ = (offset, len);
-		None
-	}
+/// The returned range must stay valid, and writable by the kernel through `&self`,
+/// for as long as `self` is alive.
+pub unsafe trait AsIoVec: Send + Sync + 'static {
+	fn as_iovec(&self) -> IoVec;
 }
 
 /// Host bytes the kernel may write through `&self`: each byte is an
@@ -48,62 +31,47 @@ impl Bytes {
 	}
 }
 
-// SAFETY: every access to the bytes goes through a pointer `resolve` hands to
-// an operation; the caller orders those accesses, as for any other `Memory`.
-unsafe impl Sync for Bytes {}
-
-// SAFETY: the vector is never resized, so its elements stay put for the
-// lifetime of `self`, and `check_extent` bounds-checks every range.
-unsafe impl Memory for Bytes {
-	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec> {
-		check_extent(offset, len, self.0.len())?;
-		Ok(IoVec {
-			ptr: UnsafeCell::raw_get(self.0[offset..].as_ptr()),
-			len,
-		})
-	}
-
+impl Bytes {
 	fn len(&self) -> usize {
 		self.0.len()
 	}
 
-	fn get_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
-		check_extent(offset, len, self.0.len()).ok()?;
-		if len == 0 {
-			return Some(&mut []);
-		}
-		let cells = &mut self.0[offset..offset + len];
+	fn as_mut_slice(&mut self) -> &mut [u8] {
+		let cells = self.0.as_mut_slice();
 		// SAFETY: `UnsafeCell<u8>` is `repr(transparent)` over `u8`, and
 		// `&mut self` guarantees exclusive access.
-		Some(unsafe { &mut *(cells as *mut [UnsafeCell<u8>] as *mut [u8]) })
+		unsafe { &mut *(cells as *mut [UnsafeCell<u8>] as *mut [u8]) }
 	}
 }
 
-/// A byte range backed by reference-counted memory, used for I/O transfers.
-///
-/// Cloning is cheap (`Arc` clone) and refers to the same memory. Use
-/// [`Buffer::zeroed`], [`Buffer::copy_from`], or `Buffer::from` a `Vec<u8>`
-/// / `Box<[u8]>` for host buffers, or wrap a custom [`Memory`] with
-/// [`Buffer::new`]. [`slice`](Buffer::slice), [`skip`](Buffer::skip), and
-/// [`take`](Buffer::take) return narrower views without copying.
-#[derive(Clone)]
-pub struct Buffer {
-	pub(crate) memory: Arc<dyn Memory>,
-	offset: usize,
-	len: usize,
-}
+// SAFETY: every access to the bytes goes through a pointer `as_iovec` hands to
+// an operation; the caller orders those accesses, as for any other `AsIoVec`.
+unsafe impl Sync for Bytes {}
 
-impl Buffer {
-	/// Wraps `memory`, spanning its full length.
-	pub fn new(memory: Arc<dyn Memory>) -> Buffer {
-		let len = memory.len();
-		Buffer {
-			memory,
-			offset: 0,
-			len,
+// SAFETY: the vector is never resized, so its elements stay put for the
+// lifetime of `self`, and `as_iovec` names the whole of it.
+unsafe impl AsIoVec for Bytes {
+	fn as_iovec(&self) -> IoVec {
+		IoVec {
+			ptr: UnsafeCell::raw_get(self.0.as_ptr()),
+			len: self.0.len(),
 		}
 	}
+}
 
+/// Bytes for I/O transfers.
+///
+/// A `Buffer` implements [`AsIoVec`], and every operation takes its buffer by
+/// value. Cloning is cheap and shares the bytes: pass `buffer.clone()` to an
+/// operation and keep the original to read the bytes back afterwards.
+///
+/// Use [`Buffer::zeroed`], [`Buffer::copy_from`], or `Buffer::from` a `Vec<u8>`
+/// / `Box<[u8]>` to allocate one, and [`Buffer::get_mut`] to read or write it
+/// once no other handle names the bytes.
+#[derive(Clone)]
+pub struct Buffer(Arc<Bytes>);
+
+impl Buffer {
 	/// Allocates `len` zeroed bytes.
 	pub fn zeroed(len: usize) -> Buffer {
 		Buffer::from(vec![0u8; len])
@@ -114,96 +82,41 @@ impl Buffer {
 		Buffer::from(bytes.to_vec())
 	}
 
-	/// Byte length of this view.
+	/// Byte length of the buffer.
 	pub fn len(&self) -> usize {
-		self.len
+		self.0.len()
 	}
 
-	/// Byte offset of this view within the underlying [`Memory`].
-	pub fn offset(&self) -> usize {
-		self.offset
-	}
-
-	/// Resolves this view's range into a raw pointer for I/O.
-	pub(crate) fn resolve(&self) -> Result<IoVec> {
-		self.memory.resolve(self.offset, self.len)
-	}
-
-	/// Moves the `Arc<dyn Memory>` out for keeping it alive in an `Entry`.
-	pub(crate) fn into_memory(self) -> Arc<dyn Memory> {
-		self.memory
-	}
-
-	/// Returns a narrower view starting at `offset` within this view.
-	pub fn slice(&self, offset: usize, len: usize) -> Buffer {
-		Buffer {
-			memory: self.memory.clone(),
-			offset: self.offset + offset,
-			len,
-		}
-	}
-
-	/// Returns a view with the first `bytes` removed.
-	pub fn skip(self, bytes: usize) -> Buffer {
-		let skipped = bytes.min(self.len);
-		Buffer {
-			memory: self.memory,
-			offset: self.offset + skipped,
-			len: self.len - skipped,
-		}
-	}
-
-	/// Returns a view truncated to at most the first `bytes`.
-	pub fn take(self, bytes: usize) -> Buffer {
-		Buffer {
-			memory: self.memory,
-			offset: self.offset,
-			len: self.len.min(bytes),
-		}
-	}
-
-	/// Returns the bytes if no other `Buffer` refers to this memory and no
-	/// operations are in flight; otherwise `None`.
+	/// Returns the bytes for reading or writing when no other `Buffer` handle
+	/// (including one an in-flight operation holds) names them; otherwise
+	/// `None`.
 	pub fn get_mut(&mut self) -> Option<&mut [u8]> {
-		let (offset, len) = (self.offset, self.len);
-		Arc::get_mut(&mut self.memory)?.get_mut(offset, len)
+		Arc::get_mut(&mut self.0).map(Bytes::as_mut_slice)
 	}
 }
 
 impl fmt::Debug for Buffer {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("Buffer")
-			.field("offset", &self.offset)
-			.field("len", &self.len)
-			.finish()
+		f.debug_struct("Buffer").field("len", &self.len()).finish()
+	}
+}
+
+// SAFETY: the `Arc` keeps the bytes in place for as long as the buffer is
+// alive, and every clone names the same range.
+unsafe impl AsIoVec for Buffer {
+	fn as_iovec(&self) -> IoVec {
+		self.0.as_iovec()
 	}
 }
 
 impl From<Vec<u8>> for Buffer {
 	fn from(bytes: Vec<u8>) -> Buffer {
-		let len = bytes.len();
-		Buffer {
-			memory: Arc::new(Bytes::new(bytes)),
-			offset: 0,
-			len,
-		}
+		Buffer(Arc::new(Bytes::new(bytes)))
 	}
 }
 
 impl From<Box<[u8]>> for Buffer {
 	fn from(bytes: Box<[u8]>) -> Buffer {
 		Buffer::from(bytes.into_vec())
-	}
-}
-
-impl<M: Memory + 'static> From<Arc<M>> for Buffer {
-	fn from(memory: Arc<M>) -> Buffer {
-		Buffer::new(memory)
-	}
-}
-
-impl From<Arc<dyn Memory>> for Buffer {
-	fn from(memory: Arc<dyn Memory>) -> Buffer {
-		Buffer::new(memory)
 	}
 }

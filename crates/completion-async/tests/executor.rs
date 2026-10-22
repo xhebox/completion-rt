@@ -16,7 +16,7 @@
 mod common;
 
 use std::future::Future;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use completion_async::{Buffer, File, StreamSocket, block_on, spawn, timeout};
+use completion_async::{Buffer, File, StreamSocket, block_on, spawn, spawn_local, timeout};
 
 /// A future that hands its waker to another thread on the first poll and
 /// stays pending until that thread raises `woken` and wakes it.
@@ -99,6 +99,66 @@ fn a_task_woken_from_another_thread_ends_block_on() {
 	finished
 		.recv_timeout(deadline)
 		.expect("block_on returns once the task is woken");
+}
+
+/// A task wake makes the task runnable, not the root: until the root's own
+/// waker is raised, nothing it awaits has changed, so polling it again is
+/// wasted work. A task that yields a few hundred times keeps the loop busy below
+/// the root; the root counts its own polls and expects only the first one and
+/// the wake that ends its wait.
+#[test]
+fn a_woken_task_does_not_poll_the_root_future() {
+	use std::cell::{Cell, RefCell};
+	use std::rc::Rc;
+
+	let root_polls = Rc::new(Cell::new(0));
+	let task_polls = Rc::new(Cell::new(0));
+	let stored = Rc::new(RefCell::new(None::<Waker>));
+	let done = Rc::new(Cell::new(false));
+	let count = Rc::clone(&root_polls);
+	let busy = Rc::clone(&task_polls);
+	let root = Rc::clone(&stored);
+	let finished = Rc::clone(&done);
+	block_on(std::future::poll_fn(move |cx| {
+		count.set(count.get() + 1);
+		if finished.get() {
+			return Poll::Ready(());
+		}
+		if root.borrow().is_none() {
+			*root.borrow_mut() = Some(cx.waker().clone());
+			let root = cx.waker().clone();
+			let busy = Rc::clone(&busy);
+			let finished = Rc::clone(&finished);
+			spawn_local(async move {
+				for _ in 0..300 {
+					// Wake once and finish on the next poll, so each turn
+					// through the loop leaves the task runnable again.
+					let mut first = true;
+					let busy = Rc::clone(&busy);
+					std::future::poll_fn(move |cx| {
+						busy.set(busy.get() + 1);
+						if std::mem::replace(&mut first, false) {
+							cx.waker().wake_by_ref();
+							Poll::Pending
+						} else {
+							Poll::Ready(())
+						}
+					})
+					.await;
+				}
+				finished.set(true);
+				root.wake();
+			});
+		}
+		Poll::Pending
+	}))
+	.unwrap();
+	assert_eq!(task_polls.get(), 600, "the task did not keep the loop busy");
+	assert_eq!(
+		root_polls.get(),
+		2,
+		"the root was polled without being woken"
+	);
 }
 
 /// kibotos notifies the reactor right after spawning a task, so a freshly
@@ -190,6 +250,64 @@ fn dropping_a_join_handle_detaches_the_task() {
 	);
 }
 
+/// A detached task's output has no receiver, so the executor drops it — and it
+/// does so where the task runs, never on whichever thread last let go of the
+/// task's waker.
+#[test]
+fn a_detached_task_drops_its_output_on_the_owning_thread() {
+	use std::sync::atomic::AtomicUsize;
+	use std::thread::ThreadId;
+
+	struct DropCount {
+		drops: Arc<AtomicUsize>,
+		owner: ThreadId,
+		on_owner: Arc<AtomicBool>,
+	}
+
+	impl Drop for DropCount {
+		fn drop(&mut self) {
+			self.drops.fetch_add(1, Ordering::SeqCst);
+			self.on_owner
+				.store(std::thread::current().id() == self.owner, Ordering::SeqCst);
+		}
+	}
+
+	common::init_logging();
+	let owner = std::thread::current().id();
+	let drops = Arc::new(AtomicUsize::new(0));
+	let on_owner = Arc::new(AtomicBool::new(false));
+	let produced = Arc::new(AtomicBool::new(false));
+	let finished = Arc::clone(&produced);
+	let task = spawn_local({
+		let drops = Arc::clone(&drops);
+		let on_owner = Arc::clone(&on_owner);
+		async move {
+			finished.store(true, Ordering::Release);
+			DropCount {
+				drops,
+				owner,
+				on_owner,
+			}
+		}
+	});
+	drop(task);
+	// One pass over the loop runs the detached task to completion.
+	block_on(async {}).unwrap();
+	assert!(
+		produced.load(Ordering::Acquire),
+		"the detached task never ran"
+	);
+	assert_eq!(
+		drops.load(Ordering::SeqCst),
+		1,
+		"the detached task's output was dropped more or less than once"
+	);
+	assert!(
+		on_owner.load(Ordering::SeqCst),
+		"the output was dropped on another thread"
+	);
+}
+
 #[test]
 fn a_task_can_drop_its_own_join_handle_while_finishing() {
 	use std::cell::{Cell, RefCell};
@@ -207,7 +325,7 @@ fn a_task_can_drop_its_own_join_handle_while_finishing() {
 	let own_handle = Rc::clone(&handle);
 	let flag = Rc::clone(&finish);
 	let task_wake = Rc::clone(&wake);
-	*handle.borrow_mut() = Some(spawn(std::future::poll_fn(move |cx| {
+	*handle.borrow_mut() = Some(spawn_local(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			drop(own_handle.borrow_mut().take());
 			return Poll::Ready(());
@@ -244,7 +362,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	let panic_next = Rc::new(Cell::new(false));
 	let flag = Rc::clone(&panic_next);
 	let (handoff, handed) = std::sync::mpsc::channel();
-	let mut task = spawn(std::future::poll_fn(move |cx| {
+	let mut task = spawn_local(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			panic!("task failed while waiting for I/O");
 		}
@@ -273,7 +391,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		std::pin::Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()))
 	}));
 	assert!(gone.is_err(), "joining a failed task parked forever");
-	let next = spawn(async { Rc::new(42) });
+	let next = spawn_local(async { Rc::new(42) });
 	assert_eq!(*block_on(next).unwrap(), 42);
 }
 
@@ -406,4 +524,49 @@ fn a_timeout_made_inside_a_spawned_task_fires_under_block_on() {
 	let task = spawn(async { timeout(Duration::from_millis(20)).await });
 	block_on(task).unwrap().unwrap();
 	assert!(start.elapsed() >= Duration::from_millis(20));
+}
+
+/// Two spawned tasks that wait on each other finish only if they run at the
+/// same time, so the pool must run them on two threads.
+#[test]
+fn spawned_tasks_run_in_parallel_on_the_worker_pool() {
+	common::init_logging();
+	let barrier = Arc::new(std::sync::Barrier::new(2));
+	let (left, right) = block_on(async {
+		let waiting = Arc::clone(&barrier);
+		let left = spawn(async move {
+			waiting.wait();
+			20
+		});
+		let waiting = Arc::clone(&barrier);
+		let right = spawn(async move {
+			waiting.wait();
+			22
+		});
+		(left.await, right.await)
+	})
+	.unwrap();
+	assert_eq!(left + right, 42);
+}
+
+/// A spawned task does its I/O on the thread that polls it, and its handle
+/// hands the result back to whichever thread awaits it.
+#[test]
+fn a_spawned_task_completes_across_threads() {
+	common::init_logging();
+	let (mut peer, socket) = socket_pair();
+	peer.write_all(b"hello").unwrap();
+	let task = spawn(async move {
+		let mut buffer = Buffer::zeroed(5);
+		socket
+			.recv_exact(buffer.clone())
+			.await
+			.into_result()
+			.unwrap();
+		buffer.get_mut().unwrap().to_vec()
+	});
+	let received = std::thread::spawn(move || block_on(task).unwrap())
+		.join()
+		.unwrap();
+	assert_eq!(received, b"hello");
 }

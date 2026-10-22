@@ -9,11 +9,13 @@ Completion-based async I/O for Rust: `io_uring` on Linux, IOCP on Windows, and a
 use completion_async::{Buffer, File, block_on};
 
 let file = File::new(std::fs::File::open("data")?);
-let buffer = Buffer::zeroed(5);
+let mut buffer = Buffer::zeroed(5);
 let read = block_on(async {
-	file.read_exact_at(&buffer, 0).await
+	// A clone is a cheap handle on the same bytes.
+	file.read_exact_at(buffer.clone(), 0).await
 })?;
 assert_eq!(read.into_result()?, 5);
+assert_eq!(buffer.get_mut().unwrap(), b"hello");
 ```
 
 ## How it works
@@ -35,11 +37,15 @@ Single-operation methods (`read_at`, `write_at`, `read`, `write`, `recv`, `send`
 
 ### Buffers
 
-Create a `Buffer` with `Buffer::zeroed`, `Buffer::copy_from` (copies a slice), or `Buffer::from` (takes a `Vec<u8>` or `Box<[u8]>` without copying), or wrap a custom `Arc<dyn Memory>` when you need shared or custom-managed backing memory. A `Buffer` is itself a view with `(offset, len)`; use `buffer.slice(offset, len)`, `buffer.skip(n)`, or `buffer.take(n)` to narrow it.
+Every I/O method takes its buffer by value as `impl AsIoVec`.
+
+A `Buffer` implements `AsIoVec`, and cloning one is cheap and shares the same bytes. Create a `Buffer` with `Buffer::zeroed`, `Buffer::copy_from` (copies a slice), or `Buffer::from` (takes a `Vec<u8>` or `Box<[u8]>` without copying). Pass `buffer.clone()` to an operation and keep the original: once the operation has landed, `buffer.get_mut()` returns the bytes, and it returns `None` while another clone or an in-flight operation still names them.
+
+Implement `unsafe trait AsIoVec` yourself if `Buffer` does not suite, such as a slice of a larger allocation, or a shared memory region.
 
 ### Cancellation
 
-Dropping an in-flight I/O future requests asynchronous cancellation and returns immediately without blocking. The runtime keeps the `Buffer` and descriptor alive in the background until the kernel finishes with them.
+Dropping an in-flight I/O future requests asynchronous cancellation and returns immediately without blocking. The runtime keeps the buffer and descriptor alive in the background until the kernel finishes with them.
 
 - For `File`, dropping a read or write is safe to retry at the same offset.
 - For `Stream`, `StreamSocket`, and `DatagramSocket`, the operation may complete in the kernel before cancellation takes effect, so any bytes already consumed are lost.

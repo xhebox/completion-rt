@@ -16,7 +16,7 @@
 mod common;
 
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use completion_async::{Buffer, File, StreamSocket, block_on, spawn, spawn_local, timeout};
+use completion_async::{Buffer, File, StreamSocket, block_on, spawn, timeout};
 
 /// A future that hands its waker to another thread on the first poll and
 /// stays pending until that thread raises `woken` and wakes it.
@@ -129,7 +129,7 @@ fn a_woken_task_does_not_poll_the_root_future() {
 			let root = cx.waker().clone();
 			let busy = Rc::clone(&busy);
 			let finished = Rc::clone(&finished);
-			spawn_local(async move {
+			spawn(async move {
 				for _ in 0..300 {
 					// Wake once and finish on the next poll, so each turn
 					// through the loop leaves the task runnable again.
@@ -278,7 +278,7 @@ fn a_detached_task_drops_its_output_on_the_owning_thread() {
 	let on_owner = Arc::new(AtomicBool::new(false));
 	let produced = Arc::new(AtomicBool::new(false));
 	let finished = Arc::clone(&produced);
-	let task = spawn_local({
+	let task = spawn({
 		let drops = Arc::clone(&drops);
 		let on_owner = Arc::clone(&on_owner);
 		async move {
@@ -325,7 +325,7 @@ fn a_task_can_drop_its_own_join_handle_while_finishing() {
 	let own_handle = Rc::clone(&handle);
 	let flag = Rc::clone(&finish);
 	let task_wake = Rc::clone(&wake);
-	*handle.borrow_mut() = Some(spawn_local(std::future::poll_fn(move |cx| {
+	*handle.borrow_mut() = Some(spawn(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			drop(own_handle.borrow_mut().take());
 			return Poll::Ready(());
@@ -362,7 +362,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	let panic_next = Rc::new(Cell::new(false));
 	let flag = Rc::clone(&panic_next);
 	let (handoff, handed) = std::sync::mpsc::channel();
-	let mut task = spawn_local(std::future::poll_fn(move |cx| {
+	let mut task = spawn(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			panic!("task failed while waiting for I/O");
 		}
@@ -391,7 +391,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		std::pin::Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()))
 	}));
 	assert!(gone.is_err(), "joining a failed task parked forever");
-	let next = spawn_local(async { Rc::new(42) });
+	let next = spawn(async { Rc::new(42) });
 	assert_eq!(*block_on(next).unwrap(), 42);
 }
 
@@ -474,7 +474,7 @@ fn calling_block_on_inside_a_running_block_on_panics_as_nested() {
 }
 
 #[test]
-fn a_handle_made_inside_block_on_submits_to_the_global_executor() {
+fn a_handle_made_inside_block_on_submits_to_the_threads_executor() {
 	common::init_logging();
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 	let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -496,7 +496,7 @@ fn a_handle_made_inside_block_on_submits_to_the_global_executor() {
 /// `StreamSocket::connect` reaches the thread's default executor on its own: the
 /// connection is made there, and the stream it hands back runs on the same one.
 #[test]
-fn a_connect_made_inside_block_on_uses_the_global_executor() {
+fn a_connect_made_inside_block_on_uses_the_threads_executor() {
 	common::init_logging();
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 	let addr = listener.local_addr().unwrap();
@@ -600,49 +600,4 @@ fn concurrent_threads_running_block_on_and_spawn_all_complete() {
 	for driver in drivers {
 		driver.join().unwrap();
 	}
-}
-
-/// Two spawned tasks that wait on each other finish only if they run at the
-/// same time, so the pool must run them on two threads.
-#[test]
-fn spawned_tasks_run_in_parallel_on_the_worker_pool() {
-	common::init_logging();
-	let barrier = Arc::new(std::sync::Barrier::new(2));
-	let (left, right) = block_on(async {
-		let waiting = Arc::clone(&barrier);
-		let left = spawn(async move {
-			waiting.wait();
-			20
-		});
-		let waiting = Arc::clone(&barrier);
-		let right = spawn(async move {
-			waiting.wait();
-			22
-		});
-		(left.await, right.await)
-	})
-	.unwrap();
-	assert_eq!(left + right, 42);
-}
-
-/// A spawned task does its I/O on the thread that polls it, and its handle
-/// hands the result back to whichever thread awaits it.
-#[test]
-fn a_spawned_task_completes_across_threads() {
-	common::init_logging();
-	let (mut peer, socket) = socket_pair();
-	peer.write_all(b"hello").unwrap();
-	let task = spawn(async move {
-		let mut buffer = Buffer::zeroed(5);
-		socket
-			.recv_exact(buffer.clone())
-			.await
-			.into_result()
-			.unwrap();
-		buffer.get_mut().unwrap().to_vec()
-	});
-	let received = std::thread::spawn(move || block_on(task).unwrap())
-		.join()
-		.unwrap();
-	assert_eq!(received, b"hello");
 }

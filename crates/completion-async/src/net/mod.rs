@@ -9,7 +9,7 @@ use completion_backend::{AsDescriptor, Op, OwnedDescriptor, OwnedSocket, Respons
 use socket2::SockAddr;
 
 use crate::Result;
-use crate::executor::{Handle, submit};
+use crate::executor::submit;
 use crate::io::{Outcome, drain, fill, transfer};
 use crate::memory::AsIoVec;
 
@@ -24,13 +24,13 @@ use crate::memory::AsIoVec;
 /// backend, handles passed to [`Stream::new`] must be opened with
 /// `FILE_FLAG_OVERLAPPED` (use [`Stream::pipe`], which sets it automatically).
 #[derive(Clone)]
-pub struct Stream(Arc<Handle<OwnedDescriptor>>);
+pub struct Stream(Arc<OwnedDescriptor>);
 
 impl Stream {
 	/// Wraps `stream`.
 	#[fastrace::trace]
 	pub fn new(stream: impl Into<OwnedDescriptor>) -> Stream {
-		Stream(Arc::new(Handle::new(stream.into())))
+		Stream(Arc::new(stream.into()))
 	}
 
 	/// Creates a connected pair of anonymous pipe streams `(reader, writer)`.
@@ -46,7 +46,7 @@ impl Stream {
 	/// Unwraps the underlying [`OwnedDescriptor`] if no clones of this handle
 	/// and no in-flight operations remain.
 	pub fn try_take(self) -> Option<OwnedDescriptor> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Performs a single read into `buf`.
@@ -90,13 +90,13 @@ impl Stream {
 ///
 /// Transfers use socket `recv`/`send` semantics.
 #[derive(Clone)]
-pub struct StreamSocket(Arc<Handle<OwnedSocket>>);
+pub struct StreamSocket(Arc<OwnedSocket>);
 
 impl StreamSocket {
 	/// Wraps `socket`.
 	#[fastrace::trace]
 	pub fn new(socket: impl Into<OwnedSocket>) -> StreamSocket {
-		StreamSocket(Arc::new(Handle::new(socket.into())))
+		StreamSocket(Arc::new(socket.into()))
 	}
 
 	/// Connects a new stream socket to `addr`.
@@ -108,7 +108,7 @@ impl StreamSocket {
 	/// Unwraps the underlying [`OwnedSocket`] if no clones of this handle
 	/// and no in-flight operations remain.
 	pub fn try_take(self) -> Option<OwnedSocket> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Performs a single receive into `buf`.
@@ -176,19 +176,19 @@ impl StreamSocket {
 
 /// Handle for a connected datagram socket.
 #[derive(Clone)]
-pub struct DatagramSocket(Arc<Handle<OwnedSocket>>);
+pub struct DatagramSocket(Arc<OwnedSocket>);
 
 impl DatagramSocket {
 	/// Wraps `socket`.
 	#[fastrace::trace]
 	pub fn new(socket: impl Into<OwnedSocket>) -> DatagramSocket {
-		DatagramSocket(Arc::new(Handle::new(socket.into())))
+		DatagramSocket(Arc::new(socket.into()))
 	}
 
 	/// Unwraps the underlying [`OwnedSocket`] if no clones of this handle and
 	/// no in-flight operations remain.
 	pub fn try_take(self) -> Option<OwnedSocket> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Performs a single receive into `buf`.
@@ -217,19 +217,19 @@ impl DatagramSocket {
 
 /// Handle for a listening socket.
 #[derive(Clone)]
-pub struct Listener(Arc<Handle<OwnedSocket>>);
+pub struct Listener(Arc<OwnedSocket>);
 
 impl Listener {
 	/// Wraps `listener`.
 	#[fastrace::trace]
 	pub fn new(listener: impl Into<OwnedSocket>) -> Listener {
-		Listener(Arc::new(Handle::new(listener.into())))
+		Listener(Arc::new(listener.into()))
 	}
 
 	/// Unwraps the underlying [`OwnedSocket`] if no clones of this handle and
 	/// no in-flight accept operations remain.
 	pub fn try_take(self) -> Option<OwnedSocket> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Accepts the next incoming connection on this listener.
@@ -296,9 +296,7 @@ impl<T: ToSockAddr + ?Sized> ToSockAddr for &T {
 	}
 }
 
-async fn connected(
-	connection: io::Result<(SockAddr, Arc<Handle<OwnedSocket>>)>,
-) -> Result<StreamSocket> {
+async fn connected(connection: io::Result<(SockAddr, Arc<OwnedSocket>)>) -> Result<StreamSocket> {
 	let (addr, socket) = connection?;
 	submit(Arc::clone(&socket), Op::Connect { addr }, ())?
 		.await
@@ -306,10 +304,10 @@ async fn connected(
 	Ok(StreamSocket(socket))
 }
 
-fn connect_socket(addr: SockAddr) -> io::Result<(SockAddr, Arc<Handle<OwnedSocket>>)> {
+fn connect_socket(addr: SockAddr) -> io::Result<(SockAddr, Arc<OwnedSocket>)> {
 	let socket = socket2::Socket::new(addr.domain(), socket2::Type::STREAM, None)?;
 	socket.set_nonblocking(true)?;
-	Ok((addr, Arc::new(Handle::new(OwnedSocket::from(socket)))))
+	Ok((addr, Arc::new(OwnedSocket::from(socket))))
 }
 
 #[cfg(unix)]

@@ -1,10 +1,9 @@
 //! Async I/O runtime built on OS completion backends (`io_uring`, IOCP, and
 //! `polling`).
 //!
-//! Run futures on the current thread's runtime with [`block_on`]. [`spawn`]
-//! runs a `Send` task on the work-stealing pool, and [`spawn_local`] pins a
-//! task to the current thread. The runtime is created with [`Config::default`]
-//! on first use, or from a custom [`Config`] by calling [`init`] first.
+//! Run futures on the current thread's runtime with [`block_on`] and
+//! [`spawn`]. The runtime is created with [`Config::default`] on first use, or
+//! from a custom [`Config`] by calling [`init`] first.
 //!
 //! A resource is wrapped in the handle whose operations it takes:
 //!
@@ -49,7 +48,7 @@ pub use completion_backend::{
 	AsDescriptor, BackendKind, BorrowedDescriptor, Config, Error, ErrorKind, IoVec,
 	OwnedDescriptor, OwnedSocket, Result,
 };
-pub use executor::{JoinHandle, block_on, init, spawn, spawn_local, timeout};
+pub use executor::{JoinHandle, block_on, init, spawn, timeout};
 pub use io::{File, OpenOptions, Outcome};
 pub use memory::{AsIoVec, Buffer};
 pub use net::{DatagramSocket, Listener, Stream, StreamSocket, ToSockAddr};

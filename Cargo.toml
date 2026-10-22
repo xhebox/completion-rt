@@ -12,7 +12,6 @@ repository = "https://github.com/xhebox/completion-rt"
 [workspace.dependencies]
 completion-backend = { version = "0.1.0", path = "crates/completion-backend" }
 async-task = "4.7"
-crossbeam-deque = "0.8"
 env_logger = "0.11"
 log = { version = "0.4.34", features = ["std", "kv"] }
 rustix = "1.1"

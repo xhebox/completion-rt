@@ -7,7 +7,7 @@ use completion_backend::{AsDescriptor, Op, OwnedDescriptor};
 use completion_backend::BorrowedDescriptor;
 
 use crate::Result;
-use crate::executor::{Handle, submit};
+use crate::executor::submit;
 
 /// Handle for a resource that signals readiness without moving bytes: a socket,
 /// and on unix an `eventfd`, `pidfd`, or `signalfd`; on Windows a waitable
@@ -20,19 +20,19 @@ use crate::executor::{Handle, submit};
 /// }
 /// ```
 #[derive(Clone)]
-pub struct Readiness(Arc<Handle<OwnedDescriptor>>);
+pub struct Readiness(Arc<OwnedDescriptor>);
 
 impl Readiness {
 	/// Wraps `descriptor`.
 	#[fastrace::trace]
 	pub fn new(descriptor: impl Into<OwnedDescriptor>) -> Readiness {
-		Readiness(Arc::new(Handle::new(descriptor.into())))
+		Readiness(Arc::new(descriptor.into()))
 	}
 
 	/// Unwraps the underlying [`OwnedDescriptor`] if no clones of this handle
 	/// and no in-flight waits remain.
 	pub fn try_take(self) -> Option<OwnedDescriptor> {
-		Arc::into_inner(self.0).map(Handle::into_inner)
+		Arc::into_inner(self.0)
 	}
 
 	/// Waits once until the descriptor becomes readable.

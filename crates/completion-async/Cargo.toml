@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 completion-backend.workspace = true
 async-task.workspace = true
-crossbeam-deque.workspace = true
 fastrace = "0.7.19"
 log.workspace = true
 scopeguard.workspace = true

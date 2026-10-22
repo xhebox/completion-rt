@@ -25,11 +25,11 @@ assert_eq!(buffer.get_mut().unwrap(), b"hello");
 Wrap a standard OS resource in the matching handle:
 
 - `File` for positioned file I/O (`read_at`, `write_at`, `sync`, `flush`, `allocate`, `punch`).
-- `Stream` for pipes, PTYs, and TAPs (`read`, `write`).
-- `StreamSocket` for stream sockets (`recv`, `send`, `recv_exact`, `send_all`, fd passing, `shutdown`, `hangup`).
-- `DatagramSocket` for datagram sockets (`recv`, `send`, fd passing).
+- `Stream` for non-seekable byte streams such as pipes (`pipe`, `read`, `write`, `read_exact`, `write_all`).
+- `StreamSocket` for stream sockets (`recv`, `send`, `recv_exact`, `send_all`, `shutdown`, `hangup`).
+- `DatagramSocket` for datagram sockets (`recv`, `send`).
 - `Listener` for listening sockets (`accept`).
-- `Readiness` for descriptors that only signal readiness (such as `eventfd`, `pidfd`, or `signalfd`).
+- `Readiness` for descriptors and waitable handles that only signal readiness (such as a socket, an `eventfd`, `pidfd`, or `signalfd` on unix, or an event or process handle on Windows).
 
 Handles are `Send + Sync`, cheap to clone, and not bound to a specific executor: each operation submits to the executor driving the current thread when its future is first polled.
 
@@ -52,11 +52,11 @@ Dropping an in-flight I/O future requests asynchronous cancellation and returns 
 
 ## Platform notes
 
-- Linux `io_uring` requires kernel 5.11 or newer (`Stream::hangup` requires 5.13+). On 6.15+, the `completion-backend/iowait` feature re-enables counting idle ring waits as system iowait.
-- On Windows with the IOCP backend, files passed to `File::new` must be opened with `FILE_FLAG_OVERLAPPED` (use `completion_async::OpenOptions`, which sets it automatically), and `Readiness` is not supported.
+- Linux `io_uring` requires kernel 5.11 or newer (`StreamSocket::hangup` requires 5.13+). On 6.15+, the `completion-backend/iowait` feature re-enables counting idle ring waits as system iowait.
+- On Windows with the IOCP backend, handles passed to `File::new` and `Stream::new` must be opened with `FILE_FLAG_OVERLAPPED` (use `completion_async::OpenOptions` and `Stream::pipe`, which set it automatically).
 
 ## Development
 
-- `task build`, `task check`, `task test`. `check` never rewrites files; `task fmt` does. `test` passes `CLI_ARGS` to nextest: `task test -- -E 'test(cancel)'`. Run `task lock` after changing dependencies.
+- `task check`, `task test`. `test` passes `CLI_ARGS` to nextest: `task test -- -E 'test(cancel)'`.
 - Logging goes through the `log` facade only; tests get a logger from `tests/common`.
 - Test through the public API in `crates/*/tests/`, scratch files via `common::tempdir(tag)`. A bug fix starts with a test that fails without it.

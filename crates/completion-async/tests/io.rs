@@ -4,9 +4,7 @@ mod common;
 
 use std::io;
 
-#[cfg(unix)]
-use completion_async::Stream;
-use completion_async::{Buffer, ErrorKind, File, OpenOptions, block_on};
+use completion_async::{Buffer, ErrorKind, File, OpenOptions, Stream, block_on};
 
 #[test]
 fn a_direct_open_asks_the_kernel_for_direct_io() {
@@ -41,16 +39,10 @@ fn a_direct_open_asks_the_kernel_for_direct_io() {
 /// A pipe is a stream, not a file: it has no offset to name, and its transfers
 /// move the descriptor's own position instead. The console's rotated output and
 /// its stdin are pipes.
-///
-/// Windows: an anonymous pipe is a synchronous handle, which a completion port
-/// cannot own.
-#[cfg(unix)]
 #[test]
 fn a_pipe_transfers_at_its_own_position() {
-	let (reader, writer) = std::io::pipe().unwrap();
+	let (reader, writer) = Stream::pipe().unwrap();
 	common::init_logging();
-	let reader = Stream::new(reader);
-	let writer = Stream::new(writer);
 
 	let payload: Buffer = Buffer::copy_from(b"hello");
 	let moved = block_on(writer.write(payload.clone())).unwrap().unwrap();
@@ -69,22 +61,22 @@ fn a_pipe_transfers_at_its_own_position() {
 /// completion hands it back for the second, and dropping the future leaves it
 /// in the entry of the round still in flight. The reactor frees it only when
 /// that round finishes.
-#[cfg(unix)]
 #[test]
 fn a_dropped_read_exact_keeps_its_memory_until_the_kernel_finishes() {
-	use std::io::Write;
 	use std::task::Poll;
 	use std::time::Duration;
 
 	use completion_async::timeout;
 
-	let (reader, mut writer) = std::io::pipe().unwrap();
+	let (stream, writer) = Stream::pipe().unwrap();
 	common::init_logging();
-	let stream = Stream::new(reader);
 	let (buffer, live) = common::tracked(8);
 	let payload = buffer.clone();
 	drop(buffer);
-	writer.write_all(b"first").unwrap();
+	block_on(writer.write_all(Buffer::copy_from(b"first")))
+		.unwrap()
+		.into_result()
+		.unwrap();
 
 	let mut read = Box::pin(stream.read_exact(payload));
 	block_on(async {

@@ -1,5 +1,4 @@
 use std::io;
-use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -21,8 +20,6 @@ const MIN_RING_ENTRIES: u32 = 2;
 /// `-1` (`u64::MAX`), interpreted by the kernel as the descriptor's current
 /// file position (`IORING_FEAT_RW_CUR_POS`, Linux 5.6+).
 const CURRENT_POSITION: u64 = u64::MAX;
-
-const MAX_FDS: usize = 8;
 
 /// `user_data` for `IORING_OP_ASYNC_CANCEL` SQEs. SlotMap keys have odd
 /// versions, so `0` never collides with an operation key.
@@ -62,110 +59,9 @@ impl Wake for Signal {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Kind {
 	Count,
-	CountWithFds,
 	Accepted,
 	Done,
 	Hangup,
-}
-
-/// Heap-allocated `msghdr`, `iovec`, control buffer, and descriptors kept
-/// stable in memory until the `RecvMsg` or `SendMsg` SQE completes.
-struct Control {
-	msg: Box<libc::msghdr>,
-	_iov: Box<libc::iovec>,
-	_cmsg: Box<[u8]>,
-	_fds: Vec<OwnedDescriptor>,
-}
-
-// SAFETY: all pointers inside `msg` point to heap allocations owned by this
-// `Control` (`_iov`, `_cmsg`), whose addresses remain stable across moves.
-unsafe impl Send for Control {}
-
-impl Control {
-	fn receive(buf: *mut u8, len: usize) -> Control {
-		let mut iov = Box::new(libc::iovec {
-			iov_base: buf.cast(),
-			iov_len: len,
-		});
-		let space =
-			(unsafe { libc::CMSG_SPACE((MAX_FDS * size_of::<libc::c_int>()) as u32) }) as usize;
-		let mut cmsg = vec![0u8; space].into_boxed_slice();
-		let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-		msg.msg_iov = iov.as_mut() as *mut libc::iovec;
-		msg.msg_iovlen = 1;
-		msg.msg_control = cmsg.as_mut_ptr().cast();
-		msg.msg_controllen = cmsg.len() as _;
-		Control {
-			msg,
-			_iov: iov,
-			_cmsg: cmsg,
-			_fds: Vec::new(),
-		}
-	}
-
-	fn send(buf: *const u8, len: usize, fds: Vec<OwnedDescriptor>) -> io::Result<Control> {
-		if fds.len() > MAX_FDS {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"too many descriptors",
-			));
-		}
-		let mut iov = Box::new(libc::iovec {
-			iov_base: buf.cast_mut().cast(),
-			iov_len: len,
-		});
-		let bytes = fds.len() * size_of::<libc::c_int>();
-		let space = (unsafe { libc::CMSG_SPACE(bytes as u32) }) as usize;
-		let mut cmsg = vec![0u8; space].into_boxed_slice();
-		let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-		msg.msg_iov = iov.as_mut() as *mut libc::iovec;
-		msg.msg_iovlen = 1;
-		msg.msg_control = cmsg.as_mut_ptr().cast();
-		msg.msg_controllen = (unsafe { libc::CMSG_LEN(bytes as u32) }) as _;
-		unsafe {
-			let header = cmsg.as_mut_ptr().cast::<libc::cmsghdr>();
-			(*header).cmsg_level = libc::SOL_SOCKET;
-			(*header).cmsg_type = libc::SCM_RIGHTS;
-			(*header).cmsg_len = msg.msg_controllen as _;
-			let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
-			for (index, fd) in fds.iter().enumerate() {
-				*data.add(index) = fd.as_raw_fd();
-			}
-		}
-		Ok(Control {
-			msg,
-			_iov: iov,
-			_cmsg: cmsg,
-			_fds: fds,
-		})
-	}
-
-	fn message(&mut self) -> *mut libc::msghdr {
-		&mut *self.msg
-	}
-
-	fn take_fds(&mut self) -> Vec<OwnedDescriptor> {
-		let mut out = Vec::new();
-		let msg: *mut libc::msghdr = &mut *self.msg;
-		let mut header = unsafe { libc::CMSG_FIRSTHDR(msg) };
-		while !header.is_null() {
-			let (level, kind) = unsafe { ((*header).cmsg_level, (*header).cmsg_type) };
-			if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-				let length = (unsafe { (*header).cmsg_len } as usize)
-					- (unsafe { libc::CMSG_LEN(0) }) as usize;
-				let count = length / size_of::<libc::c_int>();
-				let data = unsafe { libc::CMSG_DATA(header) }.cast::<libc::c_int>();
-				for index in 0..count {
-					let fd = unsafe { *data.add(index) };
-					// SAFETY: the kernel put this descriptor in the process,
-					// and nothing else in it owns the number.
-					out.push(unsafe { OwnedDescriptor::from_raw_fd(fd) });
-				}
-			}
-			header = unsafe { libc::CMSG_NXTHDR(msg, header) };
-		}
-		out
-	}
 }
 
 pub struct Uring<T = ()> {
@@ -194,9 +90,6 @@ unsafe impl<T: Send> Send for Uring<T> {}
 /// What the kernel still holds for one operation, and what its completion
 /// reports, kept until the completion arrives.
 struct Active<T> {
-	/// The message area an operation carrying descriptors reads through, and
-	/// where a receive's descriptors land.
-	control: Option<Control>,
 	/// The address a connect names. The kernel reads it when the request runs,
 	/// so it lives in a box of its own until the completion arrives.
 	_addr: Option<Box<SockAddr>>,
@@ -207,11 +100,10 @@ struct Active<T> {
 }
 
 impl<T> Active<T> {
-	/// An operation whose completion reports `kind`, and that leaves the kernel
-	/// nothing to read through beyond the request itself.
+	/// An operation whose completion reports `kind`, with nothing extra for the
+	/// kernel to hold beyond the request itself.
 	fn new(kind: Kind, data: T) -> Active<T> {
 		Active {
-			control: None,
 			_addr: None,
 			kind,
 			data,
@@ -220,7 +112,7 @@ impl<T> Active<T> {
 }
 
 /// What the mechanism reported, as the operation's own result.
-fn completion(kind: Kind, result: i32, control: Option<Control>) -> Result<Response> {
+fn completion(kind: Kind, result: i32) -> Result<Response> {
 	if result < 0 {
 		let errno = -result;
 		return Err(if errno == Errno::CANCELED.raw_os_error() {
@@ -232,10 +124,6 @@ fn completion(kind: Kind, result: i32, control: Option<Control>) -> Result<Respo
 	let moved = result as usize;
 	Ok(match kind {
 		Kind::Count => Response::Count(moved),
-		Kind::CountWithFds => Response::CountWithFds(
-			moved,
-			control.map_or_else(Vec::new, |mut area| area.take_fds()),
-		),
 		Kind::Accepted => Response::Accepted(unsafe { OwnedSocket::from_raw_fd(result) }),
 		Kind::Done | Kind::Hangup => Response::Done,
 	})
@@ -416,13 +304,7 @@ impl<T> Uring<T> {
 					}
 					continue;
 				}
-				let Some(Active {
-					control,
-					kind,
-					data,
-					..
-				}) = active.remove(key)
-				else {
+				let Some(Active { kind, data, .. }) = active.remove(key) else {
 					// A poll can report twice — a multishot one whose hangup was
 					// already taken as the result — and then has nothing left to
 					// say.
@@ -434,7 +316,7 @@ impl<T> Uring<T> {
 					// caller can re-issue if it still wants to wait.
 					Err(Error::from(io::Error::from(io::ErrorKind::WouldBlock)))
 				} else {
-					completion(kind, cqe.result(), control)
+					completion(kind, cqe.result())
 				};
 				complete(token, data, reported);
 				landed += 1;
@@ -506,8 +388,8 @@ impl<T> Uring<T> {
 		if self.sqpoll {
 			// SQPOLL consumes submissions itself but needs a syscall to wake its
 			// sleeping thread. A wake that fails leaves the request queued all the
-			// same, so the operation stays with the ring — its control area may
-			// not be freed while the kernel can still read it.
+			// same, so the operation stays with the ring — what its entry holds for
+			// the kernel may not be freed while the kernel can still read it.
 			self.ring.submit()?;
 		}
 		Ok(id)
@@ -595,45 +477,9 @@ impl<T> Uring<T> {
 				let request = opcode::Recv::new(raw, buf.ptr, capped(buf.len)).build();
 				self.queue(request, Active::new(Kind::Count, data), None)
 			}
-			Op::RecvWithFds { buf } => {
-				// The control area the kernel writes a receive's descriptors into
-				// moves into the operation's `active` entry.
-				let mut area = Control::receive(buf.ptr, buf.len);
-				let message = area.message();
-				let request = opcode::RecvMsg::new(raw, message)
-					.flags(libc::MSG_CMSG_CLOEXEC as u32)
-					.build();
-				self.queue(
-					request,
-					Active {
-						control: Some(area),
-						..Active::new(Kind::CountWithFds, data)
-					},
-					None,
-				)
-			}
-			Op::Send { buf, fds } => {
-				// The descriptors a send carries move into the control area the
-				// kernel reads through, and that area into the operation's
-				// `active` entry.
-				let (request, control) = if fds.is_empty() {
-					(
-						opcode::Send::new(raw, buf.ptr, capped(buf.len)).build(),
-						None,
-					)
-				} else {
-					let mut area = Control::send(buf.ptr, buf.len, fds)?;
-					let message = area.message();
-					(opcode::SendMsg::new(raw, message).build(), Some(area))
-				};
-				self.queue(
-					request,
-					Active {
-						control,
-						..Active::new(Kind::Count, data)
-					},
-					None,
-				)
+			Op::Send { buf } => {
+				let request = opcode::Send::new(raw, buf.ptr, capped(buf.len)).build();
+				self.queue(request, Active::new(Kind::Count, data), None)
 			}
 			Op::Connect { addr } => {
 				self.refuse_unpollable("connect")?;
@@ -688,7 +534,7 @@ impl<T> Driver<T> for Uring<T> {
 			return;
 		}
 		let entry = opcode::AsyncCancel::new(id).build().user_data(CANCEL_TOKEN);
-		let _ = self.push(entry).and_then(|()| self.ring.submit());
+		drop(self.push(entry).and_then(|()| self.ring.submit()));
 	}
 
 	fn cancel_all(&mut self) {

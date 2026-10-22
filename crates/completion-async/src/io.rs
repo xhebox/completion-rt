@@ -15,7 +15,7 @@ use crate::memory::AsIoVec;
 #[derive(Debug)]
 pub struct Outcome<T> {
 	/// Progress accumulated before the operation finished, failed, or was cancelled
-	/// (e.g. number of bytes transferred or [`Received`](crate::Received)).
+	/// (e.g. number of bytes transferred).
 	pub value: T,
 	/// `Ok(())` if the operation completed in full, or `Err` if it stopped early.
 	pub result: Result<()>,
@@ -132,7 +132,7 @@ pub(crate) async fn drain<D: AsDescriptor + 'static, M: AsIoVec>(
 /// IOCP requires before a [`std::fs::File`] can be handed to [`File`]; the
 /// portable backend takes either mode.
 pub struct OpenOptions {
-	inner: std::fs::OpenOptions,
+	inner: fs::OpenOptions,
 	direct: bool,
 }
 
@@ -146,7 +146,7 @@ impl OpenOptions {
 	/// Creates a blank set of options.
 	pub fn new() -> OpenOptions {
 		OpenOptions {
-			inner: std::fs::OpenOptions::new(),
+			inner: fs::OpenOptions::new(),
 			direct: false,
 		}
 	}

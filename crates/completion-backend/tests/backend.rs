@@ -62,15 +62,22 @@ fn a_backend_is_send() {
 	assert_send::<Backend>();
 }
 
-#[cfg(unix)]
 mod waits {
 	use std::io::Write;
+	use std::net::{TcpListener, TcpStream};
 	use std::time::Duration;
 
 	use completion_backend::{AsDescriptor, Backend, Config, Op};
 
 	/// How long one `poll` may block before `drain` polls again.
 	const TIMEOUT: Duration = Duration::from_secs(5);
+
+	fn pair() -> (TcpStream, TcpStream) {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+		let (reader, _) = listener.accept().unwrap();
+		(reader, writer)
+	}
 
 	/// Polls until `backend` is idle, returning each completion as `(id, data, succeeded)`.
 	fn drain(backend: &mut Backend<u32>) -> Vec<(u64, u32, bool)> {
@@ -95,7 +102,7 @@ mod waits {
 	#[test]
 	fn a_finished_wait_leaves_nothing_behind() {
 		let mut backend: Backend<u32> = Backend::new(&Config::default()).unwrap();
-		let (reader, mut writer) = std::io::pipe().unwrap();
+		let (reader, mut writer) = pair();
 		let id = backend
 			.submit(reader.as_descriptor(), Op::Readable, 1)
 			.unwrap();
@@ -110,7 +117,7 @@ mod waits {
 			.unwrap();
 		assert!(backend.is_idle());
 
-		let (reader, mut writer) = std::io::pipe().unwrap();
+		let (reader, mut writer) = pair();
 		let next = backend
 			.submit(reader.as_descriptor(), Op::Readable, 2)
 			.unwrap();
@@ -124,7 +131,7 @@ mod waits {
 	#[test]
 	fn a_cancelled_wait_is_not_dispatched_when_its_descriptor_turns_ready() {
 		let mut backend: Backend<u32> = Backend::new(&Config::default()).unwrap();
-		let (reader, mut writer) = std::io::pipe().unwrap();
+		let (reader, mut writer) = pair();
 		let id = backend
 			.submit(reader.as_descriptor(), Op::Readable, 7)
 			.unwrap();

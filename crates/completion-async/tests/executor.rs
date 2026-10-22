@@ -36,7 +36,7 @@ fn handed_over(woken: Arc<AtomicBool>, handoff: Sender<Waker>) -> impl Future<Ou
 			return Poll::Ready(());
 		}
 		if let Some(handoff) = handoff.take() {
-			let _ = handoff.send(cx.waker().clone());
+			drop(handoff.send(cx.waker().clone()));
 		}
 		Poll::Pending
 	})
@@ -205,12 +205,12 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 	completed.expect("a self-waking task starved real I/O or the timer");
 }
 
-fn socket_pair() -> (std::net::TcpStream, completion_async::StreamSocket) {
-	let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-	let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+fn socket_pair() -> (TcpStream, StreamSocket) {
+	let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+	let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 	let (stream, _) = listener.accept().unwrap();
 	stream.set_nonblocking(true).unwrap();
-	(peer, completion_async::StreamSocket::new(stream))
+	(peer, StreamSocket::new(stream))
 }
 
 /// The deadline is fixed when the timer is constructed, not when it is first
@@ -221,7 +221,7 @@ fn a_timeout_held_past_its_duration_fires_on_its_first_poll() {
 	common::init_logging();
 	let timeout = timeout(Duration::from_millis(5));
 	std::thread::sleep(Duration::from_millis(30));
-	let started = std::time::Instant::now();
+	let started = Instant::now();
 	block_on(timeout).unwrap().unwrap();
 	assert!(
 		started.elapsed() < Duration::from_millis(5),
@@ -375,7 +375,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		.unwrap();
 	panic_next.set(true);
 	handed.try_recv().unwrap().wake();
-	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block_on(async {})));
+	let caught = catch_unwind(AssertUnwindSafe(|| block_on(async {})));
 	let panic = caught.expect_err("a task panic must leave block_on");
 	assert_eq!(
 		panic.downcast_ref::<&str>(),
@@ -387,7 +387,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 		.unwrap()
 		.unwrap();
 	assert!(!live.alive(), "unwinding kept the I/O buffer");
-	let gone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+	let gone = catch_unwind(AssertUnwindSafe(|| {
 		std::pin::Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()))
 	}));
 	assert!(gone.is_err(), "joining a failed task parked forever");
@@ -460,9 +460,9 @@ fn a_task_can_spawn_a_child_and_await_it() {
 #[test]
 fn calling_block_on_inside_a_running_block_on_panics_as_nested() {
 	let result = catch_unwind(AssertUnwindSafe(|| {
-		let _ = block_on(async {
-			let _ = block_on(async {});
-		});
+		drop(block_on(async {
+			drop(block_on(async {}));
+		}));
 	}));
 	let payload = result.expect_err("a nested call must panic");
 	let message = payload
@@ -524,6 +524,82 @@ fn a_timeout_made_inside_a_spawned_task_fires_under_block_on() {
 	let task = spawn(async { timeout(Duration::from_millis(20)).await });
 	block_on(task).unwrap().unwrap();
 	assert!(start.elapsed() >= Duration::from_millis(20));
+}
+
+/// Yields once: the task comes back through the loop's wake rather than
+/// finishing in the poll that started it.
+fn yield_once() -> impl Future<Output = ()> {
+	let mut first = true;
+	std::future::poll_fn(move |cx| {
+		if std::mem::replace(&mut first, false) {
+			cx.waker().wake_by_ref();
+			Poll::Pending
+		} else {
+			Poll::Ready(())
+		}
+	})
+}
+
+/// Eight threads `block_on`-ing round after round, each spawning readers and
+/// yielding tasks and awaiting them, all finish: every wake a task raises
+/// reaches the loop that can run it, whatever else is in flight. A wake lost
+/// under that load parks a loop with a runnable task in hand, so the run is
+/// watched by a deadline rather than left to the harness.
+#[test]
+fn concurrent_threads_running_block_on_and_spawn_all_complete() {
+	common::init_logging();
+	let directory = common::tempdir("completion-concurrent").unwrap();
+	let path = directory.path().join("data");
+	std::fs::write(&path, [0x5a; 64]).unwrap();
+	let (done, finished) = std::sync::mpsc::channel();
+	let mut drivers = Vec::new();
+	for _ in 0..8 {
+		let file = File::new(common::open(&path).unwrap());
+		let done = done.clone();
+		drivers.push(std::thread::spawn(move || {
+			common::init_logging();
+			for _ in 0..32 {
+				block_on(async {
+					let mut readers = Vec::new();
+					for _ in 0..4 {
+						let buffer: Buffer = Buffer::zeroed(64);
+						let whole = buffer.clone();
+						let file = file.clone();
+						readers.push(spawn(async move {
+							assert_eq!(file.read_at(whole, 0).await.unwrap(), 64);
+							buffer
+						}));
+					}
+					let yielding = spawn(async {
+						for _ in 0..8 {
+							yield_once().await;
+						}
+						22
+					});
+					for read in readers {
+						let mut read = read.await;
+						assert_eq!(
+							read.get_mut().unwrap().to_vec(),
+							[0x5a; 64],
+							"a spawned read landed on the wrong bytes"
+						);
+					}
+					assert_eq!(yielding.await, 22);
+				})
+				.unwrap();
+			}
+			let _ = done.send(());
+		}));
+	}
+	drop(done);
+	for _ in 0..drivers.len() {
+		finished
+			.recv_timeout(Duration::from_secs(30))
+			.expect("a thread parked in block_on with a runnable task in hand");
+	}
+	for driver in drivers {
+		driver.join().unwrap();
+	}
 }
 
 /// Two spawned tasks that wait on each other finish only if they run at the

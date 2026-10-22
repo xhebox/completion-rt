@@ -1,7 +1,13 @@
 use std::io;
 use std::net::Shutdown;
 
-use completion_backend::BorrowedDescriptor;
+use completion_backend::{BorrowedDescriptor, OwnedDescriptor};
+
+/// Creates a connected pair of pipes: the reader reads what the writer writes.
+pub(super) fn pipe() -> io::Result<(OwnedDescriptor, OwnedDescriptor)> {
+	let (reader, writer) = io::pipe()?;
+	Ok((OwnedDescriptor::from(reader), OwnedDescriptor::from(writer)))
+}
 
 pub(super) fn shutdown(descriptor: BorrowedDescriptor<'_>, how: Shutdown) -> io::Result<()> {
 	let how = match how {

@@ -12,10 +12,40 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use completion_async::{Buffer, Config, File, StreamSocket, block_on, init};
+use completion_async::{BackendKind, Buffer, Config, File, StreamSocket, block_on, init};
 
 #[test]
 fn a_hangup_waits_out_the_half_close_for_the_peer_to_go() {
+	let (peer, stream) = UnixStream::pair().unwrap();
+	common::init_logging();
+	let stream: StreamSocket = StreamSocket::new(stream);
+	let gone = Arc::new(AtomicBool::new(false));
+	let flag = Arc::clone(&gone);
+	let peer = std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(50));
+		peer.shutdown(Shutdown::Write).unwrap();
+		std::thread::sleep(Duration::from_millis(150));
+		flag.store(true, Ordering::Release);
+		drop(peer);
+	});
+
+	block_on(stream.hangup()).unwrap().unwrap();
+	assert!(
+		gone.load(Ordering::Acquire),
+		"the hangup resolved on the half-close"
+	);
+	peer.join().unwrap();
+}
+
+/// The portable backend answers a hangup out of the poller's interrupt report:
+/// a half-close is not one, so the wait outlasts it just as the ring's does.
+#[test]
+fn the_portable_backend_waits_out_the_half_close_for_the_peer_to_go() {
+	init(Config {
+		backend: BackendKind::Portable,
+		..Config::default()
+	})
+	.unwrap();
 	let (peer, stream) = UnixStream::pair().unwrap();
 	common::init_logging();
 	let stream: StreamSocket = StreamSocket::new(stream);

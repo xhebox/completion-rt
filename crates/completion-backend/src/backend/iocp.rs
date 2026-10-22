@@ -9,6 +9,7 @@ use std::io;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, OwnedHandle};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Wake, Waker};
 use std::time::Duration;
 
@@ -20,10 +21,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Networking::WinSock::{
 	ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNIX, AcceptEx, INVALID_SOCKET, IPPROTO_TCP,
-	LPFN_CONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SO_UPDATE_ACCEPT_CONTEXT,
+	LPFN_CONNECTEX, SIO_BASE_HANDLE, SIO_GET_EXTENSION_FUNCTION_POINTER, SO_UPDATE_ACCEPT_CONTEXT,
 	SO_UPDATE_CONNECT_CONTEXT, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
-	SOCKET, SOL_SOCKET, WSA_FLAG_OVERLAPPED, WSABUF, WSAEINVAL, WSAGetLastError, WSAID_CONNECTEX,
-	WSAIoctl, WSARecv, WSASend, WSASocketW, bind, closesocket, getsockname, setsockopt,
+	SOCKET, SOCKET_ERROR, SOL_SOCKET, WSA_FLAG_OVERLAPPED, WSABUF, WSAEINVAL, WSAGetLastError,
+	WSAID_CONNECTEX, WSAIoctl, WSARecv, WSASend, WSASocketW, bind, closesocket, getsockname,
+	setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{
 	FILE_ALLOCATION_INFO, FILE_END_OF_FILE_INFO, FileAllocationInfo, FileEndOfFileInfo,
@@ -34,6 +36,9 @@ use windows_sys::Win32::System::IO::{
 	OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
 };
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
+use windows_sys::Win32::System::Threading::{
+	INFINITE, RegisterWaitForSingleObject, UnregisterWaitEx, WT_EXECUTEONLYONCE,
+};
 use windows_sys::core::GUID;
 
 use super::{Config, Driver, IoVec, Op, Response};
@@ -56,6 +61,18 @@ const STATUS_END_OF_FILE: usize = 0xC000_0011;
 /// takes `sizeof(SOCKADDR) + 16` per address, and `SOCKADDR_STORAGE` is the
 /// widest `SOCKADDR`.
 const ADDRESS_LEN: u32 = (size_of::<SOCKADDR_STORAGE>() + 16) as u32;
+/// `IOCTL_AFD_POLL`: what asks the AFD driver to report a socket's readiness
+/// through the completion port the request names.
+const IOCTL_AFD_POLL: u32 = 0x0001_2024;
+/// The AFD events each readiness wait arms.
+const AFD_POLL_RECEIVE: u32 = 0x0001;
+const AFD_POLL_RECEIVE_EXPEDITED: u32 = 0x0002;
+const AFD_POLL_SEND: u32 = 0x0004;
+const AFD_POLL_DISCONNECT: u32 = 0x0008;
+const AFD_POLL_ABORT: u32 = 0x0010;
+const AFD_POLL_LOCAL_CLOSE: u32 = 0x0020;
+const AFD_POLL_ACCEPT: u32 = 0x0080;
+const AFD_POLL_CONNECT_FAIL: u32 = 0x0100;
 /// The `ERROR_OPERATION_ABORTED` a cancelled completion reports. The status
 /// block carries an `NTSTATUS`, and only the kernel's own conversion reads one:
 /// masking the low word turns `STATUS_CANCELLED` into `ERROR_NOT_OWNER`, which
@@ -99,6 +116,83 @@ impl Wake for Port {
 	}
 }
 
+/// One handle an `IOCTL_AFD_POLL` names, with the events it waits for and the
+/// status the driver reports them under.
+#[repr(C)]
+struct AfdPollHandleInfo {
+	handle: HANDLE,
+	events: u32,
+	status: NTSTATUS,
+}
+
+/// The request `IOCTL_AFD_POLL` takes and fills in: the AFD driver reads it
+/// when the request runs, so it is boxed and kept in the operation's `active`
+/// entry until the completion lands.
+#[repr(C)]
+struct AfdPollInfo {
+	timeout: i64,
+	number_of_handles: u32,
+	exclusive: u32,
+	handles: [AfdPollHandleInfo; 1],
+}
+
+// SAFETY: the request is plain data holding one opaque kernel handle; the box
+// that owns it stays where it is, and the reactor is the only reader of it.
+unsafe impl Send for AfdPollInfo {}
+
+/// What a waitable handle's single wait answers with: the port to post the
+/// completion to, the `OVERLAPPED` that completion names, and whether one of
+/// the two paths has already posted it.
+struct WaitPacket {
+	port: Arc<Port>,
+	ov_ptr: usize,
+	fired: AtomicBool,
+}
+
+/// The thread-pool callback a waitable handle's wait runs once the object
+/// signals: posting the completion turns the signal into the operation's
+/// result.
+unsafe extern "system" fn wait_callback(context: *mut core::ffi::c_void, _timed_out: bool) {
+	// SAFETY: `context` points at a `WaitPacket` its `RegisteredWait` keeps
+	// alive until `UnregisterWaitEx(.., INVALID_HANDLE_VALUE)` returns, which is
+	// after any running callback has returned.
+	let packet = unsafe { &*(context as *const WaitPacket) };
+	// A cancel that posted first owns the completion; the other one does nothing.
+	if !packet.fired.swap(true, Ordering::AcqRel) {
+		// SAFETY: the packet names the `OVERLAPPED` box the operation is filed
+		// under, which lives until the completion is collected.
+		unsafe {
+			PostQueuedCompletionStatus(
+				packet.port.handle(),
+				0,
+				0,
+				packet.ov_ptr as *mut OVERLAPPED,
+			);
+		}
+	}
+}
+
+/// One waitable handle's registration with the thread pool, kept in the
+/// operation's `active` entry until the completion is collected.
+struct RegisteredWait {
+	wait_object: HANDLE,
+	packet: Arc<WaitPacket>,
+}
+
+// SAFETY: registration and unregistration are plain Win32 calls on a
+// thread-pool wait, which either thread may make.
+unsafe impl Send for RegisteredWait {}
+
+impl Drop for RegisteredWait {
+	fn drop(&mut self) {
+		if !self.wait_object.is_null() {
+			// `INVALID_HANDLE_VALUE` waits for a running callback to return, so
+			// the packet the callback reads stays alive for the whole of it.
+			unsafe { UnregisterWaitEx(self.wait_object, INVALID_HANDLE_VALUE) };
+		}
+	}
+}
+
 pub struct Iocp<T = ()> {
 	port: Arc<Port>,
 	/// What the kernel holds for an operation, filed under a key of this map:
@@ -129,6 +223,11 @@ struct Active<T> {
 	/// allocation and a punch report the completion itself, and it is kept here
 	/// because the reactor's entry may be gone by the time the packet arrives.
 	bytes: bool,
+	/// The `IOCTL_AFD_POLL` request the kernel reads and fills in while it is in
+	/// flight.
+	_afd: Option<Box<AfdPollInfo>>,
+	/// The thread-pool wait a waitable handle is waited on with.
+	wait: Option<RegisteredWait>,
 	/// The caller's data, handed back with the completion.
 	data: T,
 }
@@ -239,6 +338,8 @@ impl<T> Iocp<T> {
 				accept,
 				connect: None,
 				bytes,
+				_afd: None,
+				wait: None,
 				data,
 			}
 		});
@@ -482,13 +583,6 @@ impl<T> Iocp<T> {
 		Ok(key.data().as_ffi())
 	}
 
-	fn unsupported() -> io::Error {
-		io::Error::new(
-			io::ErrorKind::Unsupported,
-			"this operation is not implemented on the IOCP backend",
-		)
-	}
-
 	/// Routes a byte transfer by what the descriptor is: a stream socket takes
 	/// `recv`/`send`, and a handle — or a transfer that names an offset — takes
 	/// `ReadFile`/`WriteFile`.
@@ -506,6 +600,112 @@ impl<T> Iocp<T> {
 			}
 			(offset, fd) => self.issue(as_handle(fd)?, read, buf, offset.unwrap_or(0), data),
 		}
+	}
+
+	/// Waits until the socket's AFD endpoint reports one of `events`, through a
+	/// request that completes on the port once it does.
+	fn afd_poll(&mut self, socket: SOCKET, events: u32, data: T) -> Result<u64> {
+		let base = base_socket(socket) as HANDLE;
+		self.associate(base)?;
+		let mut afd = Box::new(AfdPollInfo {
+			// A wait the cancel ends is the only end it has.
+			timeout: i64::MAX,
+			number_of_handles: 1,
+			exclusive: 0,
+			handles: [AfdPollHandleInfo {
+				handle: base,
+				events,
+				status: 0,
+			}],
+		});
+		let afd_ptr = &mut *afd as *mut AfdPollInfo as *mut core::ffi::c_void;
+		let (key, ov_ptr) = self.enqueue(base, 0, None, false, data);
+		// The driver reads the request once the call returns, so the box moves
+		// into the entry that keeps it where the pointer says it is.
+		self.active[key]._afd = Some(afd);
+		let mut done = 0u32;
+		// SAFETY: `afd_ptr` names the box `active` now holds, and `ov_ptr` names
+		// the box it holds too; both outlive the call and the completion.
+		let ok = unsafe {
+			DeviceIoControl(
+				base,
+				IOCTL_AFD_POLL,
+				afd_ptr,
+				size_of::<AfdPollInfo>() as u32,
+				afd_ptr,
+				size_of::<AfdPollInfo>() as u32,
+				&mut done,
+				ov_ptr,
+			)
+		};
+		if ok == 0 {
+			let error = unsafe { GetLastError() } as i32;
+			if error != IO_PENDING as i32 {
+				self.refuse(key, error);
+			}
+		}
+		Ok(key.data().as_ffi())
+	}
+
+	/// Waits until the waitable kernel object `handle` signals.
+	fn wait_handle(&mut self, handle: HANDLE, data: T) -> Result<u64> {
+		let (key, ov_ptr) = self.enqueue(handle, 0, None, false, data);
+		let packet = Arc::new(WaitPacket {
+			port: Arc::clone(&self.port),
+			ov_ptr: ov_ptr as usize,
+			fired: AtomicBool::new(false),
+		});
+		let mut wait_object: HANDLE = std::ptr::null_mut();
+		// SAFETY: the callback is handed `packet`, which the registration filed
+		// below keeps alive until it is unregistered, and a one-shot wait runs it
+		// at most once.
+		let ok = unsafe {
+			RegisterWaitForSingleObject(
+				&mut wait_object,
+				handle,
+				Some(wait_callback),
+				Arc::as_ptr(&packet) as *const core::ffi::c_void,
+				INFINITE,
+				WT_EXECUTEONLYONCE,
+			)
+		};
+		if ok == 0 {
+			// Nothing was registered, so no callback can name the packet.
+			self.refuse(key, unsafe { GetLastError() } as i32);
+			return Ok(key.data().as_ffi());
+		}
+		self.active[key].wait = Some(RegisteredWait {
+			wait_object,
+			packet,
+		});
+		Ok(key.data().as_ffi())
+	}
+
+	/// Asks the kernel to stop what it still holds for `active`, or answers a
+	/// waitable handle's wait whose object has not signalled.
+	fn cancel_active(port: &Port, active: &mut Active<T>) {
+		if let Some(wait) = &active.wait {
+			// A wait already taken by its callback is on its way to the port, and
+			// the cancel has nothing left to say.
+			if !wait.packet.fired.swap(true, Ordering::AcqRel) {
+				active.ov.submit_error = ERROR_OPERATION_ABORTED as i32;
+				// SAFETY: the box stays in `active` until its completion is
+				// collected, which is after this packet arrives.
+				unsafe {
+					PostQueuedCompletionStatus(
+						port.handle(),
+						0,
+						0,
+						&*active.ov as *const Overlapped as *mut OVERLAPPED,
+					);
+				}
+			}
+			return;
+		}
+		let pointer = &*active.ov as *const Overlapped as *const OVERLAPPED;
+		// SAFETY: the box stays in `active` until its completion is collected,
+		// which is after the kernel has stopped touching the OVERLAPPED.
+		unsafe { CancelIoEx(active.ov.handle, pointer) };
 	}
 }
 
@@ -695,12 +895,30 @@ fn as_socket(fd: BorrowedDescriptor<'_>) -> io::Result<SOCKET> {
 	}
 }
 
-/// The error a wait for readiness reports: a completion port has none.
-fn no_readiness() -> Error {
-	Error::from(io::Error::new(
-		io::ErrorKind::Unsupported,
-		"a completion port has no readiness wait",
-	))
+/// The AFD endpoint handle behind `socket`, which an `IOCTL_AFD_POLL` runs on.
+/// A socket no layered provider wraps answers with its own handle.
+fn base_socket(socket: SOCKET) -> SOCKET {
+	let mut base: SOCKET = INVALID_SOCKET;
+	let mut bytes = 0u32;
+	// SAFETY: the control writes one `SOCKET` into `base`, which is the size
+	// `bytes` reports.
+	let rc = unsafe {
+		WSAIoctl(
+			socket,
+			SIO_BASE_HANDLE,
+			std::ptr::null(),
+			0,
+			&mut base as *mut SOCKET as *mut core::ffi::c_void,
+			size_of::<SOCKET>() as u32,
+			&mut bytes,
+			std::ptr::null_mut(),
+			None,
+		)
+	};
+	if rc == SOCKET_ERROR || base == INVALID_SOCKET {
+		return socket;
+	}
+	base
 }
 
 impl<T> Driver<T> for Iocp<T> {
@@ -730,18 +948,44 @@ impl<T> Driver<T> for Iocp<T> {
 				.punch(as_handle(fd)?, offset, len, data)
 				.map_err(Error::from),
 			Op::Recv { buf } => self.transfer(as_socket(fd)?, buf, false, data),
-			Op::Send { buf, fds } => {
-				if !fds.is_empty() {
-					return Err(Self::unsupported().into());
-				}
-				self.transfer(as_socket(fd)?, buf, true, data)
-			}
-			Op::RecvWithFds { .. } => Err(Self::unsupported().into()),
+			Op::Send { buf } => self.transfer(as_socket(fd)?, buf, true, data),
 			Op::Accept => self.accept(as_socket(fd)?, data).map_err(Error::from),
 			Op::Connect { addr } => self
 				.connect(as_socket(fd)?, &addr, data)
 				.map_err(Error::from),
-			Op::Readable | Op::Writable | Op::Hangup => Err(no_readiness()),
+			Op::Readable => match fd {
+				BorrowedDescriptor::Socket(socket) => self.afd_poll(
+					socket.as_raw_socket() as SOCKET,
+					AFD_POLL_RECEIVE
+						| AFD_POLL_RECEIVE_EXPEDITED
+						| AFD_POLL_ACCEPT
+						| AFD_POLL_DISCONNECT
+						| AFD_POLL_ABORT
+						| AFD_POLL_LOCAL_CLOSE
+						| AFD_POLL_CONNECT_FAIL,
+					data,
+				),
+				BorrowedDescriptor::Handle(handle) => {
+					self.wait_handle(handle.as_raw_handle(), data)
+				}
+			},
+			Op::Writable => match fd {
+				BorrowedDescriptor::Socket(socket) => self.afd_poll(
+					socket.as_raw_socket() as SOCKET,
+					AFD_POLL_SEND | AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE | AFD_POLL_CONNECT_FAIL,
+					data,
+				),
+				BorrowedDescriptor::Handle(handle) => {
+					self.wait_handle(handle.as_raw_handle(), data)
+				}
+			},
+			// A half-close is a `DISCONNECT` the driver reports as readable, so a
+			// wait for the peer gone listens for the aborted connection alone.
+			Op::Hangup => self.afd_poll(
+				as_socket(fd)?,
+				AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE | AFD_POLL_CONNECT_FAIL,
+				data,
+			),
 		}
 	}
 
@@ -749,21 +993,15 @@ impl<T> Driver<T> for Iocp<T> {
 		// The id is the key the operation is filed under: one the port never
 		// handed out, or one whose slot has been taken again since, names nothing.
 		let key = DefaultKey::from(KeyData::from_ffi(id));
-		let Some(active) = self.active.get(key) else {
+		let Some(active) = self.active.get_mut(key) else {
 			return;
 		};
-		let pointer = &*active.ov as *const Overlapped as *const OVERLAPPED;
-		// SAFETY: the box stays in `active` until its completion is collected,
-		// which is after the kernel has stopped touching the OVERLAPPED.
-		unsafe { CancelIoEx(active.ov.handle, pointer) };
+		Self::cancel_active(&self.port, active);
 	}
 
 	fn cancel_all(&mut self) {
-		for active in self.active.values() {
-			let pointer = &*active.ov as *const Overlapped as *const OVERLAPPED;
-			// SAFETY: the box stays in `active` until its completion is collected,
-			// which is after the kernel has stopped touching the OVERLAPPED.
-			unsafe { CancelIoEx(active.ov.handle, pointer) };
+		for active in self.active.values_mut() {
+			Self::cancel_active(&self.port, active);
 		}
 	}
 
@@ -870,11 +1108,8 @@ impl<T> Drop for Iocp<T> {
 		// A packet may still be on its way for an operation the reactor let go
 		// of, and the box it points at must not go before it arrives. Ask the
 		// kernel to stop what it still holds, then collect what it returns.
-		for active in self.active.values() {
-			let pointer = &*active.ov as *const Overlapped as *const OVERLAPPED;
-			// SAFETY: the box stays in `active` until its completion is
-			// collected below.
-			unsafe { CancelIoEx(active.ov.handle, pointer) };
+		for active in self.active.values_mut() {
+			Self::cancel_active(&self.port, active);
 		}
 		let mut entries: [OVERLAPPED_ENTRY; 64] = unsafe { std::mem::zeroed() };
 		while !self.active.is_empty() {

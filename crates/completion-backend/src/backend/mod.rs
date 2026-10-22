@@ -4,7 +4,7 @@ use std::time::Duration;
 use enum_dispatch::enum_dispatch;
 use socket2::SockAddr;
 
-use crate::desc::{BorrowedDescriptor, OwnedDescriptor, OwnedSocket};
+use crate::desc::{BorrowedDescriptor, OwnedSocket};
 use crate::error::Result;
 
 #[cfg(not(any(unix, windows)))]
@@ -72,13 +72,8 @@ pub enum Op {
 	Punch { offset: u64, len: u64 },
 	/// Receives into `buf`.
 	Recv { buf: IoVec },
-	/// Receives into `buf`, also capturing ancillary file descriptors (`SCM_RIGHTS`).
-	RecvWithFds { buf: IoVec },
-	/// Sends from `buf`, attaching `fds` in an ancillary control message (`SCM_RIGHTS`).
-	Send {
-		buf: IoVec,
-		fds: Vec<OwnedDescriptor>,
-	},
+	/// Sends from `buf`.
+	Send { buf: IoVec },
 	/// Accepts the next connection on a listening socket.
 	Accept,
 	/// Connects a socket to `addr`.
@@ -96,8 +91,6 @@ pub enum Op {
 pub enum Response {
 	/// Number of bytes transferred.
 	Count(usize),
-	/// Number of bytes and ancillary descriptors received.
-	CountWithFds(usize, Vec<OwnedDescriptor>),
 	/// Accepted connection socket.
 	Accepted(OwnedSocket),
 	/// Operation completed without a return value (`Fsync`, `Flush`, `Allocate`, `Punch`, `Connect`, `Readable`, `Writable`, `Hangup`).

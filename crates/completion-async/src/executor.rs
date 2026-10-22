@@ -113,7 +113,7 @@ impl Pool {
 				scopeguard::defer! {
 					self.lock().workers -= 1;
 				}
-				let _ = worker_loop();
+				drop(worker_loop());
 			})
 			.is_err()
 		{
@@ -171,7 +171,7 @@ fn worker_loop() -> Result<()> {
 			let Some(runnable) = next_runnable() else {
 				break;
 			};
-			let _ = catch_unwind(AssertUnwindSafe(|| runnable.run()));
+			drop(catch_unwind(AssertUnwindSafe(|| runnable.run())));
 		}
 		shared.parked.store(true, Ordering::SeqCst);
 		POOL.register_sleeper(&shared);

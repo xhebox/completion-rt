@@ -3,14 +3,14 @@ members = ["crates/completion-backend", "crates/completion-async"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96.1"
 license = "MIT"
 repository = "https://github.com/xhebox/completion-rt"
 
 [workspace.dependencies]
-completion-backend = { version = "0.1.0", path = "crates/completion-backend" }
+completion-backend = { version = "0.2.0", path = "crates/completion-backend" }
 async-task = "4.7"
 env_logger = "0.11"
 log = { version = "0.4.34", features = ["std", "kv"] }

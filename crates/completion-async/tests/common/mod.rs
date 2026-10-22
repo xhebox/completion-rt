@@ -14,7 +14,7 @@ use std::sync::{Arc, Once};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 
-use completion_async::{Buffer, Error, IoVec, Memory, Result};
+use completion_async::{AsIoVec, IoVec};
 
 /// Runs a future to completion on this thread, woken by whoever completes it.
 ///
@@ -153,62 +153,54 @@ pub(crate) fn tempdir(tag: &str) -> io::Result<Scratch> {
 	})
 }
 
-/// A zeroed [`Buffer`] whose memory reports when the last handle to it drops.
+/// Zeroed bytes whose memory reports when the last handle to them drops.
 ///
-/// A test that watches a reactor let go of a buffer cannot count an `Arc` it no
-/// longer holds one of; the memory's own drop is the same fact, seen from the
-/// other side.
-pub(crate) fn tracked(len: usize) -> (Buffer, Tracked) {
+/// A test that watches a reactor let go of a buffer cannot count a clone it no
+/// longer holds; the memory's own drop is the same fact, seen from the other
+/// side.
+pub(crate) fn tracked(len: usize) -> (TrackedBuffer, Tracked) {
 	let alive = Arc::new(AtomicBool::new(true));
-	let memory = TrackedMemory {
+	let inner = TrackedInner {
 		bytes: vec![0; len],
 		alive: Arc::clone(&alive),
 	};
-	(Buffer::new(Arc::new(memory)), Tracked(alive))
+	(TrackedBuffer(Arc::new(inner)), Tracked(alive))
 }
 
 /// Whether the memory behind a [`tracked`] buffer is still alive.
 pub(crate) struct Tracked(Arc<AtomicBool>);
 
 impl Tracked {
-	/// True while any [`Buffer`] naming the memory is alive.
+	/// True while any handle to the memory is alive.
 	pub(crate) fn alive(&self) -> bool {
 		self.0.load(Relaxed)
 	}
 }
 
+/// A clone-sharing handle on the tracked bytes.
+#[derive(Clone)]
+pub(crate) struct TrackedBuffer(Arc<TrackedInner>);
+
 /// Plain bytes that note their own end: the last handle dropping is what a test
 /// watches to see the reactor let go.
-struct TrackedMemory {
+struct TrackedInner {
 	bytes: Vec<u8>,
 	alive: Arc<AtomicBool>,
 }
 
-impl Drop for TrackedMemory {
+impl Drop for TrackedInner {
 	fn drop(&mut self) {
 		self.alive.store(false, Relaxed);
 	}
 }
 
-// SAFETY: the bytes are owned outright and only reached through `resolve`,
-// which checks every extent against them.
-unsafe impl Memory for TrackedMemory {
-	fn resolve(&self, offset: usize, len: usize) -> Result<IoVec> {
-		let fits = offset
-			.checked_add(len)
-			.is_some_and(|end| end <= self.bytes.len());
-		if !fits {
-			return Err(Error::from(io::Error::from(io::ErrorKind::InvalidInput)));
+// SAFETY: the bytes are owned outright and stay in place for the lifetime of
+// the value, so the whole range stays valid and writable.
+unsafe impl AsIoVec for TrackedBuffer {
+	fn as_iovec(&self) -> IoVec {
+		IoVec {
+			ptr: self.0.bytes.as_ptr().cast_mut(),
+			len: self.0.bytes.len(),
 		}
-		// SAFETY: `offset..offset + len` is inside the vector, which the buffer
-		// keeps alive.
-		Ok(IoVec {
-			ptr: unsafe { self.bytes.as_ptr().add(offset).cast_mut() },
-			len,
-		})
-	}
-
-	fn len(&self) -> usize {
-		self.bytes.len()
 	}
 }

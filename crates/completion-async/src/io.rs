@@ -7,8 +7,8 @@ use std::sync::Arc;
 use completion_backend::{AsDescriptor, Error, IoVec, Op, Response};
 
 use crate::Result;
-use crate::executor::with_rt_or_default;
-use crate::memory::Buffer;
+use crate::executor::{Handle, submit};
+use crate::memory::AsIoVec;
 
 /// Result of a multi-step transfer, preserving partial progress (`value`)
 /// alongside the completion status (`result`).
@@ -34,40 +34,68 @@ impl<T> Outcome<T> {
 }
 
 /// Submits the single transfer `op` builds over `buffer`'s range.
-pub(crate) async fn transfer(
-	fd: Arc<dyn AsDescriptor>,
-	buffer: Buffer,
-	op: impl FnOnce(IoVec) -> Op,
+pub(crate) async fn transfer<D: AsDescriptor + 'static, M: AsIoVec>(
+	fd: Arc<Handle<D>>,
+	buffer: M,
+	op: impl FnOnce(IoVec) -> Op + Send,
 ) -> Result<usize> {
-	let op = op(buffer.resolve()?);
-	match with_rt_or_default(|rt| rt.submit(fd, op, Some(buffer.into_memory())))?.await? {
-		Response::Count(bytes) => Ok(bytes),
+	transfer_in(fd, buffer, op)
+		.await
+		.map(|(bytes, _memory)| bytes)
+}
+
+/// Like [`transfer`], but hands the buffer back so a loop can file its memory
+/// with the next round.
+async fn transfer_in<D: AsDescriptor + 'static, M: AsIoVec>(
+	fd: Arc<Handle<D>>,
+	buffer: M,
+	op: impl FnOnce(IoVec) -> Op + Send,
+) -> Result<(usize, M)> {
+	let op = op(buffer.as_iovec());
+	let (response, buffer) = submit(fd, op, buffer)?.await;
+	match response? {
+		Response::Count(bytes) => Ok((bytes, buffer)),
 		other => unreachable!("a transfer reports a count, not {other:?}"),
 	}
 }
 
-async fn repeat(
-	fd: Arc<dyn AsDescriptor>,
-	buffer: Buffer,
+async fn repeat<D: AsDescriptor + 'static, M: AsIoVec>(
+	fd: Arc<Handle<D>>,
+	buffer: M,
 	short: fn() -> io::Error,
-	mut make_op: impl FnMut(usize, IoVec) -> Op,
+	mut make_op: impl FnMut(usize, IoVec) -> Op + Send,
 ) -> Outcome<usize> {
+	// The loop owns the one buffer handle: each round moves it into the round's
+	// entry, and the completion hands it back for the next. A round dropped in
+	// flight keeps it in its entry until the kernel finishes.
+	let mut buffer = buffer;
+	let whole = buffer.as_iovec();
 	let mut done = 0;
-	while done < buffer.len() {
-		let remaining = buffer.clone().skip(done);
-		match transfer(Arc::clone(&fd), remaining, |iovec| make_op(done, iovec)).await {
-			Ok(0) => return Outcome::new(done, Err(Error::from(short()))),
-			Ok(bytes) => done += bytes,
+	while done < whole.len {
+		// SAFETY: `done < whole.len`, so the rest of the range is in the buffer.
+		let remaining = IoVec {
+			ptr: unsafe { whole.ptr.add(done) },
+			len: whole.len - done,
+		};
+		// Build the round's operation before submitting, so the closure handed to
+		// the runtime owns the operation rather than borrowing the range.
+		let op = make_op(done, remaining);
+		match transfer_in(Arc::clone(&fd), buffer, move |_| op).await {
+			Ok((0, _)) => return Outcome::new(done, Err(Error::from(short()))),
+			Ok((bytes, returned)) => {
+				buffer = returned;
+				done += bytes;
+			}
 			Err(error) => return Outcome::new(done, Err(error)),
 		}
 	}
 	Outcome::new(done, Ok(()))
 }
 
-pub(crate) async fn fill(
-	fd: Arc<dyn AsDescriptor>,
-	buffer: Buffer,
-	op: impl FnMut(usize, IoVec) -> Op,
+pub(crate) async fn fill<D: AsDescriptor + 'static, M: AsIoVec>(
+	fd: Arc<Handle<D>>,
+	buffer: M,
+	op: impl FnMut(usize, IoVec) -> Op + Send,
 ) -> Outcome<usize> {
 	repeat(
 		fd,
@@ -83,10 +111,10 @@ pub(crate) async fn fill(
 	.await
 }
 
-pub(crate) async fn drain(
-	fd: Arc<dyn AsDescriptor>,
-	buffer: Buffer,
-	op: impl FnMut(usize, IoVec) -> Op,
+pub(crate) async fn drain<D: AsDescriptor + 'static, M: AsIoVec>(
+	fd: Arc<Handle<D>>,
+	buffer: M,
+	op: impl FnMut(usize, IoVec) -> Op + Send,
 ) -> Outcome<usize> {
 	repeat(
 		fd,
@@ -218,7 +246,7 @@ impl OpenOptions {
 /// Every transfer takes an explicit byte offset and leaves the OS file cursor
 /// unchanged, so cloned handles can run concurrent transfers on the same file.
 #[derive(Clone)]
-pub struct File(Arc<fs::File>);
+pub struct File(Arc<Handle<fs::File>>);
 
 impl File {
 	/// Wraps `file`.
@@ -227,109 +255,84 @@ impl File {
 	/// `FILE_FLAG_OVERLAPPED` (see [`OpenOptions`]).
 	#[fastrace::trace]
 	pub fn new(file: impl Into<fs::File>) -> File {
-		File(Arc::new(file.into()))
+		File(Arc::new(Handle::new(file.into())))
 	}
 
 	/// Unwraps the underlying [`std::fs::File`] if no clones of this handle and
 	/// no in-flight operations remain.
 	pub fn try_take(self) -> Option<fs::File> {
-		Arc::into_inner(self.0)
+		Arc::into_inner(self.0).map(Handle::into_inner)
 	}
 
 	/// Performs a single read into `buf` at byte offset `offset`.
-	pub fn read_at(
+	pub fn read_at<M: AsIoVec>(
 		&self,
-		buf: impl Into<Buffer>,
+		buf: M,
 		offset: u64,
 	) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(
-			Arc::clone(&self.0) as Arc<dyn AsDescriptor>,
-			buf.into(),
-			move |iovec| Op::Read {
-				offset: Some(offset),
-				buf: iovec,
-			},
-		)
+		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Read {
+			offset: Some(offset),
+			buf: iovec,
+		})
 	}
 
 	/// Reads into `buf` starting at `offset` until the buffer is completely filled.
-	pub fn read_exact_at(
+	pub fn read_exact_at<M: AsIoVec>(
 		&self,
-		buf: impl Into<Buffer>,
+		buf: M,
 		offset: u64,
 	) -> impl Future<Output = Outcome<usize>> + 'static {
-		let buffer = buf.into();
-		fill(
-			Arc::clone(&self.0) as Arc<dyn AsDescriptor>,
-			buffer,
-			move |done, iovec| Op::Read {
-				offset: Some(offset + done as u64),
-				buf: iovec,
-			},
-		)
+		fill(Arc::clone(&self.0), buf, move |done, iovec| Op::Read {
+			offset: Some(offset + done as u64),
+			buf: iovec,
+		})
 	}
 
 	/// Performs a single write from `buf` at byte offset `offset`.
-	pub fn write_at(
+	pub fn write_at<M: AsIoVec>(
 		&self,
-		buf: impl Into<Buffer>,
+		buf: M,
 		offset: u64,
 	) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(
-			Arc::clone(&self.0) as Arc<dyn AsDescriptor>,
-			buf.into(),
-			move |iovec| Op::Write {
-				offset: Some(offset),
-				buf: iovec,
-			},
-		)
+		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Write {
+			offset: Some(offset),
+			buf: iovec,
+		})
 	}
 
 	/// Writes all bytes in `buf` starting at `offset`.
-	pub fn write_all_at(
+	pub fn write_all_at<M: AsIoVec>(
 		&self,
-		buf: impl Into<Buffer>,
+		buf: M,
 		offset: u64,
 	) -> impl Future<Output = Outcome<usize>> + 'static {
-		let buffer = buf.into();
-		drain(
-			Arc::clone(&self.0) as Arc<dyn AsDescriptor>,
-			buffer,
-			move |done, iovec| Op::Write {
-				offset: Some(offset + done as u64),
-				buf: iovec,
-			},
-		)
+		drain(Arc::clone(&self.0), buf, move |done, iovec| Op::Write {
+			offset: Some(offset + done as u64),
+			buf: iovec,
+		})
 	}
 
 	/// Flushes all modified file data and metadata to disk (`fsync` /
 	/// `FlushFileBuffers`).
 	pub fn sync(&self) -> impl Future<Output = Result<()>> + use<> {
-		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
-		async move {
-			with_rt_or_default(|rt| rt.submit(fd, Op::Fsync, None))?
-				.await
-				.map(|_response| ())
-		}
+		let fd = Arc::clone(&self.0);
+		async move { submit(fd, Op::Fsync, ())?.await.0.map(|_response| ()) }
 	}
 
 	/// Checks for deferred write-back errors (such as `ENOSPC` or `EIO`) without
 	/// forcing data to disk.
 	pub fn flush(&self) -> impl Future<Output = Result<()>> + use<> {
-		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
-		async move {
-			with_rt_or_default(|rt| rt.submit(fd, Op::Flush, None))?
-				.await
-				.map(|_response| ())
-		}
+		let fd = Arc::clone(&self.0);
+		async move { submit(fd, Op::Flush, ())?.await.0.map(|_response| ()) }
 	}
 
 	/// Preallocates disk space for `len` bytes starting at `offset`.
 	pub fn allocate(&self, offset: u64, len: u64) -> impl Future<Output = Result<()>> + use<> {
-		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
+		let fd = Arc::clone(&self.0);
 		async move {
-			with_rt_or_default(|rt| rt.submit(fd, Op::Allocate { offset, len }, None))?
+			submit(fd, Op::Allocate { offset, len }, ())?
 				.await
+				.0
 				.map(|_response| ())
 		}
 	}
@@ -337,10 +340,11 @@ impl File {
 	/// Deallocates storage for `len` bytes at `offset` and zeroes the range while
 	/// keeping the file's length unchanged (hole punching).
 	pub fn punch(&self, offset: u64, len: u64) -> impl Future<Output = Result<()>> + use<> {
-		let fd = Arc::clone(&self.0) as Arc<dyn AsDescriptor>;
+		let fd = Arc::clone(&self.0);
 		async move {
-			with_rt_or_default(|rt| rt.submit(fd, Op::Punch { offset, len }, None))?
+			submit(fd, Op::Punch { offset, len }, ())?
 				.await
+				.0
 				.map(|_response| ())
 		}
 	}

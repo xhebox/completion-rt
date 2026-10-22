@@ -24,8 +24,8 @@ fn seeded(contents: &[u8]) -> File {
 	File::new(common::open(path).unwrap())
 }
 
-/// A copy of `buf` names the whole of it: the copy holds its own handle on the
-/// memory, so it outlives the operation even when the caller's handle goes.
+/// A clone of `buf` names the whole of it: the clone shares the bytes, so it
+/// outlives the operation even when the caller's handle goes.
 fn whole(buf: &Buffer) -> Buffer {
 	buf.clone()
 }

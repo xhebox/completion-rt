@@ -53,16 +53,65 @@ fn a_pipe_transfers_at_its_own_position() {
 	let writer = Stream::new(writer);
 
 	let payload: Buffer = Buffer::copy_from(b"hello");
-	let moved = block_on(writer.write(payload.take(5))).unwrap().unwrap();
+	let moved = block_on(writer.write(payload.clone())).unwrap().unwrap();
 	assert_eq!(moved, 5);
 
 	let mut read: Buffer = Buffer::zeroed(5);
-	let moved = block_on(reader.read_exact(read.clone().take(5)))
+	let moved = block_on(reader.read_exact(read.clone()))
 		.unwrap()
 		.into_result()
 		.unwrap();
 	assert_eq!(moved, 5);
 	assert_eq!(read.get_mut().unwrap().to_vec(), b"hello");
+}
+
+/// A loop method owns its buffer one round at a time: the first round's
+/// completion hands it back for the second, and dropping the future leaves it
+/// in the entry of the round still in flight. The reactor frees it only when
+/// that round finishes.
+#[cfg(unix)]
+#[test]
+fn a_dropped_read_exact_keeps_its_memory_until_the_kernel_finishes() {
+	use std::io::Write;
+	use std::task::Poll;
+	use std::time::Duration;
+
+	use completion_async::timeout;
+
+	let (reader, mut writer) = std::io::pipe().unwrap();
+	common::init_logging();
+	let stream = Stream::new(reader);
+	let (buffer, live) = common::tracked(8);
+	let payload = buffer.clone();
+	drop(buffer);
+	writer.write_all(b"first").unwrap();
+
+	let mut read = Box::pin(stream.read_exact(payload));
+	block_on(async {
+		// The five bytes that are there fill the first round; the second one is
+		// filed for the rest of the buffer.
+		assert!(
+			std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await,
+			"the first round did not go in"
+		);
+		timeout(Duration::from_millis(50)).await.unwrap();
+		assert!(
+			std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await,
+			"the second round did not go in"
+		);
+	})
+	.unwrap();
+
+	drop(read);
+	assert!(
+		live.alive(),
+		"dropping the loop released memory a round still names"
+	);
+	// One pass over the reactor reaps the cancelled round.
+	block_on(timeout(Duration::from_millis(50)))
+		.unwrap()
+		.unwrap();
+	assert!(!live.alive(), "the finished round kept its memory");
 }
 
 /// A read that stops short of the buffer is the count it reached, not an

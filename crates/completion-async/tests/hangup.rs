@@ -54,13 +54,12 @@ fn a_hangup_survives_a_poll_the_kernel_ends_early() {
 	// the completions pile up unreaped while the poll is armed.
 	let mut hangup = Box::pin(stream.hangup());
 	let scratch = common::tempdir("completion-hangup-ended").unwrap();
-	let buf: Buffer = Buffer::zeroed(24);
 	let mut reads = Vec::new();
 	for index in 0..24usize {
 		let path = scratch.path().join(format!("data{index}"));
 		std::fs::write(&path, b"hello").unwrap();
 		let file = File::new(common::open(&path).unwrap());
-		reads.push(Box::pin(file.read_at(buf.slice(index, 1), 0)));
+		reads.push(Box::pin(file.read_at(Buffer::zeroed(1), 0)));
 	}
 	block_on(std::future::poll_fn(|cx| {
 		assert!(hangup.as_mut().poll(cx).is_pending());

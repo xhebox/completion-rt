@@ -187,8 +187,8 @@ impl Runtime {
 		})
 	}
 
-	fn drive(&mut self, timeout: Option<Duration>) -> Result<()> {
-		let within = self.reap_timers(timeout);
+	fn drive(&mut self, timeout: Option<Duration>, wakers: &mut Vec<Waker>) -> Result<()> {
+		let within = self.reap_timers(timeout, wakers);
 		let polled = self.backend.poll(within, |_id, op, response| {
 			if !op.result.is_null() {
 				// SAFETY: `op.result` points to the pinned `LocalSlot`, which
@@ -196,22 +196,26 @@ impl Runtime {
 				unsafe { *op.result = Some(response) };
 			}
 			drop(op.keepalive);
-			if let Some(waker) = op.waker {
-				waker.wake();
-			}
+			wakers.extend(op.waker);
 		});
-		self.reap_timers(None);
+		self.reap_timers(None, wakers);
 		polled
 	}
 
-	fn reap_timers(&mut self, timeout: Option<Duration>) -> Option<Duration> {
+	fn reap_timers(
+		&mut self,
+		timeout: Option<Duration>,
+		wakers: &mut Vec<Waker>,
+	) -> Option<Duration> {
+		if self.timers.is_empty() {
+			return timeout;
+		}
 		let now = Instant::now();
-		let mut expired = false;
+		let before = wakers.len();
 		let mut nearest: Option<Duration> = None;
 		self.timers.retain(|_, (deadline, waker)| {
 			if *deadline <= now {
-				expired = true;
-				waker.wake_by_ref();
+				wakers.push(std::mem::replace(waker, Waker::noop().clone()));
 				false
 			} else {
 				let rem = deadline.saturating_duration_since(now);
@@ -219,7 +223,7 @@ impl Runtime {
 				true
 			}
 		});
-		if expired {
+		if wakers.len() > before {
 			Some(Duration::ZERO)
 		} else {
 			match (timeout, nearest) {
@@ -256,12 +260,23 @@ impl Runtime {
 
 impl Drop for Runtime {
 	fn drop(&mut self) {
-		self.timers.clear();
-		while let Some(task) = self.scheduler.runnable.pop() {
-			task.abort();
-		}
 		self.backend.cancel_all();
-		while !self.backend.is_idle() && self.drive(None).is_ok() {}
+		let mut wakers = Vec::new();
+		while !self.backend.is_idle()
+			&& self
+				.backend
+				.poll(None, |_id, op, _response| {
+					drop(op.keepalive);
+					wakers.extend(op.waker);
+				})
+				.is_ok()
+		{}
+		for (_, (_, waker)) in self.timers.drain() {
+			wakers.push(waker);
+		}
+		for waker in wakers {
+			waker.wake();
+		}
 		while let Some(task) = self.scheduler.runnable.pop() {
 			task.abort();
 		}
@@ -305,7 +320,7 @@ impl<D: Send + 'static, M: Send + 'static> Future for LocalSlot<D, M> {
 		}
 		let result_ptr = this.result.get();
 		let id = this.id;
-		RT.with_borrow_mut(|rt| {
+		let old_waker = RT.with_borrow_mut(|rt| {
 			let op = rt
 				.as_mut()
 				.unwrap()
@@ -314,9 +329,12 @@ impl<D: Send + 'static, M: Send + 'static> Future for LocalSlot<D, M> {
 				.expect("in-flight operation missing");
 			op.result = result_ptr;
 			if op.waker.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
-				op.waker = Some(cx.waker().clone());
+				op.waker.replace(cx.waker().clone())
+			} else {
+				None
 			}
 		});
+		drop(old_waker);
 		Poll::Pending
 	}
 }
@@ -381,19 +399,23 @@ impl Future for Timer {
 		}
 		let waker = cx.waker().clone();
 		let deadline = this.deadline;
-		RT.with_borrow_mut(|rt| {
+		let old_waker = RT.with_borrow_mut(|rt| {
 			let rt = rt.get_or_insert_default();
 			match rt.timers.get_mut(this.key) {
 				Some((_, registered)) => {
 					if !registered.will_wake(&waker) {
-						*registered = waker;
+						Some(std::mem::replace(registered, waker))
+					} else {
+						None
 					}
 				}
 				None => {
 					this.key = rt.timers.insert((deadline, waker));
+					None
 				}
 			}
 		});
+		drop(old_waker);
 		Poll::Pending
 	}
 }
@@ -485,6 +507,7 @@ pub fn block_on<F: Future>(future: F) -> Result<F::Output> {
 	let mut cx = Context::from_waker(&waker);
 	let mut future = std::pin::pin!(future);
 	let mut output = None;
+	let mut wakers = Vec::new();
 
 	loop {
 		if output.is_none() && scheduler.root_woken.swap(false, Ordering::SeqCst) {
@@ -506,7 +529,7 @@ pub fn block_on<F: Future>(future: F) -> Result<F::Output> {
 		if scheduler.root_woken.load(Ordering::SeqCst) {
 			continue;
 		}
-		RT.with_borrow_mut(|rt| {
+		let res = RT.with_borrow_mut(|rt| {
 			let rt = rt.as_mut().unwrap();
 			rt.scheduler.parked.store(true, Ordering::SeqCst);
 			let timeout = if rt.scheduler.runnable.is_empty()
@@ -516,10 +539,14 @@ pub fn block_on<F: Future>(future: F) -> Result<F::Output> {
 			} else {
 				Some(Duration::ZERO)
 			};
-			let res = rt.drive(timeout);
+			let res = rt.drive(timeout, &mut wakers);
 			rt.scheduler.parked.store(false, Ordering::SeqCst);
 			res
-		})?;
+		});
+		for waker in wakers.drain(..) {
+			waker.wake();
+		}
+		res?;
 	}
 }
 

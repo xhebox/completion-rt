@@ -622,3 +622,121 @@ fn concurrent_threads_running_block_on_and_spawn_all_complete() {
 		driver.join().unwrap();
 	}
 }
+
+#[test]
+fn thread_exit_with_runnable_and_timer_tasks_holding_in_flight_io_does_not_uaf() {
+	for forget_handle in [false, true] {
+		let (_peer, socket) = socket_pair();
+		let (buffer, live) = common::tracked(64);
+		let payload = buffer.clone();
+		drop(buffer);
+
+		let (_peer2, socket2) = socket_pair();
+		let (buffer2, live2) = common::tracked(64);
+		let payload2 = buffer2.clone();
+		drop(buffer2);
+
+		let handle = std::thread::spawn(move || {
+			common::init_logging();
+			let (tx, rx) = std::sync::mpsc::channel::<Waker>();
+			let mut recv1 = Box::pin(socket.recv(payload));
+			let task1 = spawn(std::future::poll_fn(move |cx| {
+				assert!(recv1.as_mut().poll(cx).is_pending());
+				drop(tx.send(cx.waker().clone()));
+				Poll::Pending::<()>
+			}));
+			if forget_handle {
+				std::mem::forget(task1);
+			} else {
+				drop(task1);
+			}
+
+			let mut recv2 = Box::pin(socket2.recv(payload2));
+			let mut timer = Box::pin(timeout(Duration::from_secs(60)));
+			let task2 = spawn(std::future::poll_fn(move |cx| {
+				assert!(recv2.as_mut().poll(cx).is_pending());
+				assert!(timer.as_mut().poll(cx).is_pending());
+				Poll::Pending::<()>
+			}));
+			if forget_handle {
+				std::mem::forget(task2);
+			} else {
+				drop(task2);
+			}
+
+			// Poll both tasks once so their `LocalSlot`s arm `op.result` in the backend.
+			block_on(async {}).unwrap();
+
+			// Queue `task1` into `scheduler.runnable` after `block_on` has returned,
+			// then exit the thread so TLS `Runtime::drop` runs with `task1` in
+			// `scheduler.runnable` and `task2` in `timers`, both holding in-flight I/O.
+			rx.recv().unwrap().wake();
+		});
+
+		handle
+			.join()
+			.expect("thread exited cleanly without SIGSEGV");
+		assert!(
+			!live.alive(),
+			"in-flight buffer 1 leaked after Runtime::drop"
+		);
+		assert!(
+			!live2.alive(),
+			"in-flight buffer 2 leaked after Runtime::drop"
+		);
+	}
+}
+
+#[test]
+fn waker_dropping_in_flight_io_and_timer_during_drive_does_not_reenter_rt() {
+	use std::sync::Mutex;
+	use std::task::Wake;
+
+	struct DropOnWake {
+		in_flight: Mutex<Option<Box<dyn Send>>>,
+		inner: Waker,
+	}
+
+	impl Wake for DropOnWake {
+		fn wake(self: Arc<Self>) {
+			drop(self.in_flight.lock().unwrap().take());
+			self.inner.wake_by_ref();
+		}
+	}
+
+	common::init_logging();
+	let (_peer, socket) = socket_pair();
+	let (buffer, live) = common::tracked(32);
+	let payload = buffer.clone();
+	drop(buffer);
+
+	block_on(async move {
+		let mut slot = Some((
+			Box::pin(socket.recv(payload)),
+			Box::pin(timeout(Duration::from_secs(60))),
+		));
+		let mut short_timer = std::pin::pin!(timeout(Duration::from_millis(5)));
+
+		std::future::poll_fn(|cx| {
+			if let Some((mut recv, mut long_timer)) = slot.take() {
+				assert!(recv.as_mut().poll(cx).is_pending());
+				assert!(long_timer.as_mut().poll(cx).is_pending());
+				let custom_waker = Waker::from(Arc::new(DropOnWake {
+					in_flight: Mutex::new(Some(Box::new((recv, long_timer)))),
+					inner: cx.waker().clone(),
+				}));
+				let mut custom_cx = Context::from_waker(&custom_waker);
+				drop(short_timer.as_mut().poll(&mut custom_cx));
+				return Poll::Pending;
+			}
+			Poll::Ready(())
+		})
+		.await;
+	})
+	.unwrap();
+	// Reap the cancelled receive.
+	block_on(timeout(Duration::from_millis(10)))
+		.unwrap()
+		.unwrap();
+	assert!(!live.alive());
+}

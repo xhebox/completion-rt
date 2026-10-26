@@ -41,9 +41,6 @@ jobs:
         id: auth
 
       - name: Publish
-        run: |
-          # crates.io must have completion-backend indexed before completion-async, which depends on it, can be published.
-          cargo publish -p completion-backend --locked
-          cargo publish -p completion-async --locked
+        run: cargo publish --workspace --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

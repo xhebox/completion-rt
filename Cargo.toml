@@ -3,23 +3,31 @@ members = ["crates/completion-backend", "crates/completion-async"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.96.1"
 license = "MIT"
 repository = "https://github.com/xhebox/completion-rt"
 
 [workspace.dependencies]
-completion-backend = { version = "0.2.0", path = "crates/completion-backend" }
-async-task = "4.7"
+completion-backend = { version = "0.2.1", path = "crates/completion-backend" }
+assert2 = "0.4"
+compio = { version = "0.20.0-beta.1", features = ["fs", "io", "net", "runtime", "time"] }
+crossbeam-queue = "0.3"
+divan = "0.1"
 env_logger = "0.11"
+futures-io = "0.3"
+insta = "1.49"
 log = { version = "0.4.34", features = ["std", "kv"] }
+rstest = { version = "0.28", default-features = false }
 rustix = "1.1"
 scopeguard = "1"
 slotmap = "1"
 smallvec = "1"
+smol = "2"
 socket2 = "0.6"
 tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "time"] }
 windows-sys = "0.60"
 
 [workspace.lints.rust]

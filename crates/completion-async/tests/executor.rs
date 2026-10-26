@@ -15,6 +15,7 @@
 
 mod common;
 
+use assert2::assert;
 use std::future::Future;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
@@ -129,7 +130,7 @@ fn a_woken_task_does_not_poll_the_root_future() {
 			let root = cx.waker().clone();
 			let busy = Rc::clone(&busy);
 			let finished = Rc::clone(&finished);
-			spawn(async move {
+			drop(spawn(async move {
 				for _ in 0..300 {
 					// Wake once and finish on the next poll, so each turn
 					// through the loop leaves the task runnable again.
@@ -148,15 +149,17 @@ fn a_woken_task_does_not_poll_the_root_future() {
 				}
 				finished.set(true);
 				root.wake();
-			});
+			}));
 		}
 		Poll::Pending
 	}))
 	.unwrap();
-	assert_eq!(task_polls.get(), 600, "the task did not keep the loop busy");
-	assert_eq!(
-		root_polls.get(),
-		2,
+	assert!(
+		task_polls.get() == 600,
+		"the task did not keep the loop busy"
+	);
+	assert!(
+		root_polls.get() == 2,
 		"the root was polled without being woken"
 	);
 }
@@ -192,11 +195,11 @@ fn a_busy_task_does_not_starve_file_io_or_timers() {
 		let payload = buffer.clone();
 		let timeout = timeout(Duration::from_millis(1));
 		block_on(async {
-			assert_eq!(file.read_at(payload, 0).await.unwrap(), 5);
+			assert!(file.read_at(payload, 0).await.unwrap() == 5);
 			timeout.await.unwrap();
 		})
 		.unwrap();
-		assert_eq!(buffer.get_mut().unwrap().to_vec(), b"hello");
+		assert!(buffer.get_mut().unwrap().to_vec() == b"hello");
 		let _ = done.send(());
 	});
 	let completed = finished.recv_timeout(Duration::from_secs(3));
@@ -297,9 +300,8 @@ fn a_detached_task_drops_its_output_on_the_owning_thread() {
 		produced.load(Ordering::Acquire),
 		"the detached task never ran"
 	);
-	assert_eq!(
-		drops.load(Ordering::SeqCst),
-		1,
+	assert!(
+		drops.load(Ordering::SeqCst) == 1,
 		"the detached task's output was dropped more or less than once"
 	);
 	assert!(
@@ -319,13 +321,13 @@ fn a_task_can_drop_its_own_join_handle_while_finishing() {
 	let payload = buffer.clone();
 	drop(buffer);
 	let mut receive = Box::pin(socket.recv(payload));
-	let handle = Rc::new(RefCell::new(None::<completion_async::JoinHandle<()>>));
+	let handle = Rc::new(RefCell::new(None::<Box<dyn std::any::Any>>));
 	let finish = Rc::new(Cell::new(false));
 	let wake = Rc::new(RefCell::new(None::<Waker>));
 	let own_handle = Rc::clone(&handle);
 	let flag = Rc::clone(&finish);
 	let task_wake = Rc::clone(&wake);
-	*handle.borrow_mut() = Some(spawn(std::future::poll_fn(move |cx| {
+	*handle.borrow_mut() = Some(Box::new(spawn(std::future::poll_fn(move |cx| {
 		if flag.get() {
 			drop(own_handle.borrow_mut().take());
 			return Poll::Ready(());
@@ -333,7 +335,7 @@ fn a_task_can_drop_its_own_join_handle_while_finishing() {
 		*task_wake.borrow_mut() = Some(cx.waker().clone());
 		assert!(receive.as_mut().poll(cx).is_pending());
 		Poll::Pending
-	})));
+	}))));
 	block_on(timeout(Duration::from_millis(1)))
 		.unwrap()
 		.unwrap();
@@ -377,10 +379,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	handed.try_recv().unwrap().wake();
 	let caught = catch_unwind(AssertUnwindSafe(|| block_on(async {})));
 	let panic = caught.expect_err("a task panic must leave block_on");
-	assert_eq!(
-		panic.downcast_ref::<&str>(),
-		Some(&"task failed while waiting for I/O")
-	);
+	assert!(panic.downcast_ref::<&str>() == Some(&"task failed while waiting for I/O"));
 	// Unwinding dropped the job and released its I/O as a detached cancel; a
 	// pass over the reactor reaps that cancel.
 	block_on(timeout(Duration::from_millis(10)))
@@ -392,7 +391,7 @@ fn a_panicking_task_releases_in_flight_io_and_leaves_the_executor_usable() {
 	}));
 	assert!(gone.is_err(), "joining a failed task parked forever");
 	let next = spawn(async { Rc::new(42) });
-	assert_eq!(*block_on(next).unwrap(), 42);
+	assert!(*block_on(next).unwrap() == 42);
 }
 
 /// A root future that is ready on its first poll returns there and then. A task
@@ -440,9 +439,9 @@ fn a_timeout_fires_at_its_deadline() {
 	let elapsed = started.elapsed();
 	assert!(
 		elapsed >= Duration::from_millis(50),
-		"fired early: {elapsed:?}"
+		"the timeout fired early"
 	);
-	assert!(elapsed < Duration::from_secs(1), "fired late: {elapsed:?}");
+	assert!(elapsed < Duration::from_secs(1), "the timeout fired late");
 }
 
 /// A timer armed on a task does not hold up a nearer one: the wait is for the
@@ -454,7 +453,7 @@ fn a_task_can_spawn_a_child_and_await_it() {
 		child.await * 2
 	});
 	let result = block_on(parent);
-	assert!(matches!(result, Ok(42)), "{result:?}");
+	assert!(let Ok(42) = result);
 }
 
 #[test]
@@ -481,16 +480,16 @@ fn a_handle_made_inside_block_on_submits_to_the_threads_executor() {
 	let (mut server, _) = listener.accept().unwrap();
 
 	let payload = Buffer::copy_from(b"hello");
-	let sent = block_on(async move {
+	block_on(async move {
 		let socket: StreamSocket = StreamSocket::new(client);
 		socket.send_all(payload).await
 	})
+	.unwrap()
 	.unwrap();
-	assert_eq!(sent.into_result().unwrap(), 5);
 
 	let mut got = [0u8; 5];
 	server.read_exact(&mut got).unwrap();
-	assert_eq!(&got, b"hello");
+	assert!(&got == b"hello");
 }
 
 /// `StreamSocket::connect` reaches the thread's default executor on its own: the
@@ -502,19 +501,19 @@ fn a_connect_made_inside_block_on_uses_the_threads_executor() {
 	let addr = listener.local_addr().unwrap();
 
 	let payload = Buffer::copy_from(b"hello");
-	let sent = block_on(async move {
+	block_on(async move {
 		let stream = StreamSocket::connect(addr)
 			.await
 			.expect("the connect failed");
 		stream.send_all(payload).await
 	})
+	.unwrap()
 	.unwrap();
-	assert_eq!(sent.into_result().unwrap(), 5);
 
 	let (mut peer, _) = listener.accept().unwrap();
 	let mut got = [0u8; 5];
 	peer.read_exact(&mut got).unwrap();
-	assert_eq!(&got, b"hello");
+	assert!(&got == b"hello");
 }
 
 #[test]
@@ -524,6 +523,29 @@ fn a_timeout_made_inside_a_spawned_task_fires_under_block_on() {
 	let task = spawn(async { timeout(Duration::from_millis(20)).await });
 	block_on(task).unwrap().unwrap();
 	assert!(start.elapsed() >= Duration::from_millis(20));
+}
+
+#[test]
+fn a_future_polled_before_block_on_completes_on_the_threads_runtime() {
+	common::init_logging();
+	let directory = common::tempdir("completion-poll-before-block-on").unwrap();
+	let path = directory.path().join("data");
+	std::fs::write(&path, b"local").unwrap();
+	let file = File::new(common::open(&path).unwrap());
+
+	let mut buf = Buffer::zeroed(5);
+	let mut read = std::pin::pin!(file.read_at(buf.clone(), 0));
+	let mut timer = std::pin::pin!(timeout(Duration::from_millis(10)));
+
+	// First poll happens outside `block_on`; both register on the thread's
+	// local runtime and complete when `block_on` drives it below.
+	let mut cx = Context::from_waker(Waker::noop());
+	drop(read.as_mut().poll(&mut cx));
+	assert!(timer.as_mut().poll(&mut cx).is_pending());
+
+	assert!(block_on(read).unwrap().unwrap() == 5);
+	block_on(timer).unwrap().unwrap();
+	assert!(buf.get_mut().unwrap() == b"local");
 }
 
 /// Yields once: the task comes back through the loop's wake rather than
@@ -566,7 +588,7 @@ fn concurrent_threads_running_block_on_and_spawn_all_complete() {
 						let whole = buffer.clone();
 						let file = file.clone();
 						readers.push(spawn(async move {
-							assert_eq!(file.read_at(whole, 0).await.unwrap(), 64);
+							assert!(file.read_at(whole, 0).await.unwrap() == 64);
 							buffer
 						}));
 					}
@@ -578,13 +600,12 @@ fn concurrent_threads_running_block_on_and_spawn_all_complete() {
 					});
 					for read in readers {
 						let mut read = read.await;
-						assert_eq!(
-							read.get_mut().unwrap().to_vec(),
-							[0x5a; 64],
+						assert!(
+							read.get_mut().unwrap().to_vec() == [0x5a; 64],
 							"a spawned read landed on the wrong bytes"
 						);
 					}
-					assert_eq!(yielding.await, 22);
+					assert!(yielding.await == 22);
 				})
 				.unwrap();
 			}

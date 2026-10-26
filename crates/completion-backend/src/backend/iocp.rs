@@ -10,7 +10,6 @@ use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, OwnedHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Wake, Waker};
 use std::time::Duration;
 
 use slotmap::{DefaultKey, Key, KeyData, SlotMap};
@@ -41,7 +40,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::core::GUID;
 
-use super::{Config, Driver, IoVec, Op, Response};
+use super::{Config, Driver, IoVec, Op, Response, Waker, WakerInner};
 use crate::desc::{BorrowedDescriptor, OwnedSocket};
 use crate::error::{Error, Result};
 
@@ -84,7 +83,10 @@ fn ntstatus_errno(status: usize) -> i32 {
 
 /// The completion port every operation completes on; a packet with no
 /// `OVERLAPPED` is a wake.
-struct Port(OwnedHandle);
+pub(super) struct Port {
+	handle: OwnedHandle,
+	notified: AtomicBool,
+}
 
 impl Port {
 	fn new() -> io::Result<Port> {
@@ -95,22 +97,23 @@ impl Port {
 			return Err(io::Error::last_os_error());
 		}
 		// SAFETY: the port handle is unowned; we own it from here on.
-		Ok(Port(unsafe { OwnedHandle::from_raw_handle(port) }))
+		Ok(Port {
+			handle: unsafe { OwnedHandle::from_raw_handle(port) },
+			notified: AtomicBool::new(false),
+		})
 	}
 
 	fn handle(&self) -> HANDLE {
-		self.0.as_raw_handle()
-	}
-}
-
-impl Wake for Port {
-	fn wake(self: Arc<Self>) {
-		self.wake_by_ref();
+		self.handle.as_raw_handle()
 	}
 
-	fn wake_by_ref(self: &Arc<Self>) {
-		// SAFETY: the port is open for as long as this `Arc` lives.
+	pub(super) fn wake(&self) {
+		if self.notified.swap(true, Ordering::AcqRel) {
+			return;
+		}
+		// SAFETY: the port is open for as long as this `Port` lives.
 		if unsafe { PostQueuedCompletionStatus(self.handle(), 0, 0, std::ptr::null_mut()) } == 0 {
+			self.notified.store(false, Ordering::Release);
 			log::warn!(error:% = io::Error::last_os_error(); "the completion port refused a wake");
 		}
 	}
@@ -989,6 +992,12 @@ impl<T> Driver<T> for Iocp<T> {
 		}
 	}
 
+	fn get_mut(&mut self, id: u64) -> Option<&mut T> {
+		self.active
+			.get_mut(DefaultKey::from(KeyData::from_ffi(id)))
+			.map(|active| &mut active.data)
+	}
+
 	fn cancel(&mut self, id: u64) {
 		// The id is the key the operation is filed under: one the port never
 		// handed out, or one whose slot has been taken again since, names nothing.
@@ -1041,6 +1050,7 @@ impl<T> Driver<T> for Iocp<T> {
 		}
 		for entry in entries[..count as usize].iter() {
 			if entry.lpOverlapped.is_null() {
+				self.port.notified.store(false, Ordering::Release);
 				continue;
 			}
 			// SAFETY: the pointer names a box we inserted into `active` at
@@ -1099,7 +1109,7 @@ impl<T> Driver<T> for Iocp<T> {
 	}
 
 	fn waker(&self) -> Waker {
-		Waker::from(Arc::clone(&self.port))
+		Waker(WakerInner::Iocp(Arc::clone(&self.port)))
 	}
 }
 
@@ -1157,3 +1167,26 @@ fn landed(error: io::Error) -> Error {
 // and the completion collection (`poll`) is the only place they are touched.
 unsafe impl Send for Overlapped {}
 unsafe impl Sync for Overlapped {}
+
+#[cfg(test)]
+mod tests {
+	use std::io;
+
+	use assert2::assert;
+	use rstest::rstest;
+
+	use super::{Config, ERROR_OPERATION_ABORTED, Iocp, ntstatus_errno};
+
+	#[test]
+	fn ntstatus_errno_maps_status_cancelled_to_operation_aborted() {
+		assert!(ntstatus_errno(0xC000_0120) == ERROR_OPERATION_ABORTED as i32);
+	}
+
+	#[rstest]
+	#[case::iopoll(Config { iopoll: true, ..Config::default() })]
+	#[case::sqpoll(Config { sqpoll: true, ..Config::default() })]
+	fn iocp_rejects_iopoll_and_sqpoll_configs(#[case] config: Config) {
+		assert!(let Err(error) = Iocp::<()>::new(&config));
+		assert!(error.kind() == io::ErrorKind::Unsupported);
+	}
+}

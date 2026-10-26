@@ -3,24 +3,24 @@
 
 mod common;
 
+use assert2::assert;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use completion_async::{
-	Buffer, DatagramSocket, File, Listener, Readiness, Stream, StreamSocket, block_on, timeout,
+	AsDescriptor, Buffer, DatagramSocket, File, Listener, Stream, StreamSocket, block_on, timeout,
 };
 
 /// Every handle the crate exposes is `Send + Sync`: none of them names a
 /// reactor, so one may be made on any thread and used from another.
 #[test]
 fn handles_are_send_and_sync() {
-	fn assert_send_sync<T: Send + Sync>() {}
+	fn assert_send_sync<T: AsDescriptor + Send + Sync>() {}
 	assert_send_sync::<File>();
 	assert_send_sync::<Stream>();
 	assert_send_sync::<StreamSocket>();
 	assert_send_sync::<DatagramSocket>();
 	assert_send_sync::<Listener>();
-	assert_send_sync::<Readiness>();
 }
 
 /// Every operation over a handle is `Send + 'static`: the reactor it submits to
@@ -54,8 +54,9 @@ fn operations_are_send_and_static() {
 	assert_send(socket.recv(whole.clone()));
 
 	let (reader, _writer) = std::io::pipe().unwrap();
-	let readiness = Readiness::new(reader);
-	assert_send(readiness.readable());
+	let stream = Stream::new(reader);
+	assert_send(stream.readable());
+	assert_send(stream.writable());
 
 	assert_send(timeout(Duration::from_secs(1)));
 }
@@ -77,6 +78,6 @@ fn a_file_made_on_one_thread_reads_on_another() {
 	})
 	.join()
 	.unwrap();
-	assert_eq!(read, 5);
-	assert_eq!(bytes, b"hello");
+	assert!(read == 5);
+	assert!(bytes == b"hello");
 }

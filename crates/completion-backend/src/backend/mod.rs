@@ -1,4 +1,4 @@
-use std::task::Waker;
+use std::sync::Arc;
 use std::time::Duration;
 
 use enum_dispatch::enum_dispatch;
@@ -97,9 +97,36 @@ pub enum Response {
 	Done,
 }
 
+/// Thread-safe handle that interrupts a blocking [`Backend::poll`].
+#[derive(Clone)]
+pub struct Waker(WakerInner);
+
+#[derive(Clone)]
+enum WakerInner {
+	Portable(Arc<portable::PollerWake>),
+	#[cfg(target_os = "linux")]
+	Uring(Arc<uring::Signal>),
+	#[cfg(windows)]
+	Iocp(Arc<iocp::Port>),
+}
+
+impl Waker {
+	/// Wakes a blocking [`Backend::poll`].
+	pub fn wake(&self) {
+		match &self.0 {
+			WakerInner::Portable(poller) => poller.wake(),
+			#[cfg(target_os = "linux")]
+			WakerInner::Uring(signal) => signal.wake(),
+			#[cfg(windows)]
+			WakerInner::Iocp(port) => port.wake(),
+		}
+	}
+}
+
 #[enum_dispatch]
 trait Driver<T> {
 	fn submit(&mut self, fd: BorrowedDescriptor<'_>, op: Op, data: T) -> Result<u64>;
+	fn get_mut(&mut self, id: u64) -> Option<&mut T>;
 	fn cancel(&mut self, id: u64);
 	fn cancel_all(&mut self);
 	fn is_idle(&self) -> bool;
@@ -134,7 +161,8 @@ trait Driver<T> {
 	strum(serialize_all = "lowercase", ascii_case_insensitive)
 )]
 pub enum Backend<T = ()> {
-	/// Readiness polling (`polling`) with file I/O on a thread pool.
+	/// Readiness polling ([`polling`](https://github.com/smol-rs/polling)) with
+	/// file I/O on a [`blocking`](https://github.com/smol-rs/blocking) thread pool.
 	#[strum_discriminants(cfg_attr(all(unix, not(target_os = "linux")), default))]
 	Portable(portable::Portable<T>),
 	/// Linux `io_uring`.
@@ -173,6 +201,12 @@ impl<T> Backend<T> {
 		Driver::submit(self, fd, op, data)
 	}
 
+	/// Returns a mutable reference to the caller data associated with `id` if
+	/// the operation is still tracked by the backend.
+	pub fn get_mut(&mut self, id: u64) -> Option<&mut T> {
+		Driver::get_mut(self, id)
+	}
+
 	/// Requests asynchronous cancellation of the in-flight operation `id`.
 	///
 	/// The operation's final result (cancelled or completed) is still delivered
@@ -209,5 +243,66 @@ impl<T> Backend<T> {
 	/// Returns a thread-safe [`Waker`] that wakes a blocking [`Backend::poll`].
 	pub fn waker(&self) -> Waker {
 		Driver::waker(self)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use assert2::assert;
+
+	use super::{Backend, BackendKind, Config};
+
+	/// The default is the target's own completion mechanism: the ring where there
+	/// is one, IOCP on Windows, the portable backend on the other unix targets.
+	#[test]
+	fn a_kind_defaults_to_the_targets_own_backend() {
+		#[cfg(target_os = "linux")]
+		assert!(BackendKind::default() == BackendKind::Uring);
+		#[cfg(all(unix, not(target_os = "linux")))]
+		assert!(BackendKind::default() == BackendKind::Portable);
+		#[cfg(windows)]
+		assert!(BackendKind::default() == BackendKind::Iocp);
+
+		let backend: Backend = Backend::new(&Config::default()).unwrap();
+		assert!(backend.kind() == BackendKind::default());
+	}
+
+	/// Every variant a target offers round-trips through its name, whatever case
+	/// the name arrives in.
+	#[test]
+	fn a_kind_round_trips_through_its_name() {
+		use strum::VariantArray;
+
+		for &kind in BackendKind::VARIANTS {
+			let name = kind.to_string();
+			assert!(name.parse::<BackendKind>().unwrap() == kind);
+			assert!(name.to_uppercase().parse::<BackendKind>().unwrap() == kind);
+			let static_name: &'static str = kind.into();
+			assert!(static_name == name);
+		}
+
+		assert!("portableish".parse::<BackendKind>().is_err());
+	}
+
+	/// Every target offers the portable backend, whether or not it is the default:
+	/// on Linux it swaps the ring for `polling`'s readiness and `blocking`'s pool,
+	/// and on Windows it swaps IOCP for them.
+	#[test]
+	fn every_target_offers_the_portable_backend() {
+		let config = Config {
+			backend: "portable".parse().unwrap(),
+			..Config::default()
+		};
+		assert!(Backend::<()>::new(&config).unwrap().kind() == BackendKind::Portable);
+		#[cfg(any(target_os = "linux", windows))]
+		assert!(BackendKind::default() != BackendKind::Portable);
+	}
+
+	/// A backend hands its mechanism to whichever thread drives it: the reactor
+	/// moves one between threads, so every mechanism it can pick is `Send`.
+	#[test]
+	fn a_backend_is_send() {
+		fn assert_send<T: Send>() {}
+		assert_send::<Backend>();
 	}
 }

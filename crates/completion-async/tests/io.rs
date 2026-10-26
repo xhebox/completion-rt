@@ -4,6 +4,7 @@ mod common;
 
 use std::io;
 
+use assert2::assert;
 use completion_async::{Buffer, ErrorKind, File, OpenOptions, Stream, block_on};
 
 #[test]
@@ -27,10 +28,8 @@ fn a_direct_open_asks_the_kernel_for_direct_io() {
 		#[cfg(not(any(target_os = "linux", target_os = "android")))]
 		Ok(file) => drop(file),
 		Err(error) => assert!(
-			matches!(
-				error.kind(),
-				io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
-			),
+			error.kind() == io::ErrorKind::Unsupported
+				|| error.kind() == io::ErrorKind::InvalidInput,
 			"unexpected direct-I/O open error: {error}"
 		),
 	}
@@ -46,15 +45,11 @@ fn a_pipe_transfers_at_its_own_position() {
 
 	let payload: Buffer = Buffer::copy_from(b"hello");
 	let moved = block_on(writer.write(payload.clone())).unwrap().unwrap();
-	assert_eq!(moved, 5);
+	assert!(moved == 5);
 
 	let mut read: Buffer = Buffer::zeroed(5);
-	let moved = block_on(reader.read_exact(read.clone()))
-		.unwrap()
-		.into_result()
-		.unwrap();
-	assert_eq!(moved, 5);
-	assert_eq!(read.get_mut().unwrap().to_vec(), b"hello");
+	block_on(reader.read_exact(read.clone())).unwrap().unwrap();
+	assert!(read.get_mut().unwrap().to_vec() == b"hello");
 }
 
 /// A loop method owns its buffer one round at a time: the first round's
@@ -75,7 +70,6 @@ fn a_dropped_read_exact_keeps_its_memory_until_the_kernel_finishes() {
 	drop(buffer);
 	block_on(writer.write_all(Buffer::copy_from(b"first")))
 		.unwrap()
-		.into_result()
 		.unwrap();
 
 	let mut read = Box::pin(stream.read_exact(payload));
@@ -119,34 +113,20 @@ fn read_exact_at_reports_the_file_ending_first() {
 
 	let mut buffer: Buffer = Buffer::zeroed(8);
 	// One call: five bytes are left, and that is what it reports.
-	assert_eq!(
-		block_on(file.read_at(buffer.clone(), 0)).unwrap().unwrap(),
-		5
-	);
-	assert_eq!(&buffer.get_mut().unwrap().to_vec()[..5], b"hello");
+	assert!(block_on(file.read_at(buffer.clone(), 0)).unwrap().unwrap() == 5);
+	assert!(&buffer.get_mut().unwrap().to_vec()[..5] == b"hello");
 
 	let mut buffer: Buffer = Buffer::zeroed(8);
-	// The loop stops where the file does, and the progress it made is the
-	// bytes it did bring back, not the whole buffer.
-	let outcome = block_on(file.read_exact_at(buffer.clone(), 0)).unwrap();
-	assert_eq!(outcome.value, 5);
-	assert_eq!(
-		&buffer.get_mut().unwrap().to_vec()[..5],
-		b"hello",
+	// The loop stops where the file does, leaving the bytes it did bring back
+	// in the buffer and reporting `UnexpectedEof`.
+	let result = block_on(file.read_exact_at(buffer.clone(), 0)).unwrap();
+	assert!(
+		&buffer.get_mut().unwrap().to_vec()[..5] == b"hello",
 		"what did arrive stays"
 	);
-	match outcome
-		.result
-		.expect_err("the file has fewer bytes than the buffer holds")
-	{
-		error if error.kind() == ErrorKind::Failed => {
-			assert_eq!(
-				io::Error::try_from(error).unwrap().kind(),
-				io::ErrorKind::UnexpectedEof
-			)
-		}
-		other => panic!("a loop that ran out of file reports an io error, not {other:?}"),
-	}
+	assert!(let Err(error) = result, "the file has fewer bytes than the buffer holds");
+	assert!(error.kind() == ErrorKind::Failed);
+	assert!(io::Error::try_from(error).unwrap().kind() == io::ErrorKind::UnexpectedEof);
 }
 
 /// `write_all_at` writes past one call's worth: a payload larger than a page
@@ -170,18 +150,15 @@ fn write_all_at_and_read_exact_at_move_a_large_payload() {
 	let payload: Buffer = Buffer::copy_from(&bytes);
 	block_on(file.write_all_at(payload.clone(), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
 	block_on(file.sync()).unwrap().unwrap();
 
 	let mut read: Buffer = Buffer::zeroed(len);
 	block_on(file.read_exact_at(read.clone(), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
-	assert_eq!(
-		read.get_mut().unwrap().to_vec(),
-		bytes,
+	assert!(
+		read.get_mut().unwrap().to_vec() == bytes,
 		"the payload did not come back whole"
 	);
 }
@@ -202,24 +179,21 @@ fn the_handle_reads_and_writes_a_whole_buffer() {
 	let file = File::new(file);
 
 	let written: Buffer = Buffer::copy_from(b"hello");
-	assert_eq!(
+	assert!(
 		block_on(file.write_at(written.clone(), 0))
 			.unwrap()
-			.unwrap(),
-		5
+			.unwrap()
+			== 5
 	);
 	block_on(file.sync()).unwrap().unwrap();
 
 	let mut read: Buffer = Buffer::zeroed(5);
-	assert_eq!(block_on(file.read_at(read.clone(), 0)).unwrap().unwrap(), 5);
-	assert_eq!(read.get_mut().unwrap().to_vec(), b"hello");
+	assert!(block_on(file.read_at(read.clone(), 0)).unwrap().unwrap() == 5);
+	assert!(read.get_mut().unwrap().to_vec() == b"hello");
 
 	// Back to the plain file: nothing names it any more, so the handle gives it
 	// up; no binding holds it any longer.
-	let plain = match file.try_take() {
-		Some(plain) => plain,
-		None => panic!("the handle still holds the file"),
-	};
+	assert!(let Some(plain) = file.try_take(), "the handle still holds the file");
 	drop(plain);
 }
 
@@ -256,8 +230,8 @@ fn a_transfer_outlives_the_handle_it_was_made_from() {
 	// the resource.
 	drop(reading.file.take());
 
-	assert_eq!(block_on(reading.read).unwrap().unwrap(), 5);
-	assert_eq!(buffer.get_mut().unwrap().to_vec(), b"hello");
+	assert!(block_on(reading.read).unwrap().unwrap() == 5);
+	assert!(buffer.get_mut().unwrap().to_vec() == b"hello");
 }
 
 /// `flush` reports the file's deferred write-back errors by closing a
@@ -279,7 +253,6 @@ fn flush_leaves_the_handle_usable() {
 	let first: Buffer = Buffer::copy_from(b"hello");
 	block_on(file.write_all_at(first.clone(), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
 	block_on(file.flush()).unwrap().unwrap();
 
@@ -288,15 +261,13 @@ fn flush_leaves_the_handle_usable() {
 	let second: Buffer = Buffer::copy_from(b"world");
 	block_on(file.write_all_at(second.clone(), 5))
 		.unwrap()
-		.into_result()
 		.unwrap();
 
 	let mut read: Buffer = Buffer::zeroed(10);
 	block_on(file.read_exact_at(read.clone(), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
-	assert_eq!(read.get_mut().unwrap().to_vec(), b"helloworld");
+	assert!(read.get_mut().unwrap().to_vec() == b"helloworld");
 }
 
 fn filled(tag: &str, len: usize) -> (common::Scratch, std::path::PathBuf, File) {
@@ -321,12 +292,12 @@ fn an_allocate_grows_the_file_and_never_shrinks_it() {
 	let (_directory, path, file) = filled("completion-allocate", 8192);
 
 	block_on(file.allocate(0, 4096)).unwrap().unwrap();
-	assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
-	assert_eq!(std::fs::read(&path).unwrap(), vec![0xab; 8192]);
+	assert!(std::fs::metadata(&path).unwrap().len() == 8192);
+	assert!(std::fs::read(&path).unwrap() == vec![0xab; 8192]);
 
 	block_on(file.allocate(8192, 4096)).unwrap().unwrap();
 	let metadata = std::fs::metadata(&path).unwrap();
-	assert_eq!(metadata.len(), 12288);
+	assert!(metadata.len() == 12288);
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::MetadataExt;
@@ -337,8 +308,8 @@ fn an_allocate_grows_the_file_and_never_shrinks_it() {
 		);
 	}
 	let contents = std::fs::read(&path).unwrap();
-	assert_eq!(&contents[..8192], &[0xab; 8192][..]);
-	assert_eq!(&contents[8192..], &[0; 4096][..]);
+	assert!(&contents[..8192] == &[0xab; 8192][..]);
+	assert!(&contents[8192..] == &[0; 4096][..]);
 }
 
 /// A punch reads back as zeros across the range, block-aligned or not, and
@@ -350,8 +321,8 @@ fn a_punch_zeroes_the_range_and_keeps_the_length() {
 	block_on(file.punch(100, 5000)).unwrap().unwrap();
 
 	let contents = std::fs::read(&path).unwrap();
-	assert_eq!(contents.len(), 3 * 4096);
-	assert_eq!(&contents[..100], &[0xab; 100][..]);
-	assert_eq!(&contents[100..5100], &[0; 5000][..]);
-	assert_eq!(&contents[5100..], &[0xab; 3 * 4096 - 5100][..]);
+	assert!(contents.len() == 3 * 4096);
+	assert!(&contents[..100] == &[0xab; 100][..]);
+	assert!(&contents[100..5100] == &[0; 5000][..]);
+	assert!(&contents[5100..] == &[0xab; 3 * 4096 - 5100][..]);
 }

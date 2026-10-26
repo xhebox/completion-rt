@@ -15,11 +15,9 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
-use std::slice;
 use std::sync::Arc;
-use std::task::{Context, Poll as TaskPoll, Wake, Waker};
+use std::task::{Context, Poll as TaskPoll, Wake, Waker as TaskWaker};
 use std::time::Duration;
 
 use blocking::{Task, unblock};
@@ -28,7 +26,7 @@ use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 use smallvec::SmallVec;
 use socket2::{SockAddr, SockRef};
 
-use super::{Config, Driver, IoVec, Op, Response};
+use super::{Config, Driver, IoVec, Op, Response, Waker, WakerInner};
 use crate::desc::{BorrowedDescriptor, OwnedSocket};
 use crate::error::{Error, Result};
 
@@ -43,6 +41,7 @@ use self::unix as sys;
 use self::windows as sys;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
 enum Direction {
 	Readable,
 	Writable,
@@ -103,7 +102,15 @@ enum Handshake {
 /// pool job and a cross-thread [`Waker`] reach the reactor through it. A notify
 /// that a zero-timeout wait takes instead loses nothing, since every poll
 /// collects the pool after its wait.
-struct PollerWake(Poller);
+pub(super) struct PollerWake(Poller);
+
+impl PollerWake {
+	pub(super) fn wake(&self) {
+		if let Err(error) = self.0.notify() {
+			log::warn!(error:%; "the poller refused a wake");
+		}
+	}
+}
 
 impl std::ops::Deref for PollerWake {
 	type Target = Poller;
@@ -115,13 +122,11 @@ impl std::ops::Deref for PollerWake {
 
 impl Wake for PollerWake {
 	fn wake(self: Arc<Self>) {
-		self.wake_by_ref();
+		PollerWake::wake(&self);
 	}
 
 	fn wake_by_ref(self: &Arc<Self>) {
-		if let Err(error) = self.0.notify() {
-			log::warn!(error:%; "the poller refused a wake");
-		}
+		PollerWake::wake(self);
 	}
 }
 
@@ -443,7 +448,7 @@ impl<T> Portable<T> {
 
 	fn collect_pool(&mut self) {
 		let mut landed = Vec::new();
-		let waker = self.waker();
+		let waker = TaskWaker::from(Arc::clone(&self.poller));
 		for (key, active) in &mut self.active {
 			let Active::Pool { task, .. } = active else {
 				continue;
@@ -485,6 +490,18 @@ impl<T> Drop for Portable<T> {
 impl<T> Driver<T> for Portable<T> {
 	fn submit(&mut self, fd: BorrowedDescriptor<'_>, op: Op, data: T) -> Result<u64> {
 		self.submit_op(fd, op, data)
+	}
+
+	fn get_mut(&mut self, id: u64) -> Option<&mut T> {
+		let key = DefaultKey::from(KeyData::from_ffi(id));
+		if let Some(Active::Waiting { data, .. } | Active::Pool { data, .. }) =
+			self.active.get_mut(key)
+		{
+			return Some(data);
+		}
+		self.done
+			.iter_mut()
+			.find_map(|(done_id, data, _)| (*done_id == id).then_some(data))
 	}
 
 	fn cancel(&mut self, id: u64) {
@@ -550,7 +567,7 @@ impl<T> Driver<T> for Portable<T> {
 	}
 
 	fn waker(&self) -> Waker {
-		Waker::from(Arc::clone(&self.poller))
+		Waker(WakerInner::Portable(Arc::clone(&self.poller)))
 	}
 }
 
@@ -700,21 +717,13 @@ fn counted(result: io::Result<usize>) -> io::Result<Progress> {
 /// holds open.
 fn recv(fd: sys::Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 	let (ptr, len) = one_buffer(buffer)?;
-	// SAFETY: the reactor holds the memory this buffer names until the operation
-	// lands, and the call is the only mover of the range while the slice stands.
-	let bytes = unsafe { slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), len) };
-	let source = sys::borrow(fd)?;
-	counted(SockRef::from(&source).recv(bytes))
+	sys::recv(fd, ptr, len)
 }
 
 /// Sends the one buffer `buffer` names, on the socket the reactor holds open.
 fn send(fd: sys::Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 	let (ptr, len) = one_buffer(buffer)?;
-	// SAFETY: the reactor holds the memory this buffer names until the operation
-	// lands, and the call only reads it.
-	let bytes = unsafe { slice::from_raw_parts(ptr, len) };
-	let source = sys::borrow(fd)?;
-	counted(SockRef::from(&source).send(bytes))
+	sys::send(fd, ptr, len)
 }
 
 /// Accepts the connection the poller reported ready. The response owns the
@@ -761,5 +770,109 @@ fn connect(fd: sys::Raw) -> io::Result<Progress> {
 		Ok(_) => Ok(Progress::Done(Response::Done)),
 		Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(Progress::Blocked),
 		Err(error) => Err(error),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::io;
+
+	use assert2::assert;
+	use rstest::rstest;
+	use slotmap::{DefaultKey, SlotMap};
+	use smallvec::SmallVec;
+
+	use super::{
+		Config, Direction, IoVec, MAX_TRANSFER, Op, Portable, Progress, Response, Source, counted,
+		direction, event_key, one_buffer, source, sys,
+	};
+
+	#[test]
+	fn source_tracks_unique_waiters_and_computes_poller_interest() {
+		#[cfg(unix)]
+		let fd: sys::Raw = 0;
+		#[cfg(windows)]
+		let fd: sys::Raw = sys::Raw::Socket(0);
+
+		let mut keys: SlotMap<DefaultKey, ()> = SlotMap::new();
+		let skey = keys.insert(());
+		let k1 = keys.insert(());
+		let k2 = keys.insert(());
+		let k3 = keys.insert(());
+
+		let mut watched = Source {
+			fd,
+			readers: SmallVec::new(),
+			writers: SmallVec::new(),
+			hangups: SmallVec::new(),
+		};
+		assert!(watched.idle());
+		let interest = watched.interest(skey);
+		assert!(!interest.readable && !interest.writable);
+
+		watched.add(Direction::Readable, k1);
+		watched.add(Direction::Readable, k1);
+		assert!(watched.readers.len() == 1);
+		assert!(watched.interest(skey).readable);
+
+		watched.add(Direction::Writable, k2);
+		assert!(watched.interest(skey).writable);
+
+		watched.add(Direction::Hangup, k3);
+		#[cfg(not(target_vendor = "apple"))]
+		assert!(watched.interest(skey).is_interrupt());
+
+		watched.remove(Direction::Readable, k1);
+		watched.remove(Direction::Writable, k2);
+		watched.remove(Direction::Hangup, k3);
+		assert!(watched.idle());
+	}
+
+	#[test]
+	fn event_key_and_source_round_trip_slotmap_keys() {
+		let mut keys: SlotMap<DefaultKey, ()> = SlotMap::new();
+		let first = keys.insert(());
+		keys.remove(first);
+		let second = keys.insert(());
+		assert!(first != second);
+
+		for key in [first, second] {
+			assert!(source(event_key(key)) == key);
+		}
+	}
+
+	#[rstest]
+	#[case::readable(Op::Readable, Direction::Readable)]
+	#[case::accept(Op::Accept, Direction::Readable)]
+	#[case::recv(Op::Recv { buf: IoVec { ptr: std::ptr::null_mut(), len: 0 } }, Direction::Readable)]
+	#[case::writable(Op::Writable, Direction::Writable)]
+	#[case::send(Op::Send { buf: IoVec { ptr: std::ptr::null_mut(), len: 0 } }, Direction::Writable)]
+	#[case::hangup(Op::Hangup, Direction::Hangup)]
+	fn direction_classifies_poller_operations(#[case] op: Op, #[case] expected: Direction) {
+		assert!(direction(&op) == expected);
+	}
+
+	#[test]
+	fn one_buffer_and_counted_handle_limits_and_would_block() {
+		assert!(let Err(error) = one_buffer(None));
+		assert!(error.kind() == io::ErrorKind::Unsupported);
+
+		let (_, len) = one_buffer(Some(IoVec {
+			ptr: std::ptr::dangling_mut(),
+			len: usize::MAX,
+		}))
+		.unwrap();
+		assert!(len == MAX_TRANSFER);
+
+		assert!(let Ok(Progress::Blocked) = counted(Err(io::ErrorKind::WouldBlock.into())));
+		assert!(let Ok(Progress::Done(Response::Count(16))) = counted(Ok(16)));
+	}
+
+	#[rstest]
+	#[case::iopoll(Config { iopoll: true, ..Config::default() })]
+	#[case::sqpoll(Config { sqpoll: true, ..Config::default() })]
+	fn portable_rejects_iopoll_and_sqpoll_configs(#[case] config: Config) {
+		assert!(let Err(error) = Portable::<()>::new(&config));
+		assert!(error.kind() == io::ErrorKind::Unsupported);
 	}
 }

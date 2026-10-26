@@ -26,3 +26,13 @@ tasks:
     desc: "Run every test on the host"
     cmds:
       - cargo nextest run --locked {{.CLI_ARGS}}
+
+  doc:
+    desc: "Build the API documentation"
+    cmds:
+      - cargo doc --no-deps --locked {{.CLI_ARGS}}
+
+  bench:
+    desc: "Run every benchmark on the host"
+    cmds:
+      - cargo bench --benches --locked -- {{.CLI_ARGS}}

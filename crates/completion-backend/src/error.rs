@@ -84,3 +84,45 @@ impl TryFrom<Error> for io::Error {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::error::Error as _;
+	use std::io;
+
+	use assert2::assert;
+	use insta::assert_snapshot;
+	use rstest::rstest;
+
+	use super::{Error, ErrorKind};
+
+	#[rstest]
+	#[case::cancelled(Error::cancelled(), ErrorKind::Cancelled)]
+	#[case::stopped(Error::stopped(), ErrorKind::Stopped)]
+	fn cancelled_and_stopped_errors_preserve_their_kind_when_io_error_conversion_fails(
+		#[case] error: Error,
+		#[case] kind: ErrorKind,
+	) {
+		assert!(error.kind() == kind);
+		assert!(error.source().is_none());
+		assert!(let Err(returned) = io::Error::try_from(error));
+		assert!(returned.kind() == kind);
+	}
+
+	#[test]
+	fn an_io_error_round_trips_through_a_failed_error() {
+		let error = Error::from(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+		assert!(error.kind() == ErrorKind::Failed);
+		assert!(error.source().is_some());
+		assert!(error.to_string().contains("denied"));
+		assert!(let Ok(io_error) = io::Error::try_from(error));
+		assert!(io_error.kind() == io::ErrorKind::PermissionDenied);
+	}
+
+	#[test]
+	fn display_describes_each_error_kind() {
+		assert_snapshot!(Error::cancelled(), @"the operation was given up");
+		assert_snapshot!(Error::stopped(), @"the reactor has been stopped");
+		assert_snapshot!(Error::from(io::Error::other("io failure")), @"io failure");
+	}
+}

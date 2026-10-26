@@ -6,16 +6,26 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+
+[lib]
+bench = false
 
 [dependencies]
 completion-backend.workspace = true
-async-task.workspace = true
+crossbeam-queue.workspace = true
 fastrace = "0.7.19"
+futures-io = { workspace = true, optional = true }
 log.workspace = true
 scopeguard.workspace = true
 slotmap.workspace = true
-smallvec.workspace = true
 socket2.workspace = true
+tokio = { workspace = true, optional = true }
+
+[features]
+# `compat` exposes `PollSocket`, the `futures_io` adapter for `StreamSocket`.
+compat = ["dep:futures-io"]
+tokio-io = ["compat", "dep:tokio"]
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["event", "fs", "net"] }
@@ -24,8 +34,24 @@ rustix = { workspace = true, features = ["event", "fs", "net"] }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
+assert2.workspace = true
+compio.workspace = true
+completion-async = { path = ".", features = ["tokio-io"] }
+divan.workspace = true
 env_logger.workspace = true
+insta.workspace = true
+rstest.workspace = true
+smol.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "runtime"
+harness = false
+
+[[bench]]
+name = "compare"
+harness = false
 
 [lints]
 workspace = true

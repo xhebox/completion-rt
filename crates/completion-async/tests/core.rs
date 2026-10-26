@@ -7,13 +7,20 @@
 mod common;
 
 #[cfg(target_os = "linux")]
+use std::future::Future;
+#[cfg(target_os = "linux")]
 use std::io;
+#[cfg(target_os = "linux")]
+use std::pin::Pin;
 
+use assert2::assert;
 #[cfg(target_os = "linux")]
 use completion_async::ErrorKind;
 #[cfg(unix)]
 use completion_async::StreamSocket;
 use completion_async::{Buffer, Config, File, block_on, init, spawn};
+#[cfg(target_os = "linux")]
+use rstest::rstest;
 
 /// A file with `contents`, wrapped in a handle bound to `executor`.
 fn seeded(contents: &[u8]) -> File {
@@ -39,8 +46,8 @@ fn a_read_short_of_the_buffer_completes_with_its_count() {
 	let file = seeded(b"hello");
 	let mut buf: Buffer = Buffer::zeroed(8);
 	let n = block_on(file.read_at(whole(&buf), 0)).unwrap().unwrap();
-	assert_eq!(n, 5, "the completion is one call's bytes");
-	assert_eq!(&buf.get_mut().unwrap().to_vec()[..5], b"hello");
+	assert!(n == 5, "the completion is one call's bytes");
+	assert!(&buf.get_mut().unwrap().to_vec()[..5] == b"hello");
 }
 
 /// An operation holds the descriptor it was submitted for. The caller's copy
@@ -74,18 +81,16 @@ fn an_operation_holds_its_descriptor_past_the_callers_copy() {
 	let mut squatters = Vec::new();
 	for _ in 0..=(number + 1).min(4096) as usize {
 		let squatter = std::fs::File::open(&second).unwrap();
-		assert_ne!(
-			squatter.as_raw_fd(),
-			number,
+		assert!(
+			squatter.as_raw_fd() != number,
 			"the operation's number was free while it was still pending"
 		);
 		squatters.push(squatter);
 	}
 
-	assert_eq!(block_on(read).unwrap().unwrap(), 5);
-	assert_eq!(
-		buf.get_mut().unwrap().to_vec(),
-		b"first",
+	assert!(block_on(read).unwrap().unwrap() == 5);
+	assert!(
+		buf.get_mut().unwrap().to_vec() == b"first",
 		"the read landed on another file"
 	);
 }
@@ -122,7 +127,7 @@ fn many_transfers_all_complete() {
 		let file = file.clone();
 		tasks.push(spawn(async move {
 			let n = file.read_at(view, 0).await.unwrap();
-			assert_eq!(n, 4096);
+			assert!(n == 4096);
 			assert!(
 				read.get_mut()
 					.unwrap()
@@ -168,8 +173,8 @@ fn a_receive_waits_on_a_nonblocking_socket() {
 	});
 	let n = block_on(right.recv(whole(&buffer))).unwrap().unwrap();
 	sender.join().unwrap();
-	assert_eq!(n, 4, "the completion is one call's bytes");
-	assert_eq!(&buffer.get_mut().unwrap().to_vec()[..4], b"data");
+	assert!(n == 4, "the completion is one call's bytes");
+	assert!(&buffer.get_mut().unwrap().to_vec()[..4] == b"data");
 }
 
 /// SQPOLL hands submissions to a kernel thread; the completions come back the
@@ -187,10 +192,7 @@ fn sqpoll_rings_complete_too() {
 		Err(error) => {
 			let error = io::Error::try_from(error).expect("SQPOLL setup fails in the OS");
 			assert!(
-				matches!(
-					error.kind(),
-					io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
-				),
+				let (io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied) = error.kind(),
 				"unexpected SQPOLL setup error: {error}"
 			);
 			return;
@@ -199,55 +201,34 @@ fn sqpoll_rings_complete_too() {
 	let file = seeded(b"hello");
 	let mut buf: Buffer = Buffer::zeroed(5);
 	let n = block_on(file.read_at(whole(&buf), 0)).unwrap().unwrap();
-	assert_eq!(n, 5);
-	assert_eq!(buf.get_mut().unwrap().to_vec(), b"hello");
+	assert!(n == 5);
+	assert!(buf.get_mut().unwrap().to_vec() == b"hello");
 }
 
-/// A fsync has no overlapped form, so an IOPOLL ring refuses it instead of
-/// letting the kernel answer EINVAL — and instead of silently dropping it.
-#[test]
+/// An operation with no polled form is refused on an IOPOLL ring, rather than
+/// handed to the kernel to answer `EINVAL` or dropped: the refusal comes back as
+/// an `Unsupported` I/O error, which lands on the first poll.
 #[cfg(target_os = "linux")]
-fn fsync_is_refused_on_an_iopoll_ring() {
+type Refused = Pin<Box<dyn Future<Output = completion_async::Result<()>>>>;
+#[cfg(target_os = "linux")]
+type Operation = fn(&File) -> Refused;
+
+#[cfg(target_os = "linux")]
+#[rstest]
+#[case::fsync(|file: &File| -> Refused { Box::pin(file.sync()) })]
+#[case::flush(|file: &File| -> Refused { Box::pin(file.flush()) })]
+#[case::allocate(|file: &File| -> Refused { Box::pin(file.allocate(0, 4096)) })]
+#[case::punch(|file: &File| -> Refused { Box::pin(file.punch(0, 4096)) })]
+fn unpollable_operations_are_refused_on_an_iopoll_ring(#[case] operation: Operation) {
 	init(Config {
 		iopoll: true,
 		..Config::default()
 	})
 	.unwrap();
 	let file = seeded(b"data");
-	// The reactor is the backend's only caller, so the refusal lands on the
-	// first poll rather than at submit time.
-	match block_on(file.sync()).unwrap() {
-		Ok(()) => panic!("fsync on an IOPOLL ring must be refused"),
-		Err(error) if error.kind() == ErrorKind::Failed => {
-			assert_eq!(
-				io::Error::try_from(error).unwrap().kind(),
-				io::ErrorKind::Unsupported
-			)
-		}
-		Err(other) => panic!("fsync on an IOPOLL ring must be refused, got {other:?}"),
-	}
-}
-
-/// A fallocate has no polled form either.
-#[test]
-#[cfg(target_os = "linux")]
-fn allocate_is_refused_on_an_iopoll_ring() {
-	init(Config {
-		iopoll: true,
-		..Config::default()
-	})
-	.unwrap();
-	let file = seeded(b"data");
-	match block_on(file.allocate(0, 4096)).unwrap() {
-		Ok(()) => panic!("allocate on an IOPOLL ring must be refused"),
-		Err(error) if error.kind() == ErrorKind::Failed => {
-			assert_eq!(
-				io::Error::try_from(error).unwrap().kind(),
-				io::ErrorKind::Unsupported
-			)
-		}
-		Err(other) => panic!("allocate on an IOPOLL ring must be refused, got {other:?}"),
-	}
+	assert!(let Err(error) = block_on(operation(&file)).unwrap());
+	assert!(error.kind() == ErrorKind::Failed);
+	assert!(io::Error::try_from(error).unwrap().kind() == io::ErrorKind::Unsupported);
 }
 
 /// The backend is chosen at runtime, by name: on Linux `portable` swaps the
@@ -279,22 +260,22 @@ fn the_portable_backend_serves_a_file_and_a_socket() {
 	// A regular file has no readiness to wait on, so its transfers run on the pool.
 	let mut buf: Buffer = Buffer::zeroed(4);
 	let n = block_on(file.read_at(whole(&buf), 0)).unwrap().unwrap();
-	assert_eq!(n, 4);
-	assert_eq!(buf.get_mut().unwrap().to_vec(), [0xab; 4]);
+	assert!(n == 4);
+	assert!(buf.get_mut().unwrap().to_vec() == [0xab; 4]);
 
 	// A punch is a pool job too, and it cuts the hole the ring cuts.
 	block_on(file.punch(0, 4096)).unwrap().unwrap();
-	assert_eq!(std::fs::read(&path).unwrap()[..4096], [0u8; 4096][..]);
+	assert!(std::fs::read(&path).unwrap()[..4096] == [0u8; 4096][..]);
 
 	// A socket is a readiness source: the poller reports it, the call runs.
 	let (left, right) = UnixStream::pair().unwrap();
 	let left: StreamSocket = StreamSocket::new(left);
 	let right: StreamSocket = StreamSocket::new(right);
 	let payload: Buffer = Buffer::copy_from(b"portable");
-	assert_eq!(block_on(left.send(whole(&payload))).unwrap().unwrap(), 8);
+	assert!(block_on(left.send(whole(&payload))).unwrap().unwrap() == 8);
 	let mut received: Buffer = Buffer::zeroed(8);
-	assert_eq!(block_on(right.recv(whole(&received))).unwrap().unwrap(), 8);
-	assert_eq!(received.get_mut().unwrap().to_vec(), b"portable");
+	assert!(block_on(right.recv(whole(&received))).unwrap().unwrap() == 8);
+	assert!(received.get_mut().unwrap().to_vec() == b"portable");
 }
 
 /// An accept on the portable backend, on every target: the listener is a
@@ -322,15 +303,15 @@ fn the_portable_backend_accepts_a_connection() {
 		.expect("the accept landed");
 
 	let payload: Buffer = Buffer::copy_from(b"hello");
-	assert_eq!(block_on(stream.send(whole(&payload))).unwrap().unwrap(), 5);
+	assert!(block_on(stream.send(whole(&payload))).unwrap().unwrap() == 5);
 	let mut got = [0u8; 5];
 	client.read_exact(&mut got).unwrap();
-	assert_eq!(&got, b"hello");
+	assert!(&got == b"hello");
 
 	client.write_all(b"world").unwrap();
 	let mut received: Buffer = Buffer::zeroed(5);
-	assert_eq!(block_on(stream.recv(whole(&received))).unwrap().unwrap(), 5);
-	assert_eq!(received.get_mut().unwrap().to_vec(), b"world");
+	assert!(block_on(stream.recv(whole(&received))).unwrap().unwrap() == 5);
+	assert!(received.get_mut().unwrap().to_vec() == b"world");
 
 	// The accepted socket is the backend's to run: a unix one carries the flags
 	// a watched descriptor needs, non-blocking and closed on exec.

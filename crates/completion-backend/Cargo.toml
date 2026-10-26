@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+
+[lib]
+bench = false
 
 [dependencies]
 blocking = "1.7"
@@ -37,8 +41,16 @@ rustix = { workspace = true, features = ["event", "fs", "net", "thread"] }
 iowait = []
 
 [dev-dependencies]
+assert2.workspace = true
+divan.workspace = true
 env_logger.workspace = true
+insta.workspace = true
+rstest.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "driver"
+harness = false
 
 [lints]
 workspace = true

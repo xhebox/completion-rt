@@ -2,7 +2,6 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 
 use super::Op;
@@ -13,7 +12,7 @@ use rustix::io::Errno;
 use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 use socket2::SockAddr;
 
-use super::{Config, Driver, Response};
+use super::{Config, Driver, Response, Waker, WakerInner};
 
 const MIN_RING_ENTRIES: u32 = 2;
 
@@ -36,17 +35,13 @@ const EMPTY: u32 = 0;
 const PARKED: u32 = 1;
 const NOTIFIED: u32 = 2;
 
-struct Signal {
+pub(super) struct Signal {
 	state: AtomicU32,
 	iopoll: bool,
 }
 
-impl Wake for Signal {
-	fn wake(self: Arc<Self>) {
-		self.wake_by_ref();
-	}
-
-	fn wake_by_ref(self: &Arc<Self>) {
+impl Signal {
+	pub(super) fn wake(&self) {
 		if self.state.swap(NOTIFIED, Ordering::AcqRel) == PARKED && !self.iopoll {
 			// `IORING_OP_FUTEX_WAIT` queues a shared futex wait (`Flags::empty()`),
 			// so a `FUTEX_PRIVATE_FLAG` wake would not match it.
@@ -524,6 +519,12 @@ impl<T> Driver<T> for Uring<T> {
 		self.prepare(fd, op, data)
 	}
 
+	fn get_mut(&mut self, id: u64) -> Option<&mut T> {
+		self.active
+			.get_mut(DefaultKey::from(KeyData::from_ffi(id)))
+			.map(|active| &mut active.data)
+	}
+
 	fn cancel(&mut self, id: u64) {
 		// The id is the token the ring holds: a key it never handed out, or one
 		// whose slot has been taken again since, names no operation here.
@@ -606,7 +607,7 @@ impl<T> Driver<T> for Uring<T> {
 	}
 
 	fn waker(&self) -> Waker {
-		Waker::from(Arc::clone(&self.signal))
+		Waker(WakerInner::Uring(Arc::clone(&self.signal)))
 	}
 }
 
@@ -629,5 +630,67 @@ impl<T> Drop for Uring<T> {
 				return;
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::io;
+	use std::sync::atomic::{AtomicU32, Ordering};
+
+	use assert2::assert;
+	use rstest::rstest;
+
+	use crate::error::ErrorKind;
+
+	use super::{EMPTY, Kind, NOTIFIED, PARKED, Response, Signal, capped, completion, hung};
+
+	#[test]
+	fn completion_maps_cqe_results_to_responses_and_errors() {
+		assert!(let Ok(Response::Count(64)) = completion(Kind::Count, 64));
+		assert!(let Ok(Response::Done) = completion(Kind::Done, 0));
+
+		assert!(let Err(cancelled) = completion(Kind::Count, -libc::ECANCELED));
+		assert!(cancelled.kind() == ErrorKind::Cancelled);
+
+		assert!(let Err(failed) = completion(Kind::Count, -libc::EIO));
+		assert!(failed.kind() == ErrorKind::Failed);
+		assert!(let Ok(io_error) = io::Error::try_from(failed));
+		assert!(io_error.raw_os_error() == Some(libc::EIO));
+	}
+
+	#[rstest]
+	#[case::cancelled(-libc::ECANCELED, false)]
+	#[case::none(0, false)]
+	#[case::readable(rustix::event::PollFlags::IN.bits() as i32, false)]
+	#[case::hangup(rustix::event::PollFlags::HUP.bits() as i32, true)]
+	#[case::error(rustix::event::PollFlags::ERR.bits() as i32, true)]
+	fn hung_detects_poll_hup_and_err_bits_only_on_non_negative_results(
+		#[case] result: i32,
+		#[case] expected: bool,
+	) {
+		assert!(hung(result) == expected);
+	}
+
+	#[rstest]
+	#[case(0, 0)]
+	#[case(4096, 4096)]
+	#[case(usize::MAX, u32::MAX)]
+	fn capped_saturates_lengths_above_u32_max(#[case] len: usize, #[case] expected: u32) {
+		assert!(capped(len) == expected);
+	}
+
+	#[rstest]
+	fn signal_wake_transitions_state_to_notified(#[values(false, true)] iopoll: bool) {
+		let signal = Signal {
+			state: AtomicU32::new(EMPTY),
+			iopoll,
+		};
+		signal.wake();
+		assert!(signal.state.load(Ordering::Acquire) == NOTIFIED);
+
+		signal.state.store(PARKED, Ordering::Release);
+		signal.wake();
+		assert!(signal.state.load(Ordering::Acquire) == NOTIFIED);
 	}
 }

@@ -5,13 +5,14 @@ use std::net::{Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use completion_backend::{AsDescriptor, Op, OwnedDescriptor, OwnedSocket, Response};
+use completion_backend::{
+	AsDescriptor, BorrowedDescriptor, Op, OwnedDescriptor, OwnedSocket, Response,
+};
 use socket2::SockAddr;
 
-use crate::Result;
-use crate::executor::submit;
-use crate::io::{Outcome, drain, fill, transfer};
+use crate::io::{drain, fill, transfer};
 use crate::memory::AsIoVec;
+use crate::{Result, submit};
 
 // ---------------------------------------------------------------------------
 // Stream (pipe)
@@ -51,15 +52,15 @@ impl Stream {
 
 	/// Performs a single read into `buf`.
 	pub fn read<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Read {
+		transfer(self.clone(), buf, move |iovec| Op::Read {
 			offset: None,
 			buf: iovec,
 		})
 	}
 
 	/// Reads into `buf` until it is completely filled.
-	pub fn read_exact<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Outcome<usize>> + 'static {
-		fill(Arc::clone(&self.0), buf, |_done, iovec| Op::Read {
+	pub fn read_exact<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<()>> + 'static {
+		fill(self.clone(), buf, |_done, iovec| Op::Read {
 			offset: None,
 			buf: iovec,
 		})
@@ -67,18 +68,52 @@ impl Stream {
 
 	/// Performs a single write from `buf`.
 	pub fn write<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Write {
+		transfer(self.clone(), buf, move |iovec| Op::Write {
 			offset: None,
 			buf: iovec,
 		})
 	}
 
 	/// Writes all bytes in `buf`, across one or more calls.
-	pub fn write_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Outcome<usize>> + 'static {
-		drain(Arc::clone(&self.0), buf, |_done, iovec| Op::Write {
+	pub fn write_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<()>> + 'static {
+		drain(self.clone(), buf, |_done, iovec| Op::Write {
 			offset: None,
 			buf: iovec,
 		})
+	}
+
+	/// Waits once until the descriptor becomes readable.
+	///
+	/// This is a one-shot wait; call `readable` again to wait for subsequent
+	/// readiness events.
+	pub fn readable(&self) -> impl Future<Output = Result<()>> + use<> {
+		let stream = self.clone();
+		async move {
+			submit(stream, Op::Readable, ())?
+				.await
+				.0
+				.map(|_response| ())
+		}
+	}
+
+	/// Waits once until the descriptor becomes writable.
+	///
+	/// This is a one-shot wait; call `writable` again to wait for subsequent
+	/// readiness events.
+	pub fn writable(&self) -> impl Future<Output = Result<()>> + use<> {
+		let stream = self.clone();
+		async move {
+			submit(stream, Op::Writable, ())?
+				.await
+				.0
+				.map(|_response| ())
+		}
+	}
+}
+
+impl AsDescriptor for Stream {
+	fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
+		self.0.as_descriptor()
 	}
 }
 
@@ -111,32 +146,38 @@ impl StreamSocket {
 		Arc::into_inner(self.0)
 	}
 
+	/// Wraps this socket in a [`PollSocket`](crate::PollSocket) implementing
+	/// [`futures_io::AsyncRead`] and [`futures_io::AsyncWrite`] (and
+	/// `tokio::io::{AsyncRead, AsyncWrite}` when the `tokio-io` feature is
+	/// enabled).
+	#[cfg(feature = "compat")]
+	pub fn into_poll(self) -> io::Result<crate::PollSocket> {
+		crate::PollSocket::new(self)
+	}
+
+	#[cfg(feature = "compat")]
+	pub(crate) fn inner_fd(&self) -> &OwnedSocket {
+		&self.0
+	}
+
 	/// Performs a single receive into `buf`.
 	pub fn recv<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Recv {
-			buf: iovec,
-		})
+		transfer(self.clone(), buf, move |iovec| Op::Recv { buf: iovec })
 	}
 
 	/// Receives into `buf` until it is completely filled.
-	pub fn recv_exact<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Outcome<usize>> + 'static {
-		fill(Arc::clone(&self.0), buf, |_done, iovec| Op::Recv {
-			buf: iovec,
-		})
+	pub fn recv_exact<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<()>> + 'static {
+		fill(self.clone(), buf, |_done, iovec| Op::Recv { buf: iovec })
 	}
 
 	/// Performs a single send from `buf`.
 	pub fn send<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Send {
-			buf: iovec,
-		})
+		transfer(self.clone(), buf, move |iovec| Op::Send { buf: iovec })
 	}
 
 	/// Sends all bytes in `buf` across one or more calls.
-	pub fn send_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Outcome<usize>> + 'static {
-		drain(Arc::clone(&self.0), buf, |_done, iovec| Op::Send {
-			buf: iovec,
-		})
+	pub fn send_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<()>> + 'static {
+		drain(self.clone(), buf, |_done, iovec| Op::Send { buf: iovec })
 	}
 
 	/// Shuts down the read, write, or both halves of the stream.
@@ -151,10 +192,12 @@ impl StreamSocket {
 
 	/// Waits until the connection is fully closed in both directions or reset.
 	pub fn hangup(&self) -> impl Future<Output = Result<()>> + use<> {
-		let fd = Arc::clone(&self.0);
+		let mut socket = self.clone();
 		async move {
 			loop {
-				match submit(Arc::clone(&fd), Op::Hangup, ())?.await.0 {
+				let (result, returned, ()) = submit(socket, Op::Hangup, ())?.await;
+				socket = returned;
+				match result {
 					Err(error)
 						if error.source().is_some_and(|s| {
 							s.downcast_ref::<io::Error>()
@@ -167,6 +210,40 @@ impl StreamSocket {
 				}
 			}
 		}
+	}
+
+	/// Waits once until the socket becomes readable.
+	///
+	/// This is a one-shot wait; call `readable` again to wait for subsequent
+	/// readiness events.
+	pub fn readable(&self) -> impl Future<Output = Result<()>> + use<> {
+		let socket = self.clone();
+		async move {
+			submit(socket, Op::Readable, ())?
+				.await
+				.0
+				.map(|_response| ())
+		}
+	}
+
+	/// Waits once until the socket becomes writable.
+	///
+	/// This is a one-shot wait; call `writable` again to wait for subsequent
+	/// readiness events.
+	pub fn writable(&self) -> impl Future<Output = Result<()>> + use<> {
+		let socket = self.clone();
+		async move {
+			submit(socket, Op::Writable, ())?
+				.await
+				.0
+				.map(|_response| ())
+		}
+	}
+}
+
+impl AsDescriptor for StreamSocket {
+	fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
+		self.0.as_descriptor()
 	}
 }
 
@@ -193,21 +270,51 @@ impl DatagramSocket {
 
 	/// Performs a single receive into `buf`.
 	pub fn recv<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Recv {
-			buf: iovec,
-		})
+		transfer(self.clone(), buf, move |iovec| Op::Recv { buf: iovec })
 	}
 
 	/// Performs a single send from `buf`.
 	pub fn send<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
-		transfer(Arc::clone(&self.0), buf, move |iovec| Op::Send {
-			buf: iovec,
-		})
+		transfer(self.clone(), buf, move |iovec| Op::Send { buf: iovec })
 	}
 
 	/// Retrieves and clears the socket's pending error (`SO_ERROR`).
 	pub fn take_error(&self) -> io::Result<Option<io::Error>> {
 		imp::take_error(self.0.as_descriptor())
+	}
+
+	/// Waits once until the socket becomes readable.
+	///
+	/// This is a one-shot wait; call `readable` again to wait for subsequent
+	/// readiness events.
+	pub fn readable(&self) -> impl Future<Output = Result<()>> + use<> {
+		let socket = self.clone();
+		async move {
+			submit(socket, Op::Readable, ())?
+				.await
+				.0
+				.map(|_response| ())
+		}
+	}
+
+	/// Waits once until the socket becomes writable.
+	///
+	/// This is a one-shot wait; call `writable` again to wait for subsequent
+	/// readiness events.
+	pub fn writable(&self) -> impl Future<Output = Result<()>> + use<> {
+		let socket = self.clone();
+		async move {
+			submit(socket, Op::Writable, ())?
+				.await
+				.0
+				.map(|_response| ())
+		}
+	}
+}
+
+impl AsDescriptor for DatagramSocket {
+	fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
+		self.0.as_descriptor()
 	}
 }
 
@@ -234,13 +341,19 @@ impl Listener {
 
 	/// Accepts the next incoming connection on this listener.
 	pub fn accept(&self) -> impl Future<Output = Result<StreamSocket>> + 'static {
-		let fd = Arc::clone(&self.0);
+		let listener = self.clone();
 		async move {
-			match submit(fd, Op::Accept, ())?.await.0? {
+			match submit(listener, Op::Accept, ())?.await.0? {
 				Response::Accepted(socket) => Ok(StreamSocket::new(socket)),
 				other => unreachable!("an accept's round reports a socket, not {other:?}"),
 			}
 		}
+	}
+}
+
+impl AsDescriptor for Listener {
+	fn as_descriptor(&self) -> BorrowedDescriptor<'_> {
+		self.0.as_descriptor()
 	}
 }
 
@@ -296,18 +409,17 @@ impl<T: ToSockAddr + ?Sized> ToSockAddr for &T {
 	}
 }
 
-async fn connected(connection: io::Result<(SockAddr, Arc<OwnedSocket>)>) -> Result<StreamSocket> {
+async fn connected(connection: io::Result<(SockAddr, StreamSocket)>) -> Result<StreamSocket> {
 	let (addr, socket) = connection?;
-	submit(Arc::clone(&socket), Op::Connect { addr }, ())?
-		.await
-		.0?;
-	Ok(StreamSocket(socket))
+	let (response, socket, ()) = submit(socket, Op::Connect { addr }, ())?.await;
+	response?;
+	Ok(socket)
 }
 
-fn connect_socket(addr: SockAddr) -> io::Result<(SockAddr, Arc<OwnedSocket>)> {
+fn connect_socket(addr: SockAddr) -> io::Result<(SockAddr, StreamSocket)> {
 	let socket = socket2::Socket::new(addr.domain(), socket2::Type::STREAM, None)?;
 	socket.set_nonblocking(true)?;
-	Ok((addr, Arc::new(OwnedSocket::from(socket))))
+	Ok((addr, StreamSocket::new(socket)))
 }
 
 #[cfg(unix)]
@@ -319,3 +431,75 @@ use unix as imp;
 mod windows;
 #[cfg(windows)]
 use windows as imp;
+
+#[cfg(test)]
+mod tests {
+	use std::net::{
+		Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, UdpSocket,
+	};
+	use std::path::{Path, PathBuf};
+
+	use assert2::assert;
+	use rstest::rstest;
+	use socket2::SockAddr;
+
+	use super::{DatagramSocket, Listener, Stream, ToSockAddr};
+
+	#[rstest]
+	#[case::v4(SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)))]
+	#[case::v6(SocketAddr::from((Ipv6Addr::LOCALHOST, 8080)))]
+	fn to_sock_addr_converts_ip_socket_addresses_and_references(#[case] addr: SocketAddr) {
+		assert!(addr.to_sock_addr().unwrap().as_socket() == Some(addr));
+
+		let sock = SockAddr::from(addr);
+		assert!(sock.to_sock_addr().unwrap().as_socket() == Some(addr));
+
+		let reference = &addr;
+		assert!(ToSockAddr::to_sock_addr(&reference).unwrap().as_socket() == Some(addr));
+	}
+
+	#[test]
+	fn to_sock_addr_converts_typed_ip_addresses() {
+		let v4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
+		assert!(v4.to_sock_addr().unwrap().as_socket() == Some(SocketAddr::V4(v4)));
+
+		let v6 = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8080, 0, 0);
+		assert!(v6.to_sock_addr().unwrap().as_socket() == Some(SocketAddr::V6(v6)));
+	}
+
+	#[rstest]
+	#[case::relative("test.sock")]
+	#[case::nested("run/test.sock")]
+	fn to_sock_addr_converts_unix_paths(#[case] name: &str) {
+		let path = Path::new(name);
+		let owned = PathBuf::from(name);
+		#[cfg(unix)]
+		{
+			assert!(path.to_sock_addr().unwrap().as_pathname() == Some(path));
+			assert!(owned.to_sock_addr().unwrap().as_pathname() == Some(path));
+		}
+		#[cfg(not(unix))]
+		{
+			path.to_sock_addr().unwrap();
+			owned.to_sock_addr().unwrap();
+		}
+	}
+
+	#[test]
+	fn try_take_returns_resource_only_when_handle_is_unique() {
+		let (reader, _writer) = Stream::pipe().unwrap();
+		let clone = reader.clone();
+		assert!(clone.try_take().is_none());
+		assert!(reader.try_take().is_some());
+
+		let socket = DatagramSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+		let clone = socket.clone();
+		assert!(clone.try_take().is_none());
+		assert!(socket.try_take().is_some());
+
+		let listener = Listener::new(TcpListener::bind("127.0.0.1:0").unwrap());
+		let clone = listener.clone();
+		assert!(clone.try_take().is_none());
+		assert!(listener.try_take().is_some());
+	}
+}

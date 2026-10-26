@@ -3,6 +3,7 @@
 //! own.
 mod common;
 
+use assert2::assert;
 use std::sync::Arc;
 
 use completion_async::{AsIoVec, Buffer, File, IoVec, OpenOptions, block_on};
@@ -64,10 +65,9 @@ fn a_custom_as_iovec_reads_and_writes_through_its_range() {
 	};
 	block_on(file.read_exact_at(sink.clone(), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
-	assert_eq!(sink.range(), b"abcd");
-	assert_eq!(sink.bytes.as_slice(), b"...abcd...");
+	assert!(sink.range() == b"abcd");
+	assert!(sink.bytes.as_slice() == b"...abcd...");
 
 	let source = Middle {
 		bytes: Arc::new(b"..WXYZ..".to_vec()),
@@ -76,9 +76,8 @@ fn a_custom_as_iovec_reads_and_writes_through_its_range() {
 	};
 	block_on(file.write_all_at(source.clone(), 4))
 		.unwrap()
-		.into_result()
 		.unwrap();
-	assert_eq!(std::fs::read(&path).unwrap(), b"abcdWXYZ");
+	assert!(std::fs::read(&path).unwrap() == b"abcdWXYZ");
 }
 
 /// A clone of a buffer is a handle on the same bytes: passing it to an
@@ -90,19 +89,15 @@ fn a_shared_buffer_reads_and_writes() {
 	std::fs::write(&path, b"shared").unwrap();
 
 	let source = Buffer::copy_from(b"shared");
-	let written = block_on(file.write_all_at(source.clone(), 0))
+	block_on(file.write_all_at(source.clone(), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
-	assert_eq!(written, 6);
 
 	let mut sink = Buffer::zeroed(6);
-	let read = block_on(file.read_exact_at(sink.clone(), 0))
+	block_on(file.read_exact_at(sink.clone(), 0))
 		.unwrap()
-		.into_result()
 		.unwrap();
-	assert_eq!(read, 6);
-	assert_eq!(sink.get_mut().unwrap(), b"shared");
+	assert!(sink.get_mut().unwrap() == b"shared");
 }
 
 /// The bytes are exclusive only while no other handle names them: another clone
@@ -120,7 +115,7 @@ fn a_buffer_is_exclusive_only_once_nothing_else_names_it() {
 		"the in-flight operation still names the bytes"
 	);
 	block_on(read).unwrap().unwrap();
-	assert_eq!(buffer.get_mut().unwrap(), b"hello");
+	assert!(buffer.get_mut().unwrap() == b"hello");
 
 	let clone = buffer.clone();
 	assert!(
@@ -146,6 +141,6 @@ fn a_transfer_outlives_the_buffer_it_was_named_by() {
 		drop(source);
 		write
 	};
-	block_on(write).unwrap().into_result().unwrap();
-	assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+	block_on(write).unwrap().unwrap();
+	assert!(std::fs::read(&path).unwrap() == b"payload");
 }

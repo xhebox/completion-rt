@@ -329,11 +329,10 @@ pub(super) fn read(fd: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 		return Ok(Progress::Done(Response::Count(0)));
 	};
 	let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
-	// SAFETY: the reactor holds the memory this buffer names until the
-	// operation lands, and the call is the only mover of the range while the
-	// slice stands.
-	let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-	counted(rustix::io::read(borrow(fd)?, bytes).map_err(io::Error::from))
+	// SAFETY: the reactor holds the memory behind `ptr` until the operation
+	// lands; the syscall copies through the raw pointer without forming a Rust
+	// reference.
+	counted(count(unsafe { libc::read(fd, ptr.cast(), len) }))
 }
 
 /// Writes from the one buffer `buffer` names, on a watched descriptor.
@@ -342,8 +341,24 @@ pub(super) fn write(fd: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 		return Ok(Progress::Done(Response::Count(0)));
 	};
 	let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
-	// SAFETY: the reactor holds the memory this buffer names until the
-	// operation lands, and the call only reads it.
-	let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-	counted(rustix::io::write(borrow(fd)?, bytes).map_err(io::Error::from))
+	// SAFETY: the reactor holds the memory behind `ptr` until the operation
+	// lands; the syscall reads through the raw pointer without forming a Rust
+	// reference.
+	counted(count(unsafe { libc::write(fd, ptr.cast(), len) }))
+}
+
+/// Receives into `ptr..ptr + len` on a watched socket.
+pub(super) fn recv(fd: Raw, ptr: *mut u8, len: usize) -> io::Result<Progress> {
+	// SAFETY: the reactor holds the memory behind `ptr` until the operation
+	// lands; the syscall copies through the raw pointer without forming a Rust
+	// reference.
+	counted(count(unsafe { libc::recv(fd, ptr.cast(), len, 0) }))
+}
+
+/// Sends from `ptr..ptr + len` on a watched socket.
+pub(super) fn send(fd: Raw, ptr: *mut u8, len: usize) -> io::Result<Progress> {
+	// SAFETY: the reactor holds the memory behind `ptr` until the operation
+	// lands; the syscall reads through the raw pointer without forming a Rust
+	// reference.
+	counted(count(unsafe { libc::send(fd, ptr.cast(), len, 0) }))
 }

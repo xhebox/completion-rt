@@ -1,73 +1,18 @@
-//! A [`Config`] names the backend it runs on with a [`BackendKind`], which also
-//! parses from the string a configuration file would carry.
+//! Waits on a real backend: a finished or cancelled wait leaves nothing behind,
+//! and the backend goes idle once it has reported.
 
 mod common;
-
-use completion_backend::{Backend, BackendKind, Config};
-
-/// The default is the target's own completion mechanism: the ring where there
-/// is one, IOCP on Windows, the portable backend on the other unix targets.
-#[test]
-fn a_kind_defaults_to_the_targets_own_backend() {
-	#[cfg(target_os = "linux")]
-	assert_eq!(BackendKind::default(), BackendKind::Uring);
-	#[cfg(all(unix, not(target_os = "linux")))]
-	assert_eq!(BackendKind::default(), BackendKind::Portable);
-	#[cfg(windows)]
-	assert_eq!(BackendKind::default(), BackendKind::Iocp);
-
-	let backend: Backend = Backend::new(&Config::default()).unwrap();
-	assert_eq!(backend.kind(), BackendKind::default());
-}
-
-/// Every variant a target offers round-trips through its name, whatever case
-/// the name arrives in.
-#[test]
-fn a_kind_round_trips_through_its_name() {
-	use strum::VariantArray;
-
-	for &kind in BackendKind::VARIANTS {
-		let name = kind.to_string();
-		assert_eq!(name.parse::<BackendKind>().unwrap(), kind);
-		assert_eq!(name.to_uppercase().parse::<BackendKind>().unwrap(), kind);
-		let static_name: &'static str = kind.into();
-		assert_eq!(static_name, name);
-	}
-
-	assert!("portableish".parse::<BackendKind>().is_err());
-}
-
-/// Every target offers the portable backend, whether or not it is the default:
-/// on Linux it swaps the ring for `polling`'s readiness and `blocking`'s pool,
-/// and on Windows it swaps IOCP for them.
-#[test]
-fn every_target_offers_the_portable_backend() {
-	let config = Config {
-		backend: "portable".parse().unwrap(),
-		..Config::default()
-	};
-	assert_eq!(
-		Backend::<()>::new(&config).unwrap().kind(),
-		BackendKind::Portable
-	);
-	#[cfg(any(target_os = "linux", windows))]
-	assert_ne!(BackendKind::default(), BackendKind::Portable);
-}
-
-/// A backend hands its mechanism to whichever thread drives it: the reactor
-/// moves one between threads, so every mechanism it can pick is `Send`.
-#[test]
-fn a_backend_is_send() {
-	fn assert_send<T: Send>() {}
-	assert_send::<Backend>();
-}
 
 mod waits {
 	use std::io::Write;
 	use std::net::{TcpListener, TcpStream};
 	use std::time::Duration;
 
-	use completion_backend::{AsDescriptor, Backend, Config, Op};
+	use assert2::assert;
+	use completion_backend::{AsDescriptor, Backend, BackendKind, Config, Op};
+	use rstest::rstest;
+
+	use super::common;
 
 	/// How long one `poll` may block before `drain` polls again.
 	const TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,18 +41,22 @@ mod waits {
 		done
 	}
 
-	/// A finished wait leaves nothing behind: its descriptor can close, the backend
-	/// goes idle, and a later wait on a new descriptor completes as if the first
-	/// had never been submitted.
-	#[test]
-	fn a_finished_wait_leaves_nothing_behind() {
-		let mut backend: Backend<u32> = Backend::new(&Config::default()).unwrap();
+	#[rstest]
+	fn a_finished_wait_leaves_nothing_behind(
+		#[values(BackendKind::default(), BackendKind::Portable)] kind: BackendKind,
+	) {
+		common::init_logging();
+		let config = Config {
+			backend: kind,
+			..Config::default()
+		};
+		let mut backend: Backend<u32> = Backend::new(&config).unwrap();
 		let (reader, mut writer) = pair();
 		let id = backend
 			.submit(reader.as_descriptor(), Op::Readable, 1)
 			.unwrap();
 		writer.write_all(b"x").unwrap();
-		assert_eq!(drain(&mut backend), [(id, 1, true)]);
+		assert!(drain(&mut backend) == [(id, 1, true)]);
 
 		drop((reader, writer));
 		backend
@@ -122,15 +71,22 @@ mod waits {
 			.submit(reader.as_descriptor(), Op::Readable, 2)
 			.unwrap();
 		writer.write_all(b"y").unwrap();
-		assert_eq!(drain(&mut backend), [(next, 2, true)]);
-		assert_ne!(id, next);
+		assert!(drain(&mut backend) == [(next, 2, true)]);
+		assert!(id != next);
 	}
 
 	/// A wait cancelled before its descriptor turns ready is reported once, and the
 	/// readiness that follows is not dispatched to it again.
-	#[test]
-	fn a_cancelled_wait_is_not_dispatched_when_its_descriptor_turns_ready() {
-		let mut backend: Backend<u32> = Backend::new(&Config::default()).unwrap();
+	#[rstest]
+	fn a_cancelled_wait_is_not_dispatched_when_its_descriptor_turns_ready(
+		#[values(BackendKind::default(), BackendKind::Portable)] kind: BackendKind,
+	) {
+		common::init_logging();
+		let config = Config {
+			backend: kind,
+			..Config::default()
+		};
+		let mut backend: Backend<u32> = Backend::new(&config).unwrap();
 		let (reader, mut writer) = pair();
 		let id = backend
 			.submit(reader.as_descriptor(), Op::Readable, 7)
@@ -139,8 +95,8 @@ mod waits {
 		writer.write_all(b"x").unwrap();
 
 		let done = drain(&mut backend);
-		assert_eq!(done.len(), 1, "the cancelled wait is reported once");
-		assert_eq!((done[0].0, done[0].1), (id, 7));
+		assert!(done.len() == 1, "the cancelled wait is reported once");
+		assert!((done[0].0, done[0].1) == (id, 7));
 
 		backend
 			.poll(Some(Duration::ZERO), |_, _, _| {

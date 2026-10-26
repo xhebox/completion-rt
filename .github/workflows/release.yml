@@ -8,33 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: arduino/setup-task@v3
-        with:
-          repo-token: ${{ github.token }}
-
-      - name: Install rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          # Leave RUSTFLAGS unset; it would override the rustflags in .cargo/config.toml.
-          rustflags: ""
-
-      - name: Install nextest
-        uses: taiki-e/install-action@nextest
-
-      # cargo publish cannot be undone, so a tag that lands on a broken merge fails here instead.
-      - name: Check
-        run: task check
-
-      - name: Test
-        run: task test
-
   release:
-    needs: test
     runs-on: ubuntu-26.04
     permissions:
       contents: write

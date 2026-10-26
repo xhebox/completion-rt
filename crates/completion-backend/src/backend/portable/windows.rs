@@ -4,14 +4,16 @@
 //! `read`/`write`.
 
 use std::io;
-use std::mem::{MaybeUninit, size_of};
+use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, BorrowedHandle, BorrowedSocket, RawSocket};
-use std::slice;
 
 use polling::os::iocp::PollerIocpExt;
 use polling::{Event as Ready, PollMode, Poller};
 use socket2::SockRef;
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING, GetLastError, HANDLE};
+use windows_sys::Win32::Networking::WinSock::{
+	SOCKET, SOCKET_ERROR, WSAGetLastError, recv as winsock_recv, send as winsock_send,
+};
 use windows_sys::Win32::Storage::FileSystem::{
 	FILE_ALLOCATION_INFO, FILE_END_OF_FILE_INFO, FileAllocationInfo, FileEndOfFileInfo,
 	FlushFileBuffers, GetFileSizeEx, ReadFile, SetFileInformationByHandle, WriteFile,
@@ -219,13 +221,7 @@ pub(super) fn read(raw: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 	let Some(buffer) = buffer else {
 		return Ok(Progress::Done(Response::Count(0)));
 	};
-	let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
-	let source = borrow(raw)?;
-	let socket = SockRef::from(&source);
-	// SAFETY: the reactor holds the memory behind `ptr` until the operation
-	// lands, and the call is the only mover of the range while the slice stands:
-	// `recv` only writes it.
-	counted(socket.recv(unsafe { slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), len) }))
+	recv(raw, buffer.ptr, buffer.len.min(MAX_TRANSFER))
 }
 
 /// Writes from the one buffer `buffer` names, on a socket the poller reported
@@ -234,12 +230,35 @@ pub(super) fn write(raw: Raw, buffer: Option<IoVec>) -> io::Result<Progress> {
 	let Some(buffer) = buffer else {
 		return Ok(Progress::Done(Response::Count(0)));
 	};
-	let (ptr, len) = (buffer.ptr, buffer.len.min(MAX_TRANSFER));
+	send(raw, buffer.ptr, buffer.len.min(MAX_TRANSFER))
+}
+
+/// Receives into `ptr..ptr + len` on a watched socket.
+pub(super) fn recv(raw: Raw, ptr: *mut u8, len: usize) -> io::Result<Progress> {
 	let source = borrow(raw)?;
-	let socket = SockRef::from(&source);
 	// SAFETY: the reactor holds the memory behind `ptr` until the operation
-	// lands, and the call only reads it.
-	counted(socket.send(unsafe { slice::from_raw_parts(ptr, len) }))
+	// lands; the call copies through the raw pointer without forming a Rust
+	// reference.
+	let moved = unsafe { winsock_recv(source.as_raw_socket() as SOCKET, ptr, len as i32, 0) };
+	counted(socket_count(moved))
+}
+
+/// Sends from `ptr..ptr + len` on a watched socket.
+pub(super) fn send(raw: Raw, ptr: *mut u8, len: usize) -> io::Result<Progress> {
+	let source = borrow(raw)?;
+	// SAFETY: the reactor holds the memory behind `ptr` until the operation
+	// lands; the call reads through the raw pointer without forming a Rust
+	// reference.
+	let moved = unsafe { winsock_send(source.as_raw_socket() as SOCKET, ptr, len as i32, 0) };
+	counted(socket_count(moved))
+}
+
+fn socket_count(result: i32) -> io::Result<usize> {
+	if result == SOCKET_ERROR {
+		Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+	} else {
+		Ok(result as usize)
+	}
 }
 
 /// One positional read or write, through an `OVERLAPPED` that names `fdoff`.

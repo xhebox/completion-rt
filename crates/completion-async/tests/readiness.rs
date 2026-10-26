@@ -1,24 +1,19 @@
-//! Readiness on a descriptor that carries no transfer.
+//! Readiness waits on [`Stream`], [`StreamSocket`], and [`DatagramSocket`].
 //!
-//! [`Readiness`] is a resource whose only operation is the wait: an eventfd, a
-//! pidfd, a vhost-user endpoint, or a waitable handle on Windows. Nothing moves
-//! through one, so a wait is the whole operation. A resource with a transfer
-//! has no wait to offer — the backend arms the readiness itself when a call
-//! would block — which the compile-fail cases on the handles hold to.
-//!
-//! The waits run on a pipe and on a socket: a pipe is unix's portable
-//! descriptor with two ends, and a socket is the one source both platforms
-//! watch the same way.
+//! The waits run on a pipe, a socket, and on Windows a waitable event handle.
 
 mod common;
 
+use assert2::assert;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
-use completion_async::{Readiness, block_on, timeout};
+#[cfg(unix)]
+use completion_async::AsDescriptor;
+use completion_async::{Stream, StreamSocket, block_on, timeout};
 
 /// A connected loopback pair: the portable way to two real sockets.
 fn pair() -> (TcpStream, TcpStream) {
@@ -37,7 +32,7 @@ fn a_wait_resolves_when_the_descriptor_becomes_ready() {
 
 	let (reader, mut peer) = std::io::pipe().unwrap();
 	common::init_logging();
-	let readiness = Readiness::new(OwnedFd::from(reader));
+	let readiness = Stream::new(OwnedFd::from(reader));
 
 	let writer = std::thread::spawn(move || {
 		std::thread::sleep(DELAY);
@@ -49,12 +44,9 @@ fn a_wait_resolves_when_the_descriptor_becomes_ready() {
 	let waited = started.elapsed();
 	writer.join().unwrap();
 	let mut byte = [0u8; 1];
-	assert_eq!(rustix::io::read(&readiness, &mut byte).unwrap(), 1);
-	assert_eq!(&byte, b"x");
-	assert!(
-		waited >= DELAY,
-		"the wait resolved in {waited:?}, before the peer wrote"
-	);
+	assert!(rustix::io::read(readiness.as_descriptor(), &mut byte).unwrap() == 1);
+	assert!(&byte == b"x");
+	assert!(waited >= DELAY, "the wait resolved before the peer wrote");
 	assert!(
 		waited < Duration::from_secs(5),
 		"the wait did not end on the peer's write"
@@ -68,7 +60,7 @@ fn a_wait_resolves_when_the_descriptor_becomes_ready() {
 fn a_writable_descriptor_ends_a_write_wait() {
 	let (_reader, writer) = std::io::pipe().unwrap();
 	common::init_logging();
-	let readiness = Readiness::new(OwnedFd::from(writer));
+	let readiness = Stream::new(OwnedFd::from(writer));
 
 	block_on(readiness.writable()).unwrap().unwrap();
 }
@@ -80,7 +72,7 @@ fn a_writable_descriptor_ends_a_write_wait() {
 fn a_dropped_wait_gives_the_descriptor_back() {
 	let (reader, _peer) = std::io::pipe().unwrap();
 	common::init_logging();
-	let readiness = Readiness::new(OwnedFd::from(reader));
+	let readiness = Stream::new(OwnedFd::from(reader));
 
 	block_on(async {
 		let mut wait = std::pin::pin!(readiness.readable());
@@ -111,14 +103,14 @@ fn a_socket_readiness_wait_resolves_when_the_peer_writes() {
 	// here and now.
 	let (client, _server) = pair();
 	common::init_logging();
-	let writable = Readiness::new(client);
+	let writable = StreamSocket::new(client);
 	block_on(writable.writable()).unwrap().unwrap();
 
 	let (mut client, server) = pair();
 	let mut probe = server
 		.try_clone()
 		.expect("a loopback socket clones its handle");
-	let readiness = Readiness::new(server);
+	let readiness = StreamSocket::new(server);
 
 	let sender = std::thread::spawn(move || {
 		std::thread::sleep(DELAY);
@@ -129,10 +121,7 @@ fn a_socket_readiness_wait_resolves_when_the_peer_writes() {
 	block_on(readiness.readable()).unwrap().unwrap();
 	let waited = started.elapsed();
 	sender.join().unwrap();
-	assert!(
-		waited >= DELAY,
-		"the wait resolved in {waited:?}, before the peer wrote"
-	);
+	assert!(waited >= DELAY, "the wait resolved before the peer wrote");
 	assert!(
 		waited < Duration::from_secs(5),
 		"the wait did not end on the peer's write"
@@ -142,8 +131,8 @@ fn a_socket_readiness_wait_resolves_when_the_peer_writes() {
 	// still there for the caller to read itself.
 	probe.set_nonblocking(false).unwrap();
 	let mut byte = [0u8; 1];
-	assert_eq!(probe.read(&mut byte).unwrap(), 1);
-	assert_eq!(&byte, b"x");
+	assert!(probe.read(&mut byte).unwrap() == 1);
+	assert!(&byte == b"x");
 	assert!(
 		readiness.try_take().is_some(),
 		"the settled wait still holds the socket"
@@ -165,11 +154,11 @@ fn a_waitable_event_handle_resolves_and_cancels_cleanly() {
 	assert!(!raw.is_null(), "CreateEventW failed");
 	let event = unsafe { OwnedHandle::from_raw_handle(raw) };
 	let signal_target = event.as_raw_handle() as usize;
-	let readiness = Readiness::new(event);
+	let readiness = Stream::new(event);
 
 	let signaller = std::thread::spawn(move || {
 		std::thread::sleep(DELAY);
-		assert_ne!(unsafe { SetEvent(signal_target as _) }, 0);
+		assert!(unsafe { SetEvent(signal_target as _) } != 0);
 	});
 
 	let started = Instant::now();
@@ -178,14 +167,14 @@ fn a_waitable_event_handle_resolves_and_cancels_cleanly() {
 	signaller.join().unwrap();
 	assert!(
 		waited >= DELAY,
-		"the wait resolved in {waited:?}, before the event was set"
+		"the wait resolved before the event was set"
 	);
 
 	// An unsignaled event whose wait is dropped in flight gives the handle back.
 	let raw = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
 	assert!(!raw.is_null(), "CreateEventW failed");
 	let event = unsafe { OwnedHandle::from_raw_handle(raw) };
-	let readiness = Readiness::new(event);
+	let readiness = Stream::new(event);
 	block_on(async {
 		let mut wait = std::pin::pin!(readiness.readable());
 		std::future::poll_fn(|cx| {

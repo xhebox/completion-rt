@@ -1,6 +1,7 @@
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::mem::ManuallyDrop;
+use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 
 use completion_backend::IoVec;
@@ -20,14 +21,18 @@ pub unsafe trait AsIoVec: Send + 'static {
 /// Bytes for I/O transfers.
 ///
 /// A `Buffer` implements [`AsIoVec`], and every operation takes its buffer by
-/// value. Cloning is cheap and shares the bytes: pass `buffer.clone()` to an
+/// value. Cloning or slicing with [`Buffer::slice`] is cheap and shares the
+/// underlying allocation: pass `buffer.clone()` or `buffer.slice(..)` to an
 /// operation and keep the original to read the bytes back afterwards.
 ///
 /// Use [`Buffer::zeroed`], [`Buffer::copy_from`], or `Buffer::from` a `Vec<u8>`
 /// / `Box<[u8]>` to allocate one, and [`Buffer::get_mut`] to read or write it
-/// once no other handle names the bytes.
+/// once no other handle names the allocation.
 #[derive(Clone)]
-pub struct Buffer(Arc<Vec<UnsafeCell<u8>>>);
+pub struct Buffer {
+	memory: Arc<Vec<UnsafeCell<u8>>>,
+	range: Range<usize>,
+}
 
 // SAFETY: `&Buffer` only exposes its length and a raw pointer derived from
 // `UnsafeCell::raw_get`; no `&[u8]` or `&mut [u8]` is ever created while
@@ -46,16 +51,43 @@ impl Buffer {
 		Buffer::from(bytes.to_vec())
 	}
 
-	/// Byte length of the buffer.
+	/// Byte length of the buffer view.
 	pub fn len(&self) -> usize {
-		self.0.len()
+		self.range.len()
 	}
 
-	/// Returns the bytes for reading or writing when no other `Buffer` handle
-	/// (including one an in-flight operation holds) names them; otherwise
-	/// `None`.
+	/// Returns a sub-view of `range` within this buffer, sharing the underlying
+	/// allocation.
+	///
+	/// # Panics
+	/// Panics if `range` is out of bounds of `0..self.len()`.
+	pub fn slice(&self, range: impl RangeBounds<usize>) -> Buffer {
+		let len = self.len();
+		let start = match range.start_bound() {
+			Bound::Included(&n) => n,
+			Bound::Excluded(&n) => n.checked_add(1).expect("slice start overflow"),
+			Bound::Unbounded => 0,
+		};
+		let end = match range.end_bound() {
+			Bound::Included(&n) => n.checked_add(1).expect("slice end overflow"),
+			Bound::Excluded(&n) => n,
+			Bound::Unbounded => len,
+		};
+		assert!(
+			start <= end && end <= len,
+			"slice range {start}..{end} out of bounds for buffer of length {len}"
+		);
+		Buffer {
+			memory: Arc::clone(&self.memory),
+			range: (self.range.start + start)..(self.range.start + end),
+		}
+	}
+
+	/// Returns the bytes in this buffer's range for reading or writing when no
+	/// other `Buffer` handle (including one an in-flight operation holds) names
+	/// the underlying allocation; otherwise `None`.
 	pub fn get_mut(&mut self) -> Option<&mut [u8]> {
-		let cells = Arc::get_mut(&mut self.0)?.as_mut_slice();
+		let cells = &mut Arc::get_mut(&mut self.memory)?[self.range.clone()];
 		// SAFETY: `UnsafeCell<u8>` has the same layout as `u8`, and `Arc::get_mut`
 		// guarantees exclusive access to the allocation.
 		Some(unsafe { &mut *(cells as *mut [UnsafeCell<u8>] as *mut [u8]) })
@@ -69,13 +101,13 @@ impl fmt::Debug for Buffer {
 }
 
 // SAFETY: the `Arc` keeps the allocation in place without resizing for as long
-// as the `Buffer` is alive, and `UnsafeCell::raw_get` yields a pointer writable
-// by the kernel through `&self`.
+// as the `Buffer` is alive, `self.range` is within `0..=self.memory.len()`, and
+// `UnsafeCell::raw_get` yields a pointer writable by the kernel through `&self`.
 unsafe impl AsIoVec for Buffer {
 	fn as_iovec(&self) -> IoVec {
 		IoVec {
-			ptr: UnsafeCell::raw_get(self.0.as_ptr()),
-			len: self.0.len(),
+			ptr: UnsafeCell::raw_get(unsafe { self.memory.as_ptr().add(self.range.start) }),
+			len: self.range.len(),
 		}
 	}
 }
@@ -87,7 +119,10 @@ impl From<Vec<u8>> for Buffer {
 		let (ptr, len, capacity) = (bytes.as_mut_ptr(), bytes.len(), bytes.capacity());
 		// SAFETY: `UnsafeCell<u8>` is `#[repr(transparent)]` over `u8`.
 		let cells = unsafe { Vec::from_raw_parts(ptr.cast::<UnsafeCell<u8>>(), len, capacity) };
-		Buffer(Arc::new(cells))
+		Buffer {
+			memory: Arc::new(cells),
+			range: 0..len,
+		}
 	}
 }
 
@@ -157,5 +192,30 @@ mod tests {
 		let iovec = buffer.as_iovec();
 		assert!(iovec.len == buffer.len());
 		assert!(iovec.ptr == buffer.get_mut().unwrap().as_ptr().cast_mut());
+	}
+
+	#[test]
+	fn a_sliced_buffer_names_its_subrange_and_nests() {
+		let mut buffer = Buffer::copy_from(b"0123456789");
+		let base = buffer.as_iovec().ptr;
+
+		let middle = buffer.slice(2..8);
+		assert!(middle.len() == 6);
+		assert!(middle.as_iovec().ptr == unsafe { base.add(2) });
+		assert!(middle.as_iovec().len == 6);
+		assert!(
+			buffer.get_mut().is_none(),
+			"the slice still names the allocation"
+		);
+
+		let nested = middle.slice(3..=4);
+		assert!(nested.len() == 2);
+		assert!(nested.as_iovec().ptr == unsafe { base.add(5) });
+		assert!(nested.as_iovec().len == 2);
+
+		drop(middle);
+		drop(buffer);
+		let mut nested = nested;
+		assert!(nested.get_mut().unwrap() == b"56");
 	}
 }

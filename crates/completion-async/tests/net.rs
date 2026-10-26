@@ -423,9 +423,10 @@ fn a_send_all_loop_reports_what_it_sent_before_an_io_error() {
 	let result = block_on(socket.send_all(whole(&payload))).unwrap();
 	gone.join().unwrap();
 	assert!(
-		result.is_err(),
+		let Err(error) = result,
 		"a send whose peer went away reports an error"
 	);
+	assert!(error.done() > 0, "the failed send dropped its progress");
 }
 
 /// A receive already in front of the kernel ends when the read side is shut
@@ -494,8 +495,12 @@ fn a_shutdown_write_ends_a_send_in_flight() {
 	let result = block_on(socket.send_all(whole(&payload))).unwrap();
 	block_on(task).unwrap();
 	assert!(
-		result.is_err(),
+		let Err(error) = result,
 		"a send whose write side was shut down reports an error, not a write left waiting"
+	);
+	assert!(
+		error.done() > 0,
+		"the shut-down send threw away the bytes it had put out"
 	);
 }
 

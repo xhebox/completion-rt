@@ -48,7 +48,8 @@ fn a_pipe_transfers_at_its_own_position() {
 	assert!(moved == 5);
 
 	let mut read: Buffer = Buffer::zeroed(5);
-	block_on(reader.read_exact(read.clone())).unwrap().unwrap();
+	let moved = block_on(reader.read_exact(read.clone())).unwrap().unwrap();
+	assert!(moved == 5);
 	assert!(read.get_mut().unwrap().to_vec() == b"hello");
 }
 
@@ -125,6 +126,7 @@ fn read_exact_at_reports_the_file_ending_first() {
 		"what did arrive stays"
 	);
 	assert!(let Err(error) = result, "the file has fewer bytes than the buffer holds");
+	assert!(error.done() == 5);
 	assert!(error.kind() == ErrorKind::Failed);
 	assert!(io::Error::try_from(error).unwrap().kind() == io::ErrorKind::UnexpectedEof);
 }

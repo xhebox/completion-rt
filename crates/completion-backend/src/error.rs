@@ -20,6 +20,7 @@ pub enum ErrorKind {
 #[derive(Debug)]
 pub struct Error {
 	kind: ErrorKind,
+	done: usize,
 	source: Option<io::Error>,
 }
 
@@ -28,6 +29,7 @@ impl Error {
 	pub fn cancelled() -> Error {
 		Error {
 			kind: ErrorKind::Cancelled,
+			done: 0,
 			source: None,
 		}
 	}
@@ -36,13 +38,25 @@ impl Error {
 	pub fn stopped() -> Error {
 		Error {
 			kind: ErrorKind::Stopped,
+			done: 0,
 			source: None,
 		}
+	}
+
+	/// Attaches the number of bytes transferred before this error occurred.
+	pub fn with_done(mut self, done: usize) -> Error {
+		self.done = done;
+		self
 	}
 
 	/// Returns the [`ErrorKind`] for this error.
 	pub fn kind(&self) -> ErrorKind {
 		self.kind
+	}
+
+	/// Returns the number of bytes transferred before this error occurred.
+	pub fn done(&self) -> usize {
+		self.done
 	}
 }
 
@@ -69,6 +83,7 @@ impl From<io::Error> for Error {
 	fn from(error: io::Error) -> Error {
 		Error {
 			kind: ErrorKind::Failed,
+			done: 0,
 			source: Some(error),
 		}
 	}
@@ -113,8 +128,11 @@ mod tests {
 	fn an_io_error_round_trips_through_a_failed_error() {
 		let error = Error::from(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
 		assert!(error.kind() == ErrorKind::Failed);
+		assert!(error.done() == 0);
 		assert!(error.source().is_some());
 		assert!(error.to_string().contains("denied"));
+		let error = error.with_done(42);
+		assert!(error.done() == 42);
 		assert!(let Ok(io_error) = io::Error::try_from(error));
 		assert!(io_error.kind() == io::ErrorKind::PermissionDenied);
 	}

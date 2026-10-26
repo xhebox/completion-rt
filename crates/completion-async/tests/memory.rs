@@ -94,10 +94,40 @@ fn a_shared_buffer_reads_and_writes() {
 		.unwrap();
 
 	let mut sink = Buffer::zeroed(6);
-	block_on(file.read_exact_at(sink.clone(), 0))
-		.unwrap()
-		.unwrap();
+	assert!(
+		block_on(file.read_exact_at(sink.clone(), 0))
+			.unwrap()
+			.unwrap()
+			== 6
+	);
 	assert!(sink.get_mut().unwrap() == b"shared");
+}
+
+/// [`Buffer::slice`] names a subrange of the same allocation: transfers into
+/// and from slices touch only the sliced range, and once the slice handles are
+/// dropped the parent buffer regains exclusive access.
+#[test]
+fn a_sliced_buffer_transfers_through_its_subrange() {
+	common::init_logging();
+	let (_directory, path, file) = scratch("completion-memory-slice");
+	std::fs::write(&path, b"abcdefgh").unwrap();
+
+	let mut buf = Buffer::copy_from(b"..........");
+	assert!(
+		block_on(file.read_exact_at(buf.slice(3..7), 2))
+			.unwrap()
+			.unwrap()
+			== 4
+	);
+	assert!(buf.get_mut().unwrap() == b"...cdef...");
+
+	assert!(
+		block_on(file.write_all_at(buf.slice(3..7), 0))
+			.unwrap()
+			.unwrap()
+			== 4
+	);
+	assert!(std::fs::read(&path).unwrap() == b"cdefefgh");
 }
 
 /// The bytes are exclusive only while no other handle names them: another clone

@@ -28,7 +28,7 @@ async fn repeat<D: AsDescriptor + 'static, M: AsIoVec>(
 	buffer: M,
 	short: fn() -> io::Error,
 	mut make_op: impl FnMut(usize, IoVec) -> Op + Send,
-) -> Result<()> {
+) -> Result<usize> {
 	// The loop owns the one descriptor and buffer handle: each round moves them
 	// into the round's entry, and the completion hands them back for the next.
 	// A round dropped in flight keeps them in its entry until the kernel finishes.
@@ -42,10 +42,10 @@ async fn repeat<D: AsDescriptor + 'static, M: AsIoVec>(
 			ptr: unsafe { whole.ptr.add(done) },
 			len: whole.len - done,
 		};
-		let slot = submit(fd, make_op(done, remaining), buffer)?;
+		let slot = submit(fd, make_op(done, remaining), buffer).map_err(|e| e.with_done(done))?;
 		let (response, returned_fd, returned_buf) = slot.await;
-		match response? {
-			Response::Count(0) => return Err(Error::from(short())),
+		match response.map_err(|e| e.with_done(done))? {
+			Response::Count(0) => return Err(Error::from(short()).with_done(done)),
 			Response::Count(bytes) => {
 				fd = returned_fd;
 				buffer = returned_buf;
@@ -54,14 +54,14 @@ async fn repeat<D: AsDescriptor + 'static, M: AsIoVec>(
 			other => unreachable!("a transfer reports a count, not {other:?}"),
 		}
 	}
-	Ok(())
+	Ok(done)
 }
 
 pub(crate) async fn fill<D: AsDescriptor + 'static, M: AsIoVec>(
 	fd: D,
 	buffer: M,
 	op: impl FnMut(usize, IoVec) -> Op + Send,
-) -> Result<()> {
+) -> Result<usize> {
 	repeat(
 		fd,
 		buffer,
@@ -80,7 +80,7 @@ pub(crate) async fn drain<D: AsDescriptor + 'static, M: AsIoVec>(
 	fd: D,
 	buffer: M,
 	op: impl FnMut(usize, IoVec) -> Op + Send,
-) -> Result<()> {
+) -> Result<usize> {
 	repeat(
 		fd,
 		buffer,
@@ -246,7 +246,7 @@ impl File {
 		&self,
 		buf: M,
 		offset: u64,
-	) -> impl Future<Output = Result<()>> + 'static {
+	) -> impl Future<Output = Result<usize>> + 'static {
 		fill(self.clone(), buf, move |done, iovec| Op::Read {
 			offset: Some(offset + done as u64),
 			buf: iovec,
@@ -270,7 +270,7 @@ impl File {
 		&self,
 		buf: M,
 		offset: u64,
-	) -> impl Future<Output = Result<()>> + 'static {
+	) -> impl Future<Output = Result<usize>> + 'static {
 		drain(self.clone(), buf, move |done, iovec| Op::Write {
 			offset: Some(offset + done as u64),
 			buf: iovec,

@@ -59,7 +59,7 @@ impl Stream {
 	}
 
 	/// Reads into `buf` until it is completely filled.
-	pub fn read_exact<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<()>> + 'static {
+	pub fn read_exact<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
 		fill(self.clone(), buf, |_done, iovec| Op::Read {
 			offset: None,
 			buf: iovec,
@@ -75,7 +75,7 @@ impl Stream {
 	}
 
 	/// Writes all bytes in `buf`, across one or more calls.
-	pub fn write_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<()>> + 'static {
+	pub fn write_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
 		drain(self.clone(), buf, |_done, iovec| Op::Write {
 			offset: None,
 			buf: iovec,
@@ -166,7 +166,7 @@ impl StreamSocket {
 	}
 
 	/// Receives into `buf` until it is completely filled.
-	pub fn recv_exact<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<()>> + 'static {
+	pub fn recv_exact<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
 		fill(self.clone(), buf, |_done, iovec| Op::Recv { buf: iovec })
 	}
 
@@ -176,7 +176,7 @@ impl StreamSocket {
 	}
 
 	/// Sends all bytes in `buf` across one or more calls.
-	pub fn send_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<()>> + 'static {
+	pub fn send_all<M: AsIoVec>(&self, buf: M) -> impl Future<Output = Result<usize>> + 'static {
 		drain(self.clone(), buf, |_done, iovec| Op::Send { buf: iovec })
 	}
 

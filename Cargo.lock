@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "completion-async"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "assert2",
  "compio",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "completion-backend"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "assert2",
  "blocking",

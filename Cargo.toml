@@ -3,14 +3,14 @@ members = ["crates/completion-backend", "crates/completion-async"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.96.1"
 license = "MIT"
 repository = "https://github.com/xhebox/completion-rt"
 
 [workspace.dependencies]
-completion-backend = { version = "0.2.2", path = "crates/completion-backend" }
+completion-backend = { version = "0.2.3", path = "crates/completion-backend" }
 assert2 = "0.4"
 compio = { version = "0.20.0-beta.1", features = ["fs", "io", "net", "runtime", "time"] }
 crossbeam-queue = "0.3"
